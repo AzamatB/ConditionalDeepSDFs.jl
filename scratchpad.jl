@@ -30,13 +30,10 @@ Returns the normalized points and transformation parameters (μ, scale, rotation
 """
 # function normalize_pointcloud!(points::CuMatrix{T}) where T
 @assert size(points, 1) == 3 "Expected 3×N matrix with columns as points"
-
 n = size(points, 2)
-
 # step 1: center at origin
 μ = mean(points, dims=2)
 points .-= μ
-
 
 # step 2: compute covariance matrix for PCA (on GPU, then transfer small 3×3)
 cov_mat = (points * points') ./ n
@@ -44,27 +41,22 @@ cov_cpu = Matrix(cov_mat)  # 3×3, cheap transfer
 
 # step 3: perform SVD for principal axes alignment
 F = svd(cov_cpu) # eigenvectors of covariance give principal directions
-R = F.U  # rotation matrix (principal axes)
-
-det(R)
-
+rotation = F.U  # rotation matrix (principal axes)
 # ensure proper rotation (det = +1), not reflection
-if det(R) < 0
-    R[:, 3] .*= -1
-end
+flip = det(rotation) < 0
+c = 1.0f0 - 2.0f0 * flip
+rotation[:, 3] .*= c
 
-# step 4: rotate to align principal axes
-R_gpu = CuMatrix{T}(R')  # Transpose for R' * points
-points .= R_gpu * points
+# step 4: invert rotation via transpose to align principal axes
+rot_inv = CuMatrix(rotation')
+points .= rot_inv * points
 
 # step 5: scale to unit sphere
-# max distance from origin
-distances_sq = sum(points .^ 2, dims=1)
-max_dist = sqrt(maximum(distances_sq))
-scale = max_dist > eps(T) ? max_dist : one(T)
-points ./= scale
-
-return points, (μ=Array(μ), scale=scale, rotation=R)
+distances² = sum(abs2, points; dims=1)
+radius_max = √(maximum(distances²))
+scale = 1.0f0 / radius_max
+points .*= scale
+return points
 # end
 
 """
