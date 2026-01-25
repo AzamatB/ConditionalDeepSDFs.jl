@@ -45,10 +45,11 @@ function normalize_pointcloud(points::CuMatrix{Float32})
 
     # canonical sign convention: ensure diagonal elements are positive
     # this makes the principal axes point in consistent directions
-    for i in 1:3
-        if rotation[i, i] < 0
-            rotation[:, i] .*= -1
-        end
+    for col in eachcol(rotation)
+        idx_max = argmax(abs, col)
+        flip = col[idx_max] < 0
+        c = 1 - 2flip
+        col .*= c
     end
 
     # ensure proper rotation (det = +1), not reflection
