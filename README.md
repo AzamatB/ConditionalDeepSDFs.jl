@@ -1,1 +1,1 @@
-# ConditionalDeepSDF
+# ConditionalDeepSDF.jl
