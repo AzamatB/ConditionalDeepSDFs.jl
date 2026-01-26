@@ -4,7 +4,7 @@ using LinearAlgebra
 
 using GeometryBasics: Mesh, Point3
 
-function vec_to_matrix(points::Vector{Point{3,T}}) where {T<:Real}
+function vec_to_matrix(points::Vector{Point3{T}}) where {T<:Real}
     matrix = reinterpret(reshape, T, points)
     return matrix
 end
