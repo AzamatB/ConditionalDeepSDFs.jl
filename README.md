@@ -1,1 +1,2 @@
-# ConditionalDeepSDF.jl
+# ConditionalDeepSDFs.jl
+Conditional Deep Signed Distance Fields.
