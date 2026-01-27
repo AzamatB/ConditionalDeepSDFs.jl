@@ -6,6 +6,11 @@ using LinearAlgebra
 # CPU helpers (Float64)
 # ----------------------------
 
+function face_indices(face::NgonFace{3,OffsetInteger{-1,UInt32}})
+    vertex_indices = convert.(Int32, face)
+    return vertex_indices
+end
+
 function dot3(x1::Float64, y1::Float64, z1::Float64, x2::Float64, y2::Float64, z2::Float64)
     value = x1*x2 + y1*y2 + z1*z2
     return value::Float64
@@ -257,14 +262,6 @@ function precompute_data_on_cpu(
     degenerate_area2_eps::Float64 = 1e-20
 )
     n_verts = length(vertices)
-
-    # Determine whether faces are 0-based or 1-based
-    min_idx = typemax(Int)
-    @inbounds for f in faces
-        min_idx = min(min_idx, Int(f[1]), Int(f[2]), Int(f[3]))
-    end
-    offset = (min_idx == 0) ? 1 : 0
-
     # Accumulators for vertex pseudo-normals (Float64)
     vnx_acc = zeros(Float64, n_verts)
     vny_acc = zeros(Float64, n_verts)
@@ -292,10 +289,8 @@ function precompute_data_on_cpu(
     fny = Float32[]
     fnz = Float32[]
 
-    @inbounds for f in faces
-        a = Int32(Int(f[1]) + offset)
-        b = Int32(Int(f[2]) + offset)
-        c = Int32(Int(f[3]) + offset)
+    @inbounds for face in faces
+        (a, b, c) = face_indices(face)
 
         ax = Float64(vertices[a][1])
         ay = Float64(vertices[a][2])
