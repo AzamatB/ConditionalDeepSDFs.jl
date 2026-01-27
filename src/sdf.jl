@@ -720,10 +720,10 @@ function compute_sdf(
 
     n_grid = Int32(length(rng))
     start = Float32(first(rng))
-    step  = Float32(step(rng))
+    Δ  = Float32(step(rng))
 
     # Robust on-surface epsilon
-    ε = max(1f-6, 1f-3 * step)
+    ε = max(1f-6, 1f-3 * Δ)
     ε² = ε * ε
 
     sdf = CUDA.zeros(Float32, n_grid, n_grid, n_grid)
@@ -753,7 +753,7 @@ function compute_sdf(
         CUDA.Const(d_eacx), CUDA.Const(d_eacy), CUDA.Const(d_eacz),
         CUDA.Const(d_ebcx), CUDA.Const(d_ebcy), CUDA.Const(d_ebcz),
         CUDA.Const(d_vnx), CUDA.Const(d_vny), CUDA.Const(d_vnz),
-        start, step, n_grid, data_cpu.n_faces, ε², val_tile_size
+        start, Δ, n_grid, data_cpu.n_faces, ε², val_tile_size
     )
     return sdf::CuArray{Float32,3}
 end
