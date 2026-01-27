@@ -488,7 +488,7 @@ end
 # CUDA kernel
 # =============================================================================
 
-function sdf_kernel!(
+function compute_sdf_kernel!(
     out,
     v0x, v0y, v0z, e0x, e0y, e0z, e1x, e1y, e1z,
     i0, i1, i2,
@@ -530,7 +530,7 @@ function sdf_kernel!(
     tid = (threadIdx().z - 1) * (tx*ty) + (threadIdx().y - 1) * tx + threadIdx().x
     stride = tx * ty * tz
 
-    best_d2 = Inf32
+    best_d² = Inf32
     best_f  = Int32(1)
 
     tile_start = Int32(1)
@@ -572,9 +572,9 @@ function sdf_kernel!(
             acy = sh_e1y[t]
             acz = sh_e1z[t]
 
-            d2 = dist2_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
-            if d2 < best_d2
-                best_d2 = d2
+            d² = dist2_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
+            if d² < best_d²
+                best_d² = d²
                 best_f = tile_start + t - Int32(1)
             end
             t += Int32(1)
@@ -585,7 +585,7 @@ function sdf_kernel!(
     end
 
     # robust on-surface handling
-    if best_d2 <= ε²
+    if best_d² <= ε²
         @inbounds out[ix, iy, iz] = 0f0
         return nothing
     end
@@ -652,7 +652,7 @@ function sdf_kernel!(
     vz = pz - qz
 
     s = dot3f(vx, vy, vz, nx, ny, nz)
-    d = sqrt(best_d2)
+    d = sqrt(best_d²)
 
     @inbounds out[ix, iy, iz] = (s >= 0f0) ? d : -d
 
@@ -741,7 +741,7 @@ function compute_sdf(
     tx, ty, tz = threads
     blocks = (cld(Int(n_grid), tx), cld(Int(n_grid), ty), cld(Int(n_grid), tz))
 
-    @cuda threads=threads blocks=blocks sdf_kernel!(
+    @cuda threads=threads blocks=blocks compute_sdf_kernel!(
         sdf,
         CUDA.Const(d_v0x), CUDA.Const(d_v0y), CUDA.Const(d_v0z),
         CUDA.Const(d_e0x), CUDA.Const(d_e0y), CUDA.Const(d_e0z),
