@@ -268,7 +268,7 @@ function precompute_data_on_cpu(
     vnz_acc = zeros(Float64, n_verts)
 
     # Edge normal sums (sum of incident unit face normals)
-    edge_acc = Dict{UInt64, NTuple{3,Float64}}()
+    edge_acc = Dict{UInt64,NTuple{3,Float64}}()
 
     # Packed triangles (skip degenerates)
     i0 = Int32[]
@@ -416,7 +416,7 @@ function precompute_data_on_cpu(
     end
 
     # Normalize edge pseudo-normals (dict of UInt64 => Float32 triple)
-    edge_unit = Dict{UInt64, NTuple{3,Float32}}()
+    edge_unit = Dict{UInt64,NTuple{3,Float32}}()
     for (k, (sx, sy, sz)) in edge_acc
         n = norm3(sx, sy, sz)
         if n == 0.0
@@ -484,18 +484,19 @@ end
 # =============================================================================
 
 function compute_sdf_kernel!(
-    out,
-    v0x, v0y, v0z, e0x, e0y, e0z, e1x, e1y, e1z,
-    i0, i1, i2,
-    fnx, fny, fnz,
-    eabx, eaby, eabz,
-    eacx, eacy, eacz,
-    ebcx, ebcy, ebcz,
-    vnx, vny, vnz,
+    sdf::CuDeviceArray{Float32,3},
+    v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
+    e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
+    e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
+    i0::CuDeviceVector{Int32}, i1::CuDeviceVector{Int32}, i2::CuDeviceVector{Int32},
+    fnx::CuDeviceVector{Float32}, fny::CuDeviceVector{Float32}, fnz::CuDeviceVector{Float32},
+    eabx::CuDeviceVector{Float32}, eaby::CuDeviceVector{Float32}, eabz::CuDeviceVector{Float32},
+    eacx::CuDeviceVector{Float32}, eacy::CuDeviceVector{Float32}, eacz::CuDeviceVector{Float32},
+    ebcx::CuDeviceVector{Float32}, ebcy::CuDeviceVector{Float32}, ebcz::CuDeviceVector{Float32},
+    vnx::CuDeviceVector{Float32}, vny::CuDeviceVector{Float32}, vnz::CuDeviceVector{Float32},
     start::Float32, step::Float32, n_grid::Int32, n_faces::Int32, ε²::Float32,
     ::Val{TILE}
 ) where {TILE}
-
     ix = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - 1) * blockDim().y + threadIdx().y
     iz = (blockIdx().z - 1) * blockDim().z + threadIdx().z
@@ -526,7 +527,7 @@ function compute_sdf_kernel!(
     stride = tx * ty * tz
 
     best_d² = Inf32
-    best_f  = Int32(1)
+    best_face  = Int32(1)
 
     tile_start = Int32(1)
     while tile_start <= n_faces
@@ -570,7 +571,7 @@ function compute_sdf_kernel!(
             d² = dist2_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
             if d² < best_d²
                 best_d² = d²
-                best_f = tile_start + t - Int32(1)
+                best_face = tile_start + t - Int32(1)
             end
             t += Int32(1)
         end
@@ -581,21 +582,21 @@ function compute_sdf_kernel!(
 
     # robust on-surface handling
     if best_d² <= ε²
-        @inbounds out[ix, iy, iz] = 0f0
+        @inbounds sdf[ix, iy, iz] = 0f0
         return nothing
     end
 
     # compute closest point + feature only for best face
     @inbounds begin
-        ax  = v0x[best_f]
-        ay  = v0y[best_f]
-        az  = v0z[best_f]
-        abx = e0x[best_f]
-        aby = e0y[best_f]
-        abz = e0z[best_f]
-        acx = e1x[best_f]
-        acy = e1y[best_f]
-        acz = e1z[best_f]
+        ax  = v0x[best_face]
+        ay  = v0y[best_face]
+        az  = v0z[best_face]
+        abx = e0x[best_face]
+        aby = e0y[best_face]
+        abz = e0z[best_face]
+        acx = e1x[best_face]
+        acy = e1y[best_face]
+        acz = e1z[best_face]
     end
 
     qx, qy, qz, region = closest_point_region(
@@ -609,36 +610,36 @@ function compute_sdf_kernel!(
 
     @inbounds begin
         if region == UInt8(0)
-            nx = fnx[best_f]
-            ny = fny[best_f]
-            nz = fnz[best_f]
+            nx = fnx[best_face]
+            ny = fny[best_face]
+            nz = fnz[best_face]
         elseif region == UInt8(1)
-            vi = i0[best_f]
+            vi = i0[best_face]
             nx = vnx[vi]
             ny = vny[vi]
             nz = vnz[vi]
         elseif region == UInt8(2)
-            vi = i1[best_f]
+            vi = i1[best_face]
             nx = vnx[vi]
             ny = vny[vi]
             nz = vnz[vi]
         elseif region == UInt8(3)
-            vi = i2[best_f]
+            vi = i2[best_face]
             nx = vnx[vi]
             ny = vny[vi]
             nz = vnz[vi]
         elseif region == UInt8(4)   # AB
-            nx = eabx[best_f]
-            ny = eaby[best_f]
-            nz = eabz[best_f]
+            nx = eabx[best_face]
+            ny = eaby[best_face]
+            nz = eabz[best_face]
         elseif region == UInt8(5)   # AC
-            nx = eacx[best_f]
-            ny = eacy[best_f]
-            nz = eacz[best_f]
+            nx = eacx[best_face]
+            ny = eacy[best_face]
+            nz = eacz[best_face]
         else                        # BC
-            nx = ebcx[best_f]
-            ny = ebcy[best_f]
-            nz = ebcz[best_f]
+            nx = ebcx[best_face]
+            ny = ebcy[best_face]
+            nz = ebcz[best_face]
         end
     end
 
@@ -649,8 +650,9 @@ function compute_sdf_kernel!(
     s = dot3f(vx, vy, vz, nx, ny, nz)
     d = sqrt(best_d²)
 
-    @inbounds out[ix, iy, iz] = (s >= 0f0) ? d : -d
-
+    is_negative = (s < 0)
+    sgn = 1.0f0 - 2.0f0 * is_negative
+    @inbounds sdf[ix, iy, iz] = sgn * d
     return nothing
 end
 
