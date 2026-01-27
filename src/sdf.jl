@@ -663,11 +663,17 @@ end
 # Public API (drop-in replacement style)
 # =============================================================================
 
+function compute_sdf(mesh::Mesh{3,Float32}, n::Int=128; tile_size::Int=256)
+    rng = range(-1f0, 1f0; length=n)
+    sdf = compute_sdf(mesh.position, mesh.faces, rng; tile_size)
+    return sdf::CuArray{Float32,3}
+end
+
 function compute_sdf(
     vertices::Vector{Point3{Float32}},
     faces::Vector{<:NgonFace{3}},
     rng::StepRangeLen{Float32};
-    tile_size::Int = 256
+    tile_size::Int=256
 )
     # - analytic grid coordinate generation (no d_grid loads)
     # - true Float64 CPU preprocessing for normals/angles
@@ -754,5 +760,5 @@ function compute_sdf(
         CUDA.Const(d_vnx), CUDA.Const(d_vny), CUDA.Const(d_vnz),
         start, step, n_grid, data_cpu.n_faces, ε², val_tile_size
     )
-    return sdf
+    return sdf::CuArray{Float32,3}
 end
