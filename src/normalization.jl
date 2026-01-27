@@ -18,13 +18,13 @@ end
 """
     normalize_pointcloud(points::CuMatrix{Float32})
 
-Normalize a 3D point cloud in-place on the GPU:
+Normalize a 3D point cloud on the GPU:
 - Centers at origin
 - Scales to fit within unit sphere
 - Aligns principal axes (largest variance along x, then y, then z)
 
 Points should be 3×N matrix where columns are 3D points.
-Returns the normalized points and transformation parameters (centroid, scale, rotation).
+Returns a new normalized matrix and transformation parameters (centroid, scale, rotation).
 """
 function normalize_pointcloud(points::CuMatrix{Float32})
     @assert size(points, 1) == 3 "Expected 3×N matrix with columns as points"
