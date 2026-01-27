@@ -744,15 +744,15 @@ function compute_sdf(
 
     @cuda threads=threads blocks=blocks compute_sdf_kernel!(
         sdf,
-        CUDA.Const(d_v0x), CUDA.Const(d_v0y), CUDA.Const(d_v0z),
-        CUDA.Const(d_e0x), CUDA.Const(d_e0y), CUDA.Const(d_e0z),
-        CUDA.Const(d_e1x), CUDA.Const(d_e1y), CUDA.Const(d_e1z),
-        CUDA.Const(d_i0),  CUDA.Const(d_i1),  CUDA.Const(d_i2),
-        CUDA.Const(d_fnx), CUDA.Const(d_fny), CUDA.Const(d_fnz),
-        CUDA.Const(d_eabx), CUDA.Const(d_eaby), CUDA.Const(d_eabz),
-        CUDA.Const(d_eacx), CUDA.Const(d_eacy), CUDA.Const(d_eacz),
-        CUDA.Const(d_ebcx), CUDA.Const(d_ebcy), CUDA.Const(d_ebcz),
-        CUDA.Const(d_vnx), CUDA.Const(d_vny), CUDA.Const(d_vnz),
+        d_v0x, d_v0y, d_v0z,
+        d_e0x, d_e0y, d_e0z,
+        d_e1x, d_e1y, d_e1z,
+        d_i0,  d_i1,  d_i2,
+        d_fnx, d_fny, d_fnz,
+        d_eabx, d_eaby, d_eabz,
+        d_eacx, d_eacy, d_eacz,
+        d_ebcx, d_ebcy, d_ebcz,
+        d_vnx, d_vny, d_vnz,
         start, Δ, n_grid, data_cpu.n_faces, ε², val_tile_size
     )
     return sdf::CuArray{Float32,3}
