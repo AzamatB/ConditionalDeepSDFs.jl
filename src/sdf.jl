@@ -258,7 +258,7 @@ Degenerate faces (very small area) are dropped.
 """
 function precompute_data_on_cpu(
     vertices::Vector{Point3{Float32}},
-    faces::Vector{<:NgonFace{3}};
+    faces::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}};
     degenerate_area2_eps::Float64 = 1e-20
 )
     n_verts = length(vertices)
@@ -666,7 +666,7 @@ end
 
 function compute_sdf(
     vertices::Vector{Point3{Float32}},
-    faces::Vector{<:NgonFace{3}},
+    faces::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}},
     rng::StepRangeLen{Float32};
     tile_size::Int=256
 )
