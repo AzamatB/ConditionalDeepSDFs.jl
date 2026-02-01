@@ -77,7 +77,7 @@ function dist2_point_triangle(
     d1 = dot3f(abx, aby, abz, apx, apy, apz)
     d2 = dot3f(acx, acy, acz, apx, apy, apz)
 
-    if (d1 <= 0f0) & (d2 <= 0f0)
+    if (d1 <= 0.0f0) & (d2 <= 0.0f0)
         return dot3f(apx, apy, apz, apx, apy, apz)  # closest to A
     end
 
@@ -88,7 +88,7 @@ function dist2_point_triangle(
     d3 = dot3f(abx, aby, abz, bpx, bpy, bpz)
     d4 = dot3f(acx, acy, acz, bpx, bpy, bpz)
 
-    if (d3 >= 0f0) & (d4 <= d3)
+    if (d3 >= 0.0f0) & (d4 <= d3)
         return dot3f(bpx, bpy, bpz, bpx, bpy, bpz)  # closest to B
     end
 
@@ -99,7 +99,7 @@ function dist2_point_triangle(
     d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
     d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
 
-    if (d6 >= 0f0) & (d5 <= d6)
+    if (d6 >= 0.0f0) & (d5 <= d6)
         return dot3f(cpx, cpy, cpz, cpx, cpy, cpz)  # closest to C
     end
 
@@ -170,7 +170,7 @@ function closest_point_region(
     d1 = dot3f(abx, aby, abz, apx, apy, apz)
     d2 = dot3f(acx, acy, acz, apx, apy, apz)
 
-    if (d1 <= 0f0) & (d2 <= 0f0)
+    if (d1 <= 0.0f0) & (d2 <= 0.0f0)
         return ax, ay, az, UInt8(1)
     end
 
@@ -181,7 +181,7 @@ function closest_point_region(
     d3 = dot3f(abx, aby, abz, bpx, bpy, bpz)
     d4 = dot3f(acx, acy, acz, bpx, bpy, bpz)
 
-    if (d3 >= 0f0) & (d4 <= d3)
+    if (d3 >= 0.0f0) & (d4 <= d3)
         return ax + abx, ay + aby, az + abz, UInt8(2)
     end
 
@@ -192,12 +192,12 @@ function closest_point_region(
     d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
     d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
 
-    if (d6 >= 0f0) & (d5 <= d6)
+    if (d6 >= 0.0f0) & (d5 <= d6)
         return ax + acx, ay + acy, az + acz, UInt8(3)
     end
 
     vc = d1*d4 - d3*d2
-    if (vc <= 0f0) & (d1 >= 0f0) & (d3 <= 0f0)
+    if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
         v = d1 / (d1 - d3)
         qx = muladd(v, abx, ax)
         qy = muladd(v, aby, ay)
@@ -206,7 +206,7 @@ function closest_point_region(
     end
 
     vb = d5*d2 - d1*d6
-    if (vb <= 0f0) & (d2 >= 0f0) & (d6 <= 0f0)
+    if (vb <= 0.0f0) & (d2 >= 0.0f0) & (d6 <= 0.0f0)
         w = d2 / (d2 - d6)
         qx = muladd(w, acx, ax)
         qy = muladd(w, acy, ay)
@@ -215,7 +215,7 @@ function closest_point_region(
     end
 
     va = d3*d6 - d5*d4
-    if (va <= 0f0) & ((d4 - d3) >= 0f0) & ((d5 - d6) >= 0f0)
+    if (va <= 0.0f0) & ((d4 - d3) >= 0.0f0) & ((d5 - d6) >= 0.0f0)
         w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
         bcx = acx - abx
         bcy = acy - aby
@@ -259,7 +259,7 @@ Degenerate faces (very small area) are dropped.
 function precompute_data_on_cpu(
     vertices::Vector{Point3{Float32}},
     faces::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}};
-    degenerate_area2_eps::Float64 = 1e-20
+    degenerate_area2_eps::Float64=1e-20
 )
     n_verts = length(vertices)
     # Accumulators for vertex pseudo-normals (Float64)
@@ -404,9 +404,9 @@ function precompute_data_on_cpu(
         n = norm3(x, y, z)
 
         if n == 0.0
-            vnx[i] = 0f0
-            vny[i] = 0f0
-            vnz[i] = 1f0
+            vnx[i] = 0.0f0
+            vny[i] = 0.0f0
+            vnz[i] = 1.0f0
         else
             inv = 1.0 / n
             vnx[i] = Float32(x * inv)
@@ -420,7 +420,7 @@ function precompute_data_on_cpu(
     for (k, (sx, sy, sz)) in edge_acc
         n = norm3(sx, sy, sz)
         if n == 0.0
-            edge_unit[k] = (0f0, 0f0, 0f0)
+            edge_unit[k] = (0.0f0, 0.0f0, 0.0f0)
         else
             inv = 1.0 / n
             edge_unit[k] = (Float32(sx * inv), Float32(sy * inv), Float32(sz * inv))
@@ -523,11 +523,11 @@ function compute_sdf_kernel!(
     tx = blockDim().x
     ty = blockDim().y
     tz = blockDim().z
-    tid = (threadIdx().z - 1) * (tx*ty) + (threadIdx().y - 1) * tx + threadIdx().x
+    tid = (threadIdx().z - 1) * (tx * ty) + (threadIdx().y - 1) * tx + threadIdx().x
     stride = tx * ty * tz
 
     best_d² = Inf32
-    best_face  = Int32(1)
+    best_face = Int32(1)
 
     tile_start = Int32(1)
     while tile_start <= n_faces
@@ -558,9 +558,9 @@ function compute_sdf_kernel!(
         # process tile (dist² only)
         t = Int32(1)
         while t <= cnt
-            ax  = sh_v0x[t]
-            ay  = sh_v0y[t]
-            az  = sh_v0z[t]
+            ax = sh_v0x[t]
+            ay = sh_v0y[t]
+            az = sh_v0z[t]
             abx = sh_e0x[t]
             aby = sh_e0y[t]
             abz = sh_e0z[t]
@@ -582,15 +582,15 @@ function compute_sdf_kernel!(
 
     # robust on-surface handling
     if best_d² <= ε²
-        @inbounds sdf[ix, iy, iz] = 0f0
+        @inbounds sdf[ix, iy, iz] = 0.0f0
         return nothing
     end
 
     # compute closest point + feature only for best face
     @inbounds begin
-        ax  = v0x[best_face]
-        ay  = v0y[best_face]
-        az  = v0z[best_face]
+        ax = v0x[best_face]
+        ay = v0y[best_face]
+        az = v0z[best_face]
         abx = e0x[best_face]
         aby = e0y[best_face]
         abz = e0z[best_face]
@@ -604,9 +604,9 @@ function compute_sdf_kernel!(
     )
 
     # choose pseudo-normal (face/edge/vertex)
-    nx = 0f0
-    ny = 0f0
-    nz = 1f0
+    nx = 0.0f0
+    ny = 0.0f0
+    nz = 1.0f0
 
     @inbounds begin
         if region == UInt8(0)
@@ -661,7 +661,7 @@ end
 # =============================================================================
 
 function compute_sdf(mesh::Mesh{3,Float32}, n::Int=128; tile_size::Int=256)
-    rng = range(-1f0, 1f0; length=n)
+    rng = range(-1.0f0, 1.0f0; length=n)
     sdf = compute_sdf(mesh.position, mesh.faces, rng; tile_size)
     return sdf::CuArray{Float32,3}
 end
@@ -696,9 +696,9 @@ function compute_sdf(
     d_e1y = CuArray(data_cpu.e1y)
     d_e1z = CuArray(data_cpu.e1z)
 
-    d_i0  = CuArray(data_cpu.i0)
-    d_i1  = CuArray(data_cpu.i1)
-    d_i2  = CuArray(data_cpu.i2)
+    d_i0 = CuArray(data_cpu.i0)
+    d_i1 = CuArray(data_cpu.i1)
+    d_i2 = CuArray(data_cpu.i2)
 
     d_fnx = CuArray(data_cpu.fnx)
     d_fny = CuArray(data_cpu.fny)
@@ -722,10 +722,10 @@ function compute_sdf(
 
     n_grid = Int32(length(rng))
     start = Float32(first(rng))
-    Δ  = Float32(step(rng))
+    Δ = Float32(step(rng))
 
     # Robust on-surface epsilon
-    ε = max(1f-6, 1f-3 * Δ)
+    ε = max(1.0f-6, 1.0f-3 * Δ)
     ε² = ε * ε
 
     sdf = CUDA.zeros(Float32, n_grid, n_grid, n_grid)
