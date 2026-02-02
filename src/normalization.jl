@@ -78,8 +78,9 @@ function normalize_pointcloud(points::Vector{Point3{Float32}})
 end
 
 function normalize_mesh(mesh::Mesh{3,Float32})
-    vertices = mesh.position
+    vertices = coordinates(mesh)
+    faces = faces(mesh)
     (vertices_normalized, _) = normalize_pointcloud(vertices)
-    mesh_normalized = Mesh(vertices_normalized, mesh.faces)
+    mesh_normalized = Mesh(vertices_normalized, faces)
     return mesh_normalized::Mesh{3,Float32}
 end

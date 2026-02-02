@@ -600,7 +600,9 @@ end
 
 function compute_sdf(mesh::Mesh{3,Float32}, n::Int=128; tile_size::Int=256)
     rng = range(-1.0f0, 1.0f0; length=n)
-    sdf = compute_sdf(mesh.position, mesh.faces, rng; tile_size)
+    vertices = coordinates(mesh)
+    faces = faces(mesh)
+    sdf = compute_sdf(vertices, faces, rng; tile_size)
     return sdf::CuArray{Float32,3}
 end
 
