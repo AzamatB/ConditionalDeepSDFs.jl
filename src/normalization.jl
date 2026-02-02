@@ -1,8 +1,7 @@
 using CUDA
-using Statistics
+using GeometryBasics
 using LinearAlgebra
-
-using GeometryBasics: Mesh, Point3
+using Statistics
 
 function vec_to_matrix(points::Vector{Point3{T}}) where {T<:Real}
     matrix = reinterpret(reshape, T, points)
@@ -79,8 +78,8 @@ end
 
 function normalize_mesh(mesh::Mesh{3,Float32})
     vertices = coordinates(mesh)
-    faces = faces(mesh)
+    triangles = faces(mesh)
     (vertices_normalized, _) = normalize_pointcloud(vertices)
-    mesh_normalized = Mesh(vertices_normalized, faces)
+    mesh_normalized = Mesh(vertices_normalized, triangles)
     return mesh_normalized::Mesh{3,Float32}
 end

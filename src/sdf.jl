@@ -199,10 +199,25 @@ Degenerate faces (very small area) are dropped.
 """
 function precompute_data_on_cpu(
     vertices::Vector{Point3{Float32}},
-    faces::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}};
+    triangles::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}};
     degenerate_area2_eps::Float64=1e-20
 )
     n_verts = length(vertices)
+
+    # compute signed volume to determine global normal orientation
+    # for a closed mesh with outward normals, signed volume should be positive
+    signed_volume = 0.0
+    for face in triangles
+        (a, b, c) = face_indices(face)
+        ax, ay, az = Float64(vertices[a][1]), Float64(vertices[a][2]), Float64(vertices[a][3])
+        bx, by, bz = Float64(vertices[b][1]), Float64(vertices[b][2]), Float64(vertices[b][3])
+        cx, cy, cz = Float64(vertices[c][1]), Float64(vertices[c][2]), Float64(vertices[c][3])
+        # signed volume of tetrahedron from origin to triangle = (1/6)a·(b × c)
+        signed_volume += (ax * (by*cz - bz*cy) + ay * (bz*cx - bx*cz) + az * (bx*cy - by*cx))
+    end
+    # if signed volume is negative, normals point inward - we need to flip them all
+    global_flip = signed_volume < 0.0
+
     # Accumulators for vertex pseudo-normals (Float64)
     vnx_acc = zeros(Float64, n_verts)
     vny_acc = zeros(Float64, n_verts)
@@ -211,7 +226,7 @@ function precompute_data_on_cpu(
     # edge normal sums (sum of incident unit face normals)
     edge_acc = Dict{UInt64,NTuple{3,Float64}}()
 
-    # Packed triangles (skip degenerates)
+    # packed triangles (skip degenerates)
     i0 = Int32[]
     i1 = Int32[]
     i2 = Int32[]
@@ -230,7 +245,7 @@ function precompute_data_on_cpu(
     fny = Float32[]
     fnz = Float32[]
 
-    @inbounds for face in faces
+    @inbounds for face in triangles
         (a, b, c) = face_indices(face)
 
         ax = Float64(vertices[a][1])
@@ -268,7 +283,14 @@ function precompute_data_on_cpu(
         nuy = ny * invn
         nuz = nz * invn
 
-        # Angles for vertex pseudo-normals (Float64)
+        # Apply global flip if mesh has inside-out winding
+        if global_flip
+            nux = -nux
+            nuy = -nuy
+            nuz = -nuz
+        end
+
+        # angles for vertex pseudo-normals (Float64)
         angA = angle_between(abx64, aby64, abz64, acx64, acy64, acz64)
 
         bax = -abx64
@@ -306,7 +328,7 @@ function precompute_data_on_cpu(
             edge_acc[key] = (sx + nux, sy + nuy, sz + nuz)
         end
 
-        # Store packed tri geometry
+        # store packed tri geometry
         push!(i0, a)
         push!(i1, b)
         push!(i2, c)
@@ -356,7 +378,7 @@ function precompute_data_on_cpu(
         end
     end
 
-    # Normalize edge pseudo-normals (dict of UInt64 => Float32 triple)
+    # normalize edge pseudo-normals (dict of UInt64 => Float32 triple)
     edge_unit = Dict{UInt64,NTuple{3,Float32}}()
     for (k, (sx, sy, sz)) in edge_acc
         n = norm3(sx, sy, sz)
@@ -368,7 +390,7 @@ function precompute_data_on_cpu(
         end
     end
 
-    # Per-triangle edge normals for AB, AC, BC
+    # per-triangle edge normals for AB, AC, BC
     eabx = Vector{Float32}(undef, n_faces)
     eaby = Vector{Float32}(undef, n_faces)
     eabz = Vector{Float32}(undef, n_faces)
@@ -601,14 +623,14 @@ end
 function compute_sdf(mesh::Mesh{3,Float32}, n::Int=128; tile_size::Int=256)
     rng = range(-1.0f0, 1.0f0; length=n)
     vertices = coordinates(mesh)
-    faces = faces(mesh)
-    sdf = compute_sdf(vertices, faces, rng; tile_size)
+    triangles = faces(mesh)
+    sdf = compute_sdf(vertices, triangles, rng; tile_size)
     return sdf::CuArray{Float32,3}
 end
 
 function compute_sdf(
     vertices::Vector{Point3{Float32}},
-    faces::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}},
+    triangles::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}},
     rng::StepRangeLen{Float32};
     tile_size::Int=256
 )
@@ -621,7 +643,7 @@ function compute_sdf(
     # - generic thread indexing and tunable TILE_SIZE (64/128/256)
     (tile_size ∈ (64, 128, 256)) || error("tile_size must be 64, 128, or 256")
 
-    data_cpu = precompute_data_on_cpu(vertices, faces)
+    data_cpu = precompute_data_on_cpu(vertices, triangles)
 
     # Upload to GPU
     d_v0x = CuArray(data_cpu.v0x)
