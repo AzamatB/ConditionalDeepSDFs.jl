@@ -102,6 +102,20 @@ function dist2_and_region(
         return d², UInt8(2), ax + abx, ay + aby, az + abz
     end
 
+    # must to compute cpx, d5, d6 BEFORE edge checks (needed for vertex C and edge BC)
+    cpx = apx - acx
+    cpy = apy - acy
+    cpz = apz - acz
+
+    d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
+    d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
+
+    # vertex C region (must check BEFORE edge AB)
+    if (d6 >= 0.0f0) & (d5 <= d6)
+        d² = dot3f(cpx, cpy, cpz, cpx, cpy, cpz)
+        return d², UInt8(3), ax + acx, ay + acy, az + acz
+    end
+
     # edge AB region
     vc = d1*d4 - d3*d2
     if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
@@ -114,19 +128,6 @@ function dist2_and_region(
         dz = pz - qz
         d² = dot3f(dx, dy, dz, dx, dy, dz)
         return d², UInt8(4), qx, qy, qz
-    end
-
-    cpx = apx - acx
-    cpy = apy - acy
-    cpz = apz - acz
-
-    d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
-    d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
-
-    # vertex C region
-    if (d6 >= 0.0f0) & (d5 <= d6)
-        d² = dot3f(cpx, cpy, cpz, cpx, cpy, cpz)
-        return d², UInt8(3), ax + acx, ay + acy, az + acz
     end
 
     # edge AC region
