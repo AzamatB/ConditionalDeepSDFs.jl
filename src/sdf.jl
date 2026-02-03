@@ -5,19 +5,13 @@ using LinearAlgebra
 # ----------------------------
 # CPU helpers (Float64)
 # ----------------------------
-
-function face_indices(face::NgonFace{3,OffsetInteger{-1,UInt32}})
-    vertex_indices = convert.(Int32, face)
-    return vertex_indices
-end
-
 function dot3(x1::Float64, y1::Float64, z1::Float64, x2::Float64, y2::Float64, z2::Float64)
-    value = x1*x2 + y1*y2 + z1*z2
+    value = x1 * x2 + y1 * y2 + z1 * z2
     return value::Float64
 end
 
 function norm3(x::Float64, y::Float64, z::Float64)
-    value = sqrt(x*x + y*y + z*z)
+    value = sqrt(x * x + y * y + z * z)
     return value::Float64
 end
 
@@ -117,7 +111,7 @@ function dist2_and_region(
     end
 
     # edge AB region
-    vc = d1*d4 - d3*d2
+    vc = d1 * d4 - d3 * d2
     if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
         v = d1 / (d1 - d3)
         qx = muladd(v, abx, ax)
@@ -131,7 +125,7 @@ function dist2_and_region(
     end
 
     # edge AC region
-    vb = d5*d2 - d1*d6
+    vb = d5 * d2 - d1 * d6
     if (vb <= 0.0f0) & (d2 >= 0.0f0) & (d6 <= 0.0f0)
         w = d2 / (d2 - d6)
         qx = muladd(w, acx, ax)
@@ -145,7 +139,7 @@ function dist2_and_region(
     end
 
     # edge BC region
-    va = d3*d6 - d5*d4
+    va = d3 * d6 - d5 * d4
     if (va <= 0.0f0) & ((d4 - d3) >= 0.0f0) & ((d5 - d6) >= 0.0f0)
         w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
         bcx = acx - abx
@@ -208,12 +202,12 @@ function precompute_data_on_cpu(
     # for a closed mesh with outward normals, signed volume should be positive
     signed_volume = 0.0
     for face in triangles
-        (a, b, c) = face_indices(face)
-        ax, ay, az = Float64(vertices[a][1]), Float64(vertices[a][2]), Float64(vertices[a][3])
-        bx, by, bz = Float64(vertices[b][1]), Float64(vertices[b][2]), Float64(vertices[b][3])
-        cx, cy, cz = Float64(vertices[c][1]), Float64(vertices[c][2]), Float64(vertices[c][3])
+        (a, b, c) = face
+        (ax, ay, az) = Float64.(vertices[a])
+        (bx, by, bz) = Float64.(vertices[b])
+        (cx, cy, cz) = Float64.(vertices[c])
         # signed volume of tetrahedron from origin to triangle = (1/6)a·(b × c)
-        signed_volume += (ax * (by*cz - bz*cy) + ay * (bz*cx - bx*cz) + az * (bx*cy - by*cx))
+        signed_volume += (ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx))
     end
     # if signed volume is negative, normals point inward - we need to flip them all
     global_flip = signed_volume < 0.0
@@ -246,19 +240,10 @@ function precompute_data_on_cpu(
     fnz = Float32[]
 
     @inbounds for face in triangles
-        (a, b, c) = face_indices(face)
-
-        ax = Float64(vertices[a][1])
-        ay = Float64(vertices[a][2])
-        az = Float64(vertices[a][3])
-
-        bx = Float64(vertices[b][1])
-        by = Float64(vertices[b][2])
-        bz = Float64(vertices[b][3])
-
-        cx = Float64(vertices[c][1])
-        cy = Float64(vertices[c][2])
-        cz = Float64(vertices[c][3])
+        (a, b, c) = face
+        (ax, ay, az) = Float64.(vertices[a])
+        (bx, by, bz) = Float64.(vertices[b])
+        (cx, cy, cz) = Float64.(vertices[c])
 
         abx64 = bx - ax
         aby64 = by - ay
@@ -269,11 +254,11 @@ function precompute_data_on_cpu(
         acz64 = cz - az
 
         # face normal (unit)
-        nx = aby64*acz64 - abz64*acy64
-        ny = abz64*acx64 - abx64*acz64
-        nz = abx64*acy64 - aby64*acx64
+        nx = aby64 * acz64 - abz64 * acy64
+        ny = abz64 * acx64 - abx64 * acz64
+        nz = abx64 * acy64 - aby64 * acx64
 
-        area2 = nx*nx + ny*ny + nz*nz
+        area2 = nx * nx + ny * ny + nz * nz
         if area2 <= degenerate_area2_eps
             continue
         end
