@@ -91,7 +91,7 @@ Deterministic vertex welding using lexicographic sort (x,y,z) + sweep line windo
 
 - Merges vertices connected by edges of length ≤ ε (single-linkage via union-find).
 - Sets welded vertex positions to the centroid (mean) of their cluster.
-- Remaps faces and removes degenerate triangles (repeated indices).
+- Remaps faces and removes degenerate and duplicate triangles (repeated indices).
 
 Returns: `Mesh{3, Float32, TriangleFace{Int32}}`.
 
@@ -108,13 +108,15 @@ function merge_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
 
     ε² = ε * ε
     # sort indices lexicographically by (x, y, z)
-    @inline function is_less(i::Int, j::Int)
-        Δ = @inbounds vertices[i] - vertices[j]
+    @inline @inbounds function is_less(i::Int, j::Int)
+        pi = vertices[i]
+        pj = vertices[j]
+        Δ = pi - pj
         (Δx, Δy, Δz) = Δ
         # prioritized comparison: x, then y, then z
-        cmp = ifelse(iszero(Δx), ifelse(iszero(Δy), Δz, Δy), Δx)
-        result = cmp < zero(Float32)
-        return result
+        cmp = ifelse(Δx == 0f0, Δy, Δx)
+        cmp = ifelse(cmp == 0f0, Δz, cmp)
+        return cmp < 0f0
     end
     perm = collect(1:num_vertices)
     sort!(perm, lt=is_less)
@@ -149,11 +151,14 @@ function merge_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     @inbounds for hi in 1:num_vertices
         ii = perm[hi]
         pi = vertices[ii]
-        (xi, yi, zi) = Float64.(pi)
+        xi = Float64(pi[1])
+        yi = Float64(pi[2])
+        zi = Float64(pi[3])
 
         while lo < hi
             jj = perm[lo]
-            xj = Float64(vertices[jj][1])
+            pj = vertices[jj]
+            xj = Float64(pj[1])
             Δx = xi - xj
             (Δx > ε) || break
             lo += 1
@@ -217,7 +222,7 @@ function merge_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     faces_new = Vector{TriangleFace{Int32}}(undef, num_faces)
     k = 0
     @inbounds for index in 1:num_faces
-        face = faces[index]
+        face = faces_old[index]
         a = old2new[face[1]]
         b = old2new[face[2]]
         c = old2new[face[3]]
