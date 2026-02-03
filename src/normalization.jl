@@ -91,7 +91,8 @@ Deterministic vertex welding using lexicographic sort (x,y,z) + sweep line windo
 
 - Merges vertices connected by edges of length ≤ ε (single-linkage via union-find).
 - Sets welded vertex positions to the centroid (mean) of their cluster.
-- Remaps faces and removes degenerate and duplicate triangles (repeated indices).
+- Remaps faces and removes degenerate triangles (repeated vertex indices) and
+  duplicate triangles (same 3 vertices up to permutation).
 
 Returns: `Mesh{3, Float32, TriangleFace{Int32}}`.
 
@@ -111,8 +112,9 @@ function merge_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     @inline @inbounds function is_less(i::Int, j::Int)
         pi = vertices[i]
         pj = vertices[j]
-        Δ = pi - pj
-        (Δx, Δy, Δz) = Δ
+        Δx = pi[1] - pj[1]
+        Δy = pi[2] - pj[2]
+        Δz = pi[3] - pj[3]
         # prioritized comparison: x, then y, then z
         cmp = ifelse(Δx == 0f0, Δy, Δx)
         cmp = ifelse(cmp == 0f0, Δz, cmp)
@@ -239,25 +241,15 @@ function merge_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     return Mesh(vertices_new, faces_new)
 end
 
-@inline function sort_triplet(a::Int32, b::Int32, c::Int32)
+@inline function sort_triplet(a::Int32, b::Int32, c::Int32)::NTuple{3,Int32}
     # compare-swap (a, b)
     gt = a > b
-    aa = ifelse(gt, b, a)
-    bb = ifelse(gt, a, b)
-    a = aa
-    b = bb
-
+    a, b = ifelse(gt, b, a), ifelse(gt, a, b)
     # compare-swap (b, c)
     gt = b > c
-    bb = ifelse(gt, c, b)
-    cc = ifelse(gt, b, c)
-    b = bb
-    c = cc
-
+    b, c = ifelse(gt, c, b), ifelse(gt, b, c)
     # compare-swap (a, b)
     gt = a > b
-    aa = ifelse(gt, b, a)
-    bb = ifelse(gt, a, b)
-
-    return (aa, bb, c)
+    a, b = ifelse(gt, b, a), ifelse(gt, a, b)
+    return (a, b, c)
 end
