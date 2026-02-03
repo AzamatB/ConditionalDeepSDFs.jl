@@ -239,9 +239,25 @@ function merge_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     return Mesh(vertices_new, faces_new)
 end
 
-@inline function sort_triplet(a::R, b::R, c::R) where {R<:Real}
-    (a, b) = ifelse(a > b, (b, a), (a, b))
-    (b, c) = ifelse(b > c, (c, b), (b, c))
-    (a, b) = ifelse(a > b, (b, a), (a, b))
-    return (a, b, c)
+@inline function sort_triplet(a::Int32, b::Int32, c::Int32)
+    # compare-swap (a, b)
+    gt = a > b
+    aa = ifelse(gt, b, a)
+    bb = ifelse(gt, a, b)
+    a = aa
+    b = bb
+
+    # compare-swap (b, c)
+    gt = b > c
+    bb = ifelse(gt, c, b)
+    cc = ifelse(gt, b, c)
+    b = bb
+    c = cc
+
+    # compare-swap (a, b)
+    gt = a > b
+    aa = ifelse(gt, b, a)
+    bb = ifelse(gt, a, b)
+
+    return (aa, bb, c)
 end
