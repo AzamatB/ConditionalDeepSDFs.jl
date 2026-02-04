@@ -173,8 +173,11 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     end
     resize!(faces_new, k)
     num_vertices_new = length(vertices_new)
-    ratio = round(100 * num_vertices_new / num_vertices; digits=2)
-    @info "Welded vertices: $num_vertices_new / $num_vertices = $ratio%"
+    ratio_v = round(100 * num_vertices_new / num_vertices; digits=2)
+    ratio_f = round(100 * k / num_faces; digits=2)
+    @info "$ratio_v% of the original $num_vertices vertices remain after performing the vertex welding."
+    @info "$ratio_f% of the original $num_faces faces remain after performing the vertex welding."
+
     return Mesh(vertices_new, faces_new)
 end
 
@@ -375,6 +378,10 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
             end
         end
     end
+
+    num_reoriented = count(flip)
+    ratio = round(100 * num_reoriented / num_faces; digits=2)
+    @info "Reoriented $ratio% of the total $num_faces faces."
 
     FT = eltype(fcs)  # GLTriangleFace
     faces_new = Vector{FT}(undef, num_faces)
