@@ -1,7 +1,6 @@
 using CUDA
 using GeometryBasics
 using LinearAlgebra
-using Statistics
 
 function canonicalize(mesh::Mesh{3,Float32,GLTriangleFace})
     # weld vertices that are within distance ε (single-linkage via union-find)

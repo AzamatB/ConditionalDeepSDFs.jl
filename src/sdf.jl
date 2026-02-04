@@ -198,7 +198,7 @@ Degenerate faces (very small area) are dropped.
 function precompute_data_on_cpu(
     vertices::Vector{Point3{Float32}},
     fcs::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}};
-    degenerate_area2_eps::Float64=1e-20
+    degenerate_area2_tol::Float64=1e-20
 )
     n_verts = length(vertices)
     # Accumulators for vertex pseudo-normals (Float64)
@@ -251,7 +251,7 @@ function precompute_data_on_cpu(
         nz = abx64 * acy64 - aby64 * acx64
 
         area2 = nx * nx + ny * ny + nz * nz
-        if area2 <= degenerate_area2_eps
+        if area2 <= degenerate_area2_tol
             continue
         end
 
@@ -330,6 +330,7 @@ function precompute_data_on_cpu(
     vny = Vector{Float32}(undef, n_verts)
     vnz = Vector{Float32}(undef, n_verts)
 
+    do_warn = false
     @inbounds for i in 1:n_verts
         x = vnx_acc[i]
         y = vny_acc[i]
@@ -339,7 +340,8 @@ function precompute_data_on_cpu(
         if n == 0.0
             vnx[i] = 0.0f0
             vny[i] = 0.0f0
-            vnz[i] = 1.0f0
+            vnz[i] = 0.0f0
+            do_warn = true
         else
             inv = 1.0 / n
             vnx[i] = Float32(x * inv)
@@ -347,6 +349,7 @@ function precompute_data_on_cpu(
             vnz[i] = Float32(z * inv)
         end
     end
+    do_warn && @warn("Non-manifold geometry detected: some vertices had zero pseudo-normals")
 
     # normalize edge pseudo-normals (dict of UInt64 => Float32 triple)
     edge_unit = Dict{UInt64,NTuple{3,Float32}}()
