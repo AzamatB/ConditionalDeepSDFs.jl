@@ -390,6 +390,7 @@ end
 
 function shift_to_origin!(mesh::Mesh{3,Float32,GLTriangleFace})
     vertices = coordinates(mesh)
+    isempty(vertices) && return mesh
     centroidd = sum(vertices; init=zero(Point3d)) / length(vertices)
     centroid = Point3f(centroidd)
     vertices .-= centroid
@@ -399,13 +400,12 @@ end
 """
     align_and_rescale(points::CuMatrix{Float32})
 
-Normalize a 3D point cloud on the GPU:
-- Centers at origin
+Normalize a 3D point cloud on the GPU assuming that it is already centered at the origin:
 - Scales to fit within unit sphere
 - Aligns principal axes (largest variance along x, then y, then z)
 
 Points should be 3×N matrix where columns are 3D points.
-Returns a new normalized matrix and transformation parameters (centroid, scale, rotation).
+Returns a new normalized matrix and transformation parameters (scale, rotation).
 """
 function align_and_rescale(mesh::Mesh{3,Float32})
     vertices = coordinates(mesh)
@@ -454,7 +454,8 @@ function align_and_rescale(points::CuMatrix{Float32})
     # step 4: scale to unit sphere
     distances² = sum(abs2, points; dims=1)
     radius_max = √(maximum(distances²))
-    scale = 1 / radius_max
+    is_zero = iszero(radius_max)
+    scale = inv(radius_max + is_zero)
     points = scale .* points
 
     params = (; scale=radius_max, rotation)

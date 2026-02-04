@@ -5,6 +5,10 @@ using LinearAlgebra
 # ----------------------------
 # CPU helpers (Float64)
 # ----------------------------
+function int32(n::GLIndex)
+    return Int32(GeometryBasics.value(n))
+end
+
 function dot3(x1::Float64, y1::Float64, z1::Float64, x2::Float64, y2::Float64, z2::Float64)
     value = x1 * x2 + y1 * y2 + z1 * z2
     return value::Float64
@@ -225,7 +229,10 @@ function precompute_data_on_cpu(
     fnz = Float32[]
 
     @inbounds for face in fcs
-        (a, b, c) = face
+        a = int32(face[1])
+        b = int32(face[2])
+        c = int32(face[3])
+
         (ax, ay, az) = Float64.(vertices[a])
         (bx, by, bz) = Float64.(vertices[b])
         (cx, cy, cz) = Float64.(vertices[c])
