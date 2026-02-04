@@ -4,7 +4,7 @@ using LinearAlgebra
 
 function canonicalize(mesh::Mesh{3,Float32,GLTriangleFace})
     # weld vertices that are within distance ε (single-linkage via union-find)
-    mesh_repaired = weld_vertices(mesh; ε::Float64=1e-7)
+    mesh_repaired = weld_vertices(mesh)
     # shift the mesh so that its vertex centroid is at the origin
     shift_to_origin!(mesh_repaired)
     # reorient the mesh so that its faces are oriented outward
@@ -172,6 +172,9 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
         faces_new[k] = FT(a, b, c)  # keep the first ordering encountered
     end
     resize!(faces_new, k)
+    num_vertices_new = length(vertices_new)
+    ratio = round(100 * num_vertices_new / num_vertices; digits=2)
+    @info "Welded vertices: $num_vertices_new / $num_vertices = $ratio%"
     return Mesh(vertices_new, faces_new)
 end
 
@@ -325,13 +328,10 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
 
     @inbounds for start in 1:num_faces
         seen[start] && continue
-
         head = 1
         tail = 1
         queue[1] = start
         seen[start] = true
-        flip[start] = false
-
         vol6 = 0.0
 
         while head <= tail
