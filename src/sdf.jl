@@ -51,6 +51,99 @@ function dot3f(ax::Float32, ay::Float32, az::Float32, bx::Float32, by::Float32, 
 end
 
 """
+Squared distance from point p to triangle defined by vertex A and edges AB, AC.
+
+This function matches the distance arithmetic used inside dist²_and_region, but does not
+compute the closest point or region. It is intended for the hot inner loop.
+"""
+function dist²_point_triangle(
+    px::Float32, py::Float32, pz::Float32,
+    ax::Float32, ay::Float32, az::Float32,
+    abx::Float32, aby::Float32, abz::Float32,
+    acx::Float32, acy::Float32, acz::Float32
+)
+    apx = px - ax
+    apy = py - ay
+    apz = pz - az
+    d1 = dot3f(abx, aby, abz, apx, apy, apz)
+    d2 = dot3f(acx, acy, acz, apx, apy, apz)
+    # vertex A region
+    if (d1 <= 0.0f0) & (d2 <= 0.0f0)
+        d² = dot3f(apx, apy, apz, apx, apy, apz)
+        return d²
+    end
+
+    bpx = apx - abx
+    bpy = apy - aby
+    bpz = apz - abz
+    d3 = dot3f(abx, aby, abz, bpx, bpy, bpz)
+    d4 = dot3f(acx, acy, acz, bpx, bpy, bpz)
+    # vertex B region
+    if (d3 >= 0.0f0) & (d4 <= d3)
+        d² = dot3f(bpx, bpy, bpz, bpx, bpy, bpz)
+        return d²
+    end
+
+    # compute cpx, d5, d6 before edge checks (needed for vertex C and edge BC)
+    cpx = apx - acx
+    cpy = apy - acy
+    cpz = apz - acz
+    d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
+    d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
+    # vertex C region
+    if (d6 >= 0.0f0) & (d5 <= d6)
+        d² = dot3f(cpx, cpy, cpz, cpx, cpy, cpz)
+        return d²
+    end
+
+    # edge AB region
+    vc = d1 * d4 - d3 * d2
+    if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
+        v = d1 / (d1 - d3)
+        dx = apx - v * abx
+        dy = apy - v * aby
+        dz = apz - v * abz
+        d² = dot3f(dx, dy, dz, dx, dy, dz)
+        return d²
+    end
+
+    # edge AC region
+    vb = d5 * d2 - d1 * d6
+    if (vb <= 0.0f0) & (d2 >= 0.0f0) & (d6 <= 0.0f0)
+        w = d2 / (d2 - d6)
+        dx = apx - w * acx
+        dy = apy - w * acy
+        dz = apz - w * acz
+        d² = dot3f(dx, dy, dz, dx, dy, dz)
+        return d²
+    end
+
+    # edge BC region
+    va = d3 * d6 - d5 * d4
+    if (va <= 0.0f0) & ((d4 - d3) >= 0.0f0) & ((d5 - d6) >= 0.0f0)
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        bcx = acx - abx
+        bcy = acy - aby
+        bcz = acz - abz
+        dx = bpx - w * bcx
+        dy = bpy - w * bcy
+        dz = bpz - w * bcz
+        d² = dot3f(dx, dy, dz, dx, dy, dz)
+        return d²
+    end
+
+    # face interior region
+    denom = inv(va + vb + vc)
+    v = vb * denom
+    w = vc * denom
+    dx = apx - v * abx - w * acx
+    dy = apy - v * aby - w * acy
+    dz = apz - v * abz - w * acz
+    d² = dot3f(dx, dy, dz, dx, dy, dz)
+    return d²
+end
+
+"""
 Combined squared distance, closest point, and region computation.
 
 Returns (d², region, qx, qy, qz) where:
@@ -66,10 +159,10 @@ Returns (d², region, qx, qy, qz) where:
   - (qx, qy, qz) is the closest point on the triangle
 
 This combined function ensures consistent region/closest-point determination for a given triangle.
-In the kernel, dist2_point_triangle is used for the hot inner loop, and dist2_and_region is called
-once for the winning triangle; dist2_point_triangle matches the distance arithmetic used here.
+In the kernel, dist²_point_triangle is used for the hot inner loop, and dist²_and_region is called
+once for the winning triangle; dist²_point_triangle matches the distance arithmetic used here.
 """
-function dist2_and_region(
+function dist²_and_region(
     px::Float32, py::Float32, pz::Float32,
     ax::Float32, ay::Float32, az::Float32,
     abx::Float32, aby::Float32, abz::Float32,
@@ -78,10 +171,8 @@ function dist2_and_region(
     apx = px - ax
     apy = py - ay
     apz = pz - az
-
     d1 = dot3f(abx, aby, abz, apx, apy, apz)
     d2 = dot3f(acx, acy, acz, apx, apy, apz)
-
     # vertex A region
     if (d1 <= 0.0f0) & (d2 <= 0.0f0)
         d² = dot3f(apx, apy, apz, apx, apy, apz)
@@ -91,10 +182,8 @@ function dist2_and_region(
     bpx = apx - abx
     bpy = apy - aby
     bpz = apz - abz
-
     d3 = dot3f(abx, aby, abz, bpx, bpy, bpz)
     d4 = dot3f(acx, acy, acz, bpx, bpy, bpz)
-
     # vertex B region
     if (d3 >= 0.0f0) & (d4 <= d3)
         d² = dot3f(bpx, bpy, bpz, bpx, bpy, bpz)
@@ -105,10 +194,8 @@ function dist2_and_region(
     cpx = apx - acx
     cpy = apy - acy
     cpz = apz - acz
-
     d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
     d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
-
     # vertex C region (must check before edge AB)
     if (d6 >= 0.0f0) & (d5 <= d6)
         d² = dot3f(cpx, cpy, cpz, cpx, cpy, cpz)
@@ -167,16 +254,13 @@ function dist2_and_region(
     denom = inv(va + vb + vc)
     v = vb * denom
     w = vc * denom
-
     qx = muladd(w, acx, muladd(v, abx, ax))
     qy = muladd(w, acy, muladd(v, aby, ay))
     qz = muladd(w, acz, muladd(v, abz, az))
-
     dx = px - qx
     dy = py - qy
     dz = pz - qz
     d² = dot3f(dx, dy, dz, dx, dy, dz)
-
     return d², UInt8(0), qx, qy, qz
 end
 
@@ -490,10 +574,6 @@ function compute_sdf_kernel!(
 
     best_d² = Inf32
     best_face = Int32(1)
-    best_region = UInt8(0)
-    best_qx = 0.0f0
-    best_qy = 0.0f0
-    best_qz = 0.0f0
 
     tile_start = Int32(1)
     while tile_start <= n_faces
@@ -521,7 +601,7 @@ function compute_sdf_kernel!(
         end
         CUDA.sync_threads()
 
-        # process tile: compute dist², region, and closest point together
+        # process tile: compute dist² only (region/closest point computed once after the minimum is known)
         t = Int32(1)
         while t <= cnt
             ax = sh_v0x[t]
@@ -534,18 +614,11 @@ function compute_sdf_kernel!(
             acy = sh_e1y[t]
             acz = sh_e1z[t]
 
-            # combined computation - no separate recomputation later
-            d², region, qx, qy, qz = dist2_and_region(
-                px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz
-            )
-
+            # distance-only computation for the hot inner loop
+            d² = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
             if d² < best_d²
                 best_d² = d²
                 best_face = tile_start + t - Int32(1)
-                best_region = region
-                best_qx = qx
-                best_qy = qy
-                best_qz = qz
             end
             t += Int32(1)
         end
@@ -560,37 +633,53 @@ function compute_sdf_kernel!(
         return nothing
     end
 
-    # use tracked region and closest point (no recomputation!)
+    # recompute closest point and region once for the winning triangle (for sign)
+    @inbounds begin
+        ax = v0x[best_face]
+        ay = v0y[best_face]
+        az = v0z[best_face]
+
+        abx = e0x[best_face]
+        aby = e0y[best_face]
+        abz = e0z[best_face]
+
+        acx = e1x[best_face]
+        acy = e1y[best_face]
+        acz = e1z[best_face]
+    end
+    best_d², region, qx, qy, qz = dist²_and_region(
+        px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz
+    )
     # choose pseudo-normal (face/edge/vertex)
     nx = 0.0f0
     ny = 0.0f0
     nz = 1.0f0
 
     @inbounds begin
-        if best_region == UInt8(0)
+        if region == UInt8(0)
             nx = fnx[best_face]
             ny = fny[best_face]
             nz = fnz[best_face]
-        elseif best_region == UInt8(1)
+        elseif region == UInt8(1)
             vi = i0[best_face]
             nx = vnx[vi]
             ny = vny[vi]
             nz = vnz[vi]
-        elseif best_region == UInt8(2)
+        elseif region == UInt8(2)
             vi = i1[best_face]
             nx = vnx[vi]
             ny = vny[vi]
             nz = vnz[vi]
-        elseif best_region == UInt8(3)
+        elseif region == UInt8(3)
             vi = i2[best_face]
             nx = vnx[vi]
             ny = vny[vi]
             nz = vnz[vi]
-        elseif best_region == UInt8(4)   # AB
+        elseif region == UInt8(4)   # AB
             nx = eabx[best_face]
             ny = eaby[best_face]
             nz = eabz[best_face]
-        elseif best_region == UInt8(5)   # AC
+        elseif region == UInt8(5)   # AC
             nx = eacx[best_face]
             ny = eacy[best_face]
             nz = eacz[best_face]
@@ -601,10 +690,10 @@ function compute_sdf_kernel!(
         end
     end
 
-    # Use tracked closest point for sign computation
-    vx = px - best_qx
-    vy = py - best_qy
-    vz = pz - best_qz
+    # sign computation using the closest point q and the chosen pseudo-normal
+    vx = px - qx
+    vy = py - qy
+    vz = pz - qz
 
     s = dot3f(vx, vy, vz, nx, ny, nz)
     d = sqrt(best_d²)
