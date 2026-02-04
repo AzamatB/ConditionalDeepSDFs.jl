@@ -65,8 +65,9 @@ Returns (d², region, qx, qy, qz) where:
       6 = edge BC
   - (qx, qy, qz) is the closest point on the triangle
 
-This combined function ensures consistent region determination,
-avoiding floating-point mismatch between separate distance and region computations.
+This combined function ensures consistent region/closest-point determination for a given triangle.
+In the kernel, dist2_point_triangle is used for the hot inner loop, and dist2_and_region is called
+once for the winning triangle; dist2_point_triangle matches the distance arithmetic used here.
 """
 function dist2_and_region(
     px::Float32, py::Float32, pz::Float32,
@@ -198,9 +199,10 @@ Degenerate faces (very small area) are dropped.
 function precompute_data_on_cpu(
     vertices::Vector{Point3{Float32}},
     fcs::Vector{GLTriangleFace};
-    degenerate_area2_tol::Float64=1e-20
+    ε_degenerate_area²::Float64=1e-20
 )
     n_verts = length(vertices)
+    num_faces = length(fcs)
     # Accumulators for vertex pseudo-normals (Float64)
     vnx_acc = zeros(Float64, n_verts)
     vny_acc = zeros(Float64, n_verts)
@@ -217,9 +219,11 @@ function precompute_data_on_cpu(
     v0x = Float32[]
     v0y = Float32[]
     v0z = Float32[]
+
     e0x = Float32[]
     e0y = Float32[]
     e0z = Float32[]
+
     e1x = Float32[]
     e1y = Float32[]
     e1z = Float32[]
@@ -227,6 +231,27 @@ function precompute_data_on_cpu(
     fnx = Float32[]
     fny = Float32[]
     fnz = Float32[]
+
+    sizehint!(edge_acc, 2 * num_faces)
+    sizehint!(i0, num_faces)
+    sizehint!(i1, num_faces)
+    sizehint!(i2, num_faces)
+
+    sizehint!(v0x, num_faces)
+    sizehint!(v0y, num_faces)
+    sizehint!(v0z, num_faces)
+
+    sizehint!(e0x, num_faces)
+    sizehint!(e0y, num_faces)
+    sizehint!(e0z, num_faces)
+
+    sizehint!(e1x, num_faces)
+    sizehint!(e1y, num_faces)
+    sizehint!(e1z, num_faces)
+
+    sizehint!(fnx, num_faces)
+    sizehint!(fny, num_faces)
+    sizehint!(fnz, num_faces)
 
     @inbounds for face in fcs
         a = int32(face[1])
@@ -251,7 +276,7 @@ function precompute_data_on_cpu(
         nz = abx64 * acy64 - aby64 * acx64
 
         area2 = nx * nx + ny * ny + nz * nz
-        if area2 <= degenerate_area2_tol
+        if area2 <= ε_degenerate_area²
             continue
         end
 
@@ -353,6 +378,7 @@ function precompute_data_on_cpu(
 
     # normalize edge pseudo-normals (dict of UInt64 => Float32 triple)
     edge_unit = Dict{UInt64,NTuple{3,Float32}}()
+    sizehint!(edge_unit, length(edge_acc))
     for (k, (sx, sy, sz)) in edge_acc
         n = norm3(sx, sy, sz)
         if n == 0.0
