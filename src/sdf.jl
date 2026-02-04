@@ -193,25 +193,10 @@ Degenerate faces (very small area) are dropped.
 """
 function precompute_data_on_cpu(
     vertices::Vector{Point3{Float32}},
-    triangles::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}};
+    fcs::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}};
     degenerate_area2_eps::Float64=1e-20
 )
     n_verts = length(vertices)
-
-    # compute signed volume to determine global normal orientation
-    # for a closed mesh with outward normals, signed volume should be positive
-    signed_volume = 0.0
-    for face in triangles
-        (a, b, c) = face
-        (ax, ay, az) = Float64.(vertices[a])
-        (bx, by, bz) = Float64.(vertices[b])
-        (cx, cy, cz) = Float64.(vertices[c])
-        # signed volume of tetrahedron from origin to triangle = (1/6)a·(b × c)
-        signed_volume += (ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx))
-    end
-    # if signed volume is negative, normals point inward - we need to flip them all
-    global_flip = signed_volume < 0.0
-
     # Accumulators for vertex pseudo-normals (Float64)
     vnx_acc = zeros(Float64, n_verts)
     vny_acc = zeros(Float64, n_verts)
@@ -239,7 +224,7 @@ function precompute_data_on_cpu(
     fny = Float32[]
     fnz = Float32[]
 
-    @inbounds for face in triangles
+    @inbounds for face in fcs
         (a, b, c) = face
         (ax, ay, az) = Float64.(vertices[a])
         (bx, by, bz) = Float64.(vertices[b])
@@ -267,13 +252,6 @@ function precompute_data_on_cpu(
         nux = nx * invn
         nuy = ny * invn
         nuz = nz * invn
-
-        # Apply global flip if mesh has inside-out winding
-        if global_flip
-            nux = -nux
-            nuy = -nuy
-            nuz = -nuz
-        end
 
         # angles for vertex pseudo-normals (Float64)
         angA = angle_between(abx64, aby64, abz64, acx64, acy64, acz64)
@@ -608,14 +586,14 @@ end
 function compute_sdf(mesh::Mesh{3,Float32}, n::Int=128; tile_size::Int=256)
     rng = range(-1.0f0, 1.0f0; length=n)
     vertices = coordinates(mesh)
-    triangles = faces(mesh)
-    sdf = compute_sdf(vertices, triangles, rng; tile_size)
+    fcs = faces(mesh)
+    sdf = compute_sdf(vertices, fcs, rng; tile_size)
     return sdf::CuArray{Float32,3}
 end
 
 function compute_sdf(
     vertices::Vector{Point3{Float32}},
-    triangles::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}},
+    fcs::Vector{NgonFace{3,OffsetInteger{-1,UInt32}}},
     rng::StepRangeLen{Float32};
     tile_size::Int=256
 )
@@ -628,7 +606,7 @@ function compute_sdf(
     # - generic thread indexing and tunable TILE_SIZE (64/128/256)
     (tile_size ∈ (64, 128, 256)) || error("tile_size must be 64, 128, or 256")
 
-    data_cpu = precompute_data_on_cpu(vertices, triangles)
+    data_cpu = precompute_data_on_cpu(vertices, fcs)
 
     # Upload to GPU
     d_v0x = CuArray(data_cpu.v0x)
