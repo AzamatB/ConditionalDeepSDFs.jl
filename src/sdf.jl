@@ -55,6 +55,8 @@ Squared distance from point p to triangle defined by vertex A and edges AB, AC.
 
 This function matches the distance arithmetic used inside dist²_and_region, but does not
 compute the closest point or region. It is intended for the hot inner loop.
+INVARIANT: dist²_point_triangle and dist²_and_region must use identical region
+classification logic and distance arithmetic. If you modify one, update the other to match.
 """
 function dist²_point_triangle(
     px::Float32, py::Float32, pz::Float32,
