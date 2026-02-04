@@ -132,8 +132,8 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
         count[r] += 1
     end
 
-    P = eltype(vertices)
-    vertices_new = Vector{P}()
+    VT = eltype(vertices)
+    vertices_new = Vector{VT}()
     sizehint!(vertices_new, num_vertices)
     root2new = zeros(Int32, num_vertices)
     @inbounds for r in 1:num_vertices
@@ -143,7 +143,7 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
             x = Float32(Σx[r] * weight)
             y = Float32(Σy[r] * weight)
             z = Float32(Σz[r] * weight)
-            push!(vertices_new, P(x, y, z))
+            push!(vertices_new, VT(x, y, z))
             root2new[r] = length(vertices_new)
         end
     end
