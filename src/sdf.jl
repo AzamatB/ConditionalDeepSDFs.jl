@@ -15,7 +15,7 @@ function dot3(x1::Float64, y1::Float64, z1::Float64, x2::Float64, y2::Float64, z
 end
 
 function norm3(x::Float64, y::Float64, z::Float64)
-    value = sqrt(x * x + y * y + z * z)
+    value = √(x * x + y * y + z * z)
     return value::Float64
 end
 
@@ -46,7 +46,7 @@ end
 # ----------------------------
 
 function dot3f(ax::Float32, ay::Float32, az::Float32, bx::Float32, by::Float32, bz::Float32)
-    value = muladd(ax, bx, muladd(ay, by, az * bz))
+    value = muladd(ax, bx, muladd(ay, by, az * bz))  # ax * bx + ay * by + az * bz
     return value::Float32
 end
 
@@ -208,9 +208,9 @@ function dist²_and_region(
     vc = d1 * d4 - d3 * d2
     if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
         v = d1 / (d1 - d3)
-        qx = muladd(v, abx, ax)
-        qy = muladd(v, aby, ay)
-        qz = muladd(v, abz, az)
+        qx = ax + v * abx
+        qy = ay + v * aby
+        qz = az + v * abz
         dx = px - qx
         dy = py - qy
         dz = pz - qz
@@ -222,9 +222,9 @@ function dist²_and_region(
     vb = d5 * d2 - d1 * d6
     if (vb <= 0.0f0) & (d2 >= 0.0f0) & (d6 <= 0.0f0)
         w = d2 / (d2 - d6)
-        qx = muladd(w, acx, ax)
-        qy = muladd(w, acy, ay)
-        qz = muladd(w, acz, az)
+        qx = ax + w * acx
+        qy = ay + w * acy
+        qz = az + w * acz
         dx = px - qx
         dy = py - qy
         dz = pz - qz
@@ -242,9 +242,9 @@ function dist²_and_region(
         bx = ax + abx
         by = ay + aby
         bz = az + abz
-        qx = muladd(w, bcx, bx)
-        qy = muladd(w, bcy, by)
-        qz = muladd(w, bcz, bz)
+        qx = bx + w * bcx
+        qy = by + w * bcy
+        qz = bz + w * bcz
         dx = px - qx
         dy = py - qy
         dz = pz - qz
@@ -256,9 +256,9 @@ function dist²_and_region(
     denom = inv(va + vb + vc)
     v = vb * denom
     w = vc * denom
-    qx = muladd(w, acx, muladd(v, abx, ax))
-    qy = muladd(w, acy, muladd(v, aby, ay))
-    qz = muladd(w, acz, muladd(v, abz, az))
+    qx = ax + v * abx + w * acx
+    qy = ay + v * aby + w * acy
+    qz = az + v * abz + w * acz
     dx = px - qx
     dy = py - qy
     dz = pz - qz
@@ -553,9 +553,9 @@ function compute_sdf_kernel!(
         return nothing
     end
 
-    px = muladd(Float32(ix - 1), step, start)
-    py = muladd(Float32(iy - 1), step, start)
-    pz = muladd(Float32(iz - 1), step, start)
+    px = start + Float32(ix - 1) * step
+    py = start + Float32(iy - 1) * step
+    pz = start + Float32(iz - 1) * step
 
     # Shared geometry tile (9 arrays)
     sh_v0x = CUDA.CuStaticSharedArray(Float32, TILE)
