@@ -361,12 +361,10 @@ function precompute_data_on_cpu(
         ny = abz64 * acx64 - abx64 * acz64
         nz = abx64 * acy64 - aby64 * acx64
 
-        area2 = nx * nx + ny * ny + nz * nz
-        if area2 <= ε_degenerate_area²
-            continue
-        end
+        area² = nx * nx + ny * ny + nz * nz
+        (area² <= ε_degenerate_area²) && continue
 
-        invn = 1.0 / sqrt(area2)
+        invn = inv(√(area²))
         nux = nx * invn
         nuy = ny * invn
         nuz = nz * invn
@@ -696,13 +694,9 @@ function compute_sdf_kernel!(
     vx = px - qx
     vy = py - qy
     vz = pz - qz
-
     s = dot3f(vx, vy, vz, nx, ny, nz)
-    d = sqrt(best_d²)
-
-    is_negative = (s < 0)
-    sgn = 1.0f0 - 2.0f0 * is_negative
-    @inbounds sdf[ix, iy, iz] = sgn * d
+    d = √(best_d²)
+    @inbounds sdf[ix, iy, iz] = ifelse(s < 0.0f0, -d, d)
     return nothing
 end
 
