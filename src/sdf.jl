@@ -685,7 +685,7 @@ function compute_sdf_kernel!(
             nx = eacx[best_face]
             ny = eacy[best_face]
             nz = eacz[best_face]
-        else                              # BC
+        else                        # BC
             nx = ebcx[best_face]
             ny = ebcy[best_face]
             nz = ebcz[best_face]
