@@ -474,8 +474,8 @@ end
 • Degenerate triangles are dropped.
 """
 function preprocess_geometry(
-    vertices::AbstractVector{<:GeometryBasics.Point{3}},
-    fcs::AbstractVector;
+    vertices::AbstractVector{Point3f},
+    fcs::AbstractVector{GLTriangleFace};
     ε²::Float64=1e-20
 )
     num_faces = length(fcs)
@@ -484,14 +484,15 @@ function preprocess_geometry(
 
     @inbounds for face in fcs
         # Works for TriangleFace / GLTriangleFace; we only need integer indices.
-        a, b, c = Int.(GeometryBasics.value.(face))
+        (a, b, c) = GeometryBasics.value.(face)
         A = Float64.(vertices[a])
         ab = Float64.(vertices[b]) .- A
         ac = Float64.(vertices[c]) .- A
         nx = ab[2] * ac[3] - ab[3] * ac[2]
         ny = ab[3] * ac[1] - ab[1] * ac[3]
         nz = ab[1] * ac[2] - ab[2] * ac[1]
-        ((nx * nx + ny * ny + nz * nz) <= ε²) && continue
+        norm² = muladd(nx, nx, muladd(ny, ny, nz * nz))  # = nx*nx + ny*ny + nz*nz
+        (norm² <= ε²) && continue
 
         push!(v0x, Float32(A[1]))
         push!(v0y, Float32(A[2]))
@@ -542,8 +543,8 @@ function construct_sdf(mesh::Mesh{3,Float32,GLTriangleFace}, n::Int=256; kwargs.
 end
 
 function construct_sdf(
-    vertices::AbstractVector{<:GeometryBasics.Point{3}},
-    fcs::AbstractVector,
+    vertices::AbstractVector{Point3f},
+    fcs::AbstractVector{GLTriangleFace},
     n::Int=256;
     band::Int=5,
     jfa_corrections::Int=2,
