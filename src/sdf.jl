@@ -1,807 +1,565 @@
+""" 
+GPU-Accelerated Signed Distance Field (SDF)
+══════════════════════════════════════════
+
+This file computes a signed distance field on a uniform grid over the fixed
+domain **[-1, 1]³** (your canonicalized mesh domain). It is designed to be:
+
+• **Robust**: sign is computed via **ray parity** (odd/even) — no pseudo-normals.
+• **Fast on GPU**: distance uses a narrow-band seed + jump flooding (JFA) over
+  *triangle indices*; sign uses triangle rasterization + a per-column prefix XOR.
+• **Practical**: pure CUDA.jl (does not rely on RTX RT cores / OptiX).
+
+Pipeline:
+  Phase 1  — Seed:   atomic_min of packed (dist², tri_idx) within a voxel band.
+  Phase 1b — Index:  unpack the winning triangle index per voxel.
+  Phase 2  — JFA:    propagate triangle indices (26-neighborhood) with exact
+                     point-to-triangle distance checks per candidate.
+  Phase 3  — Parity: rasterize triangle XY footprint; for each (x,y) cast a
+                     jittered +z ray, toggle parity at the hit sample index
+                     (half-open convention).
+  Phase 4  — Final:  prefix-XOR parity per (x,y) column; recompute exact distance
+                     to assigned triangle; apply sign.
+
+Notes:
+• Parity sign is **orientation-independent** (unlike winding-number methods).
+• The JFA nearest-triangle assignment is an excellent approximation in practice
+  but is not mathematically guaranteed exact for triangle distance; it is,
+  however, far faster than brute force for large meshes.
+"""
+
 using CUDA
 using GeometryBasics
-using LinearAlgebra
 
-# ----------------------------
-# CPU helpers (Float64)
-# ----------------------------
-function int32(n::GLIndex)
-    return Int32(GeometryBasics.value(n))
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+
+const _SENTINEL_U64 = typemax(UInt64)
+const _NO_TRIANGLE  = Int32(0)   # 1-based triangle indices; 0 = unassigned
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Low-level GPU math
+# ──────────────────────────────────────────────────────────────────────────────
+
+@inline function _dot3(ax::Float32, ay::Float32, az::Float32,
+                       bx::Float32, by::Float32, bz::Float32)
+    muladd(ax, bx, muladd(ay, by, az * bz))
 end
 
-function dot3(x1::Float64, y1::Float64, z1::Float64, x2::Float64, y2::Float64, z2::Float64)
-    value = x1 * x2 + y1 * y2 + z1 * z2
-    return value::Float64
-end
+"""Squared distance from point P to triangle (A, A+AB, A+AC).
 
-function norm3(x::Float64, y::Float64, z::Float64)
-    value = √(x * x + y * y + z * z)
-    return value::Float64
-end
-
-function angle_between(
-    u1::Float64, u2::Float64, u3::Float64, v1::Float64, v2::Float64, v3::Float64
-)
-    nu = norm3(u1, u2, u3)
-    nv = norm3(v1, v2, v3)
-    if nu == 0.0 || nv == 0.0
-        return 0.0
-    end
-
-    c = dot3(u1, u2, u3, v1, v2, v3) / (nu * nv)
-    c = clamp(c, -1.0, 1.0)
-    θ = acos(c)
-    return θ::Float64
-end
-
-function edge_key(i::Int32, j::Int32)::UInt64
-    a = i < j ? i : j
-    b = i < j ? j : i
-    key = (UInt64(a) << 32) | UInt64(b)
-    return key
-end
-
-# ----------------------------
-# GPU helpers (Float32)
-# ----------------------------
-
-function dot3f(ax::Float32, ay::Float32, az::Float32, bx::Float32, by::Float32, bz::Float32)
-    value = muladd(ax, bx, muladd(ay, by, az * bz))  # ax * bx + ay * by + az * bz
-    return value::Float32
-end
-
+Voronoi-region closest-point (Ericson, *Real-Time Collision Detection*).
 """
-Squared distance from point p to triangle defined by vertex A and edges AB, AC.
-
-This function matches the distance arithmetic used inside dist²_and_region, but does not
-compute the closest point or region. It is intended for the hot inner loop.
-INVARIANT: dist²_point_triangle and dist²_and_region must use identical region
-classification logic and distance arithmetic. If you modify one, update the other to match.
-"""
-function dist²_point_triangle(
+@inline function _dist2_point_triangle(
     px::Float32, py::Float32, pz::Float32,
     ax::Float32, ay::Float32, az::Float32,
     abx::Float32, aby::Float32, abz::Float32,
-    acx::Float32, acy::Float32, acz::Float32
+    acx::Float32, acy::Float32, acz::Float32,
 )
-    apx = px - ax
-    apy = py - ay
-    apz = pz - az
-    d1 = dot3f(abx, aby, abz, apx, apy, apz)
-    d2 = dot3f(acx, acy, acz, apx, apy, apz)
-    # vertex A region
-    if (d1 <= 0.0f0) & (d2 <= 0.0f0)
-        d² = dot3f(apx, apy, apz, apx, apy, apz)
-        return d²
-    end
+    apx = px - ax; apy = py - ay; apz = pz - az
+    d1 = _dot3(abx, aby, abz, apx, apy, apz)
+    d2 = _dot3(acx, acy, acz, apx, apy, apz)
+    (d1 <= 0f0) & (d2 <= 0f0) && return _dot3(apx, apy, apz, apx, apy, apz)
 
-    bpx = apx - abx
-    bpy = apy - aby
-    bpz = apz - abz
-    d3 = dot3f(abx, aby, abz, bpx, bpy, bpz)
-    d4 = dot3f(acx, acy, acz, bpx, bpy, bpz)
-    # vertex B region
-    if (d3 >= 0.0f0) & (d4 <= d3)
-        d² = dot3f(bpx, bpy, bpz, bpx, bpy, bpz)
-        return d²
-    end
+    bpx = apx - abx; bpy = apy - aby; bpz = apz - abz
+    d3 = _dot3(abx, aby, abz, bpx, bpy, bpz)
+    d4 = _dot3(acx, acy, acz, bpx, bpy, bpz)
+    (d3 >= 0f0) & (d4 <= d3) && return _dot3(bpx, bpy, bpz, bpx, bpy, bpz)
 
-    # compute cpx, d5, d6 before edge checks (needed for vertex C and edge BC)
-    cpx = apx - acx
-    cpy = apy - acy
-    cpz = apz - acz
-    d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
-    d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
-    # vertex C region
-    if (d6 >= 0.0f0) & (d5 <= d6)
-        d² = dot3f(cpx, cpy, cpz, cpx, cpy, cpz)
-        return d²
-    end
+    cpx = apx - acx; cpy = apy - acy; cpz = apz - acz
+    d5 = _dot3(abx, aby, abz, cpx, cpy, cpz)
+    d6 = _dot3(acx, acy, acz, cpx, cpy, cpz)
+    (d6 >= 0f0) & (d5 <= d6) && return _dot3(cpx, cpy, cpz, cpx, cpy, cpz)
 
-    # edge AB region
     vc = d1 * d4 - d3 * d2
-    if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
+    if (vc <= 0f0) & (d1 >= 0f0) & (d3 <= 0f0)
         v = d1 / (d1 - d3)
-        dx = apx - v * abx
-        dy = apy - v * aby
-        dz = apz - v * abz
-        d² = dot3f(dx, dy, dz, dx, dy, dz)
-        return d²
+        dx = apx - v * abx; dy = apy - v * aby; dz = apz - v * abz
+        return _dot3(dx, dy, dz, dx, dy, dz)
     end
 
-    # edge AC region
     vb = d5 * d2 - d1 * d6
-    if (vb <= 0.0f0) & (d2 >= 0.0f0) & (d6 <= 0.0f0)
+    if (vb <= 0f0) & (d2 >= 0f0) & (d6 <= 0f0)
         w = d2 / (d2 - d6)
-        dx = apx - w * acx
-        dy = apy - w * acy
-        dz = apz - w * acz
-        d² = dot3f(dx, dy, dz, dx, dy, dz)
-        return d²
+        dx = apx - w * acx; dy = apy - w * acy; dz = apz - w * acz
+        return _dot3(dx, dy, dz, dx, dy, dz)
     end
 
-    # edge BC region
     va = d3 * d6 - d5 * d4
-    if (va <= 0.0f0) & ((d4 - d3) >= 0.0f0) & ((d5 - d6) >= 0.0f0)
+    if (va <= 0f0) & ((d4 - d3) >= 0f0) & ((d5 - d6) >= 0f0)
         w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
-        bcx = acx - abx
-        bcy = acy - aby
-        bcz = acz - abz
-        dx = bpx - w * bcx
-        dy = bpy - w * bcy
-        dz = bpz - w * bcz
-        d² = dot3f(dx, dy, dz, dx, dy, dz)
-        return d²
+        bcx = acx - abx; bcy = acy - aby; bcz = acz - abz
+        dx = bpx - w * bcx; dy = bpy - w * bcy; dz = bpz - w * bcz
+        return _dot3(dx, dy, dz, dx, dy, dz)
     end
 
-    # face interior region
     denom = inv(va + vb + vc)
-    v = vb * denom
-    w = vc * denom
+    v = vb * denom; w = vc * denom
     dx = apx - v * abx - w * acx
     dy = apy - v * aby - w * acy
     dz = apz - v * abz - w * acz
-    d² = dot3f(dx, dy, dz, dx, dy, dz)
-    return d²
+    return _dot3(dx, dy, dz, dx, dy, dz)
 end
 
-"""
-Combined squared distance, closest point, and region computation.
+# ──────────────────────────────────────────────────────────────────────────────
+# Packing (dist², tri_idx) into UInt64 for atomic_min
+# ──────────────────────────────────────────────────────────────────────────────
 
-Returns (d², region, qx, qy, qz) where:
-  - d² is squared distance from p to triangle
-  - region identifies the closest feature:
-      0 = face interior
-      1 = vertex A
-      2 = vertex B
-      3 = vertex C
-      4 = edge AB
-      5 = edge AC
-      6 = edge BC
-  - (qx, qy, qz) is the closest point on the triangle
-
-This combined function ensures consistent region/closest-point determination for a given triangle.
-In the kernel, dist²_point_triangle is used for the hot inner loop, and dist²_and_region is called
-once for the winning triangle; dist²_point_triangle matches the distance arithmetic used here.
-"""
-function dist²_and_region(
-    px::Float32, py::Float32, pz::Float32,
-    ax::Float32, ay::Float32, az::Float32,
-    abx::Float32, aby::Float32, abz::Float32,
-    acx::Float32, acy::Float32, acz::Float32
-)
-    apx = px - ax
-    apy = py - ay
-    apz = pz - az
-    d1 = dot3f(abx, aby, abz, apx, apy, apz)
-    d2 = dot3f(acx, acy, acz, apx, apy, apz)
-    # vertex A region
-    if (d1 <= 0.0f0) & (d2 <= 0.0f0)
-        d² = dot3f(apx, apy, apz, apx, apy, apz)
-        return d², UInt8(1), ax, ay, az
-    end
-
-    bpx = apx - abx
-    bpy = apy - aby
-    bpz = apz - abz
-    d3 = dot3f(abx, aby, abz, bpx, bpy, bpz)
-    d4 = dot3f(acx, acy, acz, bpx, bpy, bpz)
-    # vertex B region
-    if (d3 >= 0.0f0) & (d4 <= d3)
-        d² = dot3f(bpx, bpy, bpz, bpx, bpy, bpz)
-        return d², UInt8(2), ax + abx, ay + aby, az + abz
-    end
-
-    # must to compute cpx, d5, d6 before edge checks (needed for vertex C and edge BC)
-    cpx = apx - acx
-    cpy = apy - acy
-    cpz = apz - acz
-    d5 = dot3f(abx, aby, abz, cpx, cpy, cpz)
-    d6 = dot3f(acx, acy, acz, cpx, cpy, cpz)
-    # vertex C region (must check before edge AB)
-    if (d6 >= 0.0f0) & (d5 <= d6)
-        d² = dot3f(cpx, cpy, cpz, cpx, cpy, cpz)
-        return d², UInt8(3), ax + acx, ay + acy, az + acz
-    end
-
-    # edge AB region
-    vc = d1 * d4 - d3 * d2
-    if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
-        v = d1 / (d1 - d3)
-        qx = ax + v * abx
-        qy = ay + v * aby
-        qz = az + v * abz
-        dx = px - qx
-        dy = py - qy
-        dz = pz - qz
-        d² = dot3f(dx, dy, dz, dx, dy, dz)
-        return d², UInt8(4), qx, qy, qz
-    end
-
-    # edge AC region
-    vb = d5 * d2 - d1 * d6
-    if (vb <= 0.0f0) & (d2 >= 0.0f0) & (d6 <= 0.0f0)
-        w = d2 / (d2 - d6)
-        qx = ax + w * acx
-        qy = ay + w * acy
-        qz = az + w * acz
-        dx = px - qx
-        dy = py - qy
-        dz = pz - qz
-        d² = dot3f(dx, dy, dz, dx, dy, dz)
-        return d², UInt8(5), qx, qy, qz
-    end
-
-    # edge BC region
-    va = d3 * d6 - d5 * d4
-    if (va <= 0.0f0) & ((d4 - d3) >= 0.0f0) & ((d5 - d6) >= 0.0f0)
-        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
-        bcx = acx - abx
-        bcy = acy - aby
-        bcz = acz - abz
-        bx = ax + abx
-        by = ay + aby
-        bz = az + abz
-        qx = bx + w * bcx
-        qy = by + w * bcy
-        qz = bz + w * bcz
-        dx = px - qx
-        dy = py - qy
-        dz = pz - qz
-        d² = dot3f(dx, dy, dz, dx, dy, dz)
-        return d², UInt8(6), qx, qy, qz
-    end
-
-    # face interior region
-    denom = inv(va + vb + vc)
-    v = vb * denom
-    w = vc * denom
-    qx = ax + v * abx + w * acx
-    qy = ay + v * aby + w * acy
-    qz = az + v * abz + w * acz
-    dx = px - qx
-    dy = py - qy
-    dz = pz - qz
-    d² = dot3f(dx, dy, dz, dx, dy, dz)
-    return d², UInt8(0), qx, qy, qz
+@inline function _pack_dist2_idx(d2::Float32, idx::Int32)
+    # High 32 bits: dist² as UInt32 (positive floats preserve ordering)
+    # Low  32 bits: triangle index
+    (UInt64(reinterpret(UInt32, d2)) << 32) | UInt64(UInt32(idx))
 end
 
-# =============================================================================
-# CPU preprocessing
-# =============================================================================
-
-"""
-Precompute packed triangle geometry + pseudo-normals.
-
-Returns a NamedTuple of CPU arrays:
-  - indices i0,i1,i2 (Int32)
-  - geometry v0 + e0(ab) + e1(ac) (Float32)
-  - face normals per tri (Float32)
-  - edge normals per tri for AB, AC, BC (Float32)
-  - vertex pseudo-normals per vertex (Float32)
-
-Degenerate faces (very small area) are dropped.
-"""
-function precompute_data_on_cpu(
-    vertices::Vector{Point3{Float32}},
-    fcs::Vector{GLTriangleFace};
-    ε_degenerate_area²::Float64=1e-20
-)
-    n_verts = length(vertices)
-    num_faces = length(fcs)
-    # Accumulators for vertex pseudo-normals (Float64)
-    vnx_acc = zeros(Float64, n_verts)
-    vny_acc = zeros(Float64, n_verts)
-    vnz_acc = zeros(Float64, n_verts)
-
-    # edge normal sums (sum of incident unit face normals)
-    edge_acc = Dict{UInt64,NTuple{3,Float64}}()
-
-    # packed triangles (skip degenerates)
-    i0 = Int32[]
-    i1 = Int32[]
-    i2 = Int32[]
-
-    v0x = Float32[]
-    v0y = Float32[]
-    v0z = Float32[]
-
-    e0x = Float32[]
-    e0y = Float32[]
-    e0z = Float32[]
-
-    e1x = Float32[]
-    e1y = Float32[]
-    e1z = Float32[]
-
-    fnx = Float32[]
-    fny = Float32[]
-    fnz = Float32[]
-
-    sizehint!(edge_acc, 2 * num_faces)
-    sizehint!(i0, num_faces)
-    sizehint!(i1, num_faces)
-    sizehint!(i2, num_faces)
-
-    sizehint!(v0x, num_faces)
-    sizehint!(v0y, num_faces)
-    sizehint!(v0z, num_faces)
-
-    sizehint!(e0x, num_faces)
-    sizehint!(e0y, num_faces)
-    sizehint!(e0z, num_faces)
-
-    sizehint!(e1x, num_faces)
-    sizehint!(e1y, num_faces)
-    sizehint!(e1z, num_faces)
-
-    sizehint!(fnx, num_faces)
-    sizehint!(fny, num_faces)
-    sizehint!(fnz, num_faces)
-
-    @inbounds for face in fcs
-        a = int32(face[1])
-        b = int32(face[2])
-        c = int32(face[3])
-
-        (ax, ay, az) = Float64.(vertices[a])
-        (bx, by, bz) = Float64.(vertices[b])
-        (cx, cy, cz) = Float64.(vertices[c])
-
-        abx64 = bx - ax
-        aby64 = by - ay
-        abz64 = bz - az
-
-        acx64 = cx - ax
-        acy64 = cy - ay
-        acz64 = cz - az
-
-        # face normal (unit)
-        nx = aby64 * acz64 - abz64 * acy64
-        ny = abz64 * acx64 - abx64 * acz64
-        nz = abx64 * acy64 - aby64 * acx64
-
-        area² = nx * nx + ny * ny + nz * nz
-        (area² <= ε_degenerate_area²) && continue
-
-        invn = inv(√(area²))
-        nux = nx * invn
-        nuy = ny * invn
-        nuz = nz * invn
-
-        # angles for vertex pseudo-normals (Float64)
-        angA = angle_between(abx64, aby64, abz64, acx64, acy64, acz64)
-
-        bax = -abx64
-        bay = -aby64
-        baz = -abz64
-        bcx = acx64 - abx64
-        bcy = acy64 - aby64
-        bcz = acz64 - abz64
-        angB = angle_between(bax, bay, baz, bcx, bcy, bcz)
-
-        cax = -acx64
-        cay = -acy64
-        caz = -acz64
-        cbx = abx64 - acx64
-        cby = aby64 - acy64
-        cbz = abz64 - acz64
-        angC = angle_between(cax, cay, caz, cbx, cby, cbz)
-
-        vnx_acc[a] += nux * angA
-        vny_acc[a] += nuy * angA
-        vnz_acc[a] += nuz * angA
-
-        vnx_acc[b] += nux * angB
-        vny_acc[b] += nuy * angB
-        vnz_acc[b] += nuz * angB
-
-        vnx_acc[c] += nux * angC
-        vny_acc[c] += nuy * angC
-        vnz_acc[c] += nuz * angC
-
-        # edge pseudo-normal accumulation
-        for (u, v) in ((a, b), (a, c), (b, c))
-            key = edge_key(u, v)
-            sx, sy, sz = get(edge_acc, key, (0.0, 0.0, 0.0))
-            edge_acc[key] = (sx + nux, sy + nuy, sz + nuz)
-        end
-
-        # store packed tri geometry
-        push!(i0, a)
-        push!(i1, b)
-        push!(i2, c)
-
-        push!(v0x, Float32(ax))
-        push!(v0y, Float32(ay))
-        push!(v0z, Float32(az))
-
-        push!(e0x, Float32(abx64))
-        push!(e0y, Float32(aby64))
-        push!(e0z, Float32(abz64))
-
-        push!(e1x, Float32(acx64))
-        push!(e1y, Float32(acy64))
-        push!(e1z, Float32(acz64))
-
-        push!(fnx, Float32(nux))
-        push!(fny, Float32(nuy))
-        push!(fnz, Float32(nuz))
-    end
-
-    n_faces = length(i0)
-    if n_faces == 0
-        error("All faces were degenerate after filtering")
-    end
-
-    # vertex pseudo-normals (unit) Float64 -> Float32
-    vnx = Vector{Float32}(undef, n_verts)
-    vny = Vector{Float32}(undef, n_verts)
-    vnz = Vector{Float32}(undef, n_verts)
-
-    do_warn = false
-    @inbounds for i in 1:n_verts
-        x = vnx_acc[i]
-        y = vny_acc[i]
-        z = vnz_acc[i]
-        n = norm3(x, y, z)
-
-        if n == 0.0
-            vnx[i] = 0.0f0
-            vny[i] = 0.0f0
-            vnz[i] = 0.0f0
-            do_warn = true
-        else
-            inv = 1.0 / n
-            vnx[i] = Float32(x * inv)
-            vny[i] = Float32(y * inv)
-            vnz[i] = Float32(z * inv)
-        end
-    end
-    do_warn && @warn("Non-manifold geometry detected: some vertices had zero pseudo-normals")
-
-    # normalize edge pseudo-normals (dict of UInt64 => Float32 triple)
-    edge_unit = Dict{UInt64,NTuple{3,Float32}}()
-    sizehint!(edge_unit, length(edge_acc))
-    for (k, (sx, sy, sz)) in edge_acc
-        n = norm3(sx, sy, sz)
-        if n == 0.0
-            edge_unit[k] = (0.0f0, 0.0f0, 0.0f0)
-        else
-            inv = 1.0 / n
-            edge_unit[k] = (Float32(sx * inv), Float32(sy * inv), Float32(sz * inv))
-        end
-    end
-
-    # per-triangle edge normals for AB, AC, BC
-    eabx = Vector{Float32}(undef, n_faces)
-    eaby = Vector{Float32}(undef, n_faces)
-    eabz = Vector{Float32}(undef, n_faces)
-
-    eacx = Vector{Float32}(undef, n_faces)
-    eacy = Vector{Float32}(undef, n_faces)
-    eacz = Vector{Float32}(undef, n_faces)
-
-    ebcx = Vector{Float32}(undef, n_faces)
-    ebcy = Vector{Float32}(undef, n_faces)
-    ebcz = Vector{Float32}(undef, n_faces)
-
-    @inbounds for t in 1:n_faces
-        a = i0[t]
-        b = i1[t]
-        c = i2[t]
-        fn = (fnx[t], fny[t], fnz[t])
-
-        nab = get(edge_unit, edge_key(a, b), fn)
-        nac = get(edge_unit, edge_key(a, c), fn)
-        nbc = get(edge_unit, edge_key(b, c), fn)
-
-        eabx[t] = nab[1]
-        eaby[t] = nab[2]
-        eabz[t] = nab[3]
-
-        eacx[t] = nac[1]
-        eacy[t] = nac[2]
-        eacz[t] = nac[3]
-
-        ebcx[t] = nbc[1]
-        ebcy[t] = nbc[2]
-        ebcz[t] = nbc[3]
-    end
-
-    result = (
-        i0=i0, i1=i1, i2=i2,
-        v0x=v0x, v0y=v0y, v0z=v0z,
-        e0x=e0x, e0y=e0y, e0z=e0z,
-        e1x=e1x, e1y=e1y, e1z=e1z,
-        fnx=fnx, fny=fny, fnz=fnz,
-        eabx=eabx, eaby=eaby, eabz=eabz,
-        eacx=eacx, eacy=eacy, eacz=eacz,
-        ebcx=ebcx, ebcy=ebcy, ebcz=ebcz,
-        vnx=vnx, vny=vny, vnz=vnz,
-        n_faces=Int32(n_faces),
-        n_verts=Int32(n_verts)
-    )
-    return result
+@inline function _unpack_idx(p::UInt64)
+    reinterpret(Int32, UInt32(p & 0xFFFF_FFFF))
 end
 
-# =============================================================================
-# CUDA kernel
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# Deterministic (x,y) jitter (cheap integer hash)
+# ──────────────────────────────────────────────────────────────────────────────
 
-function compute_sdf_kernel!(
-    sdf::CuDeviceArray{Float32,3},
+@inline function _u32_hash(x::UInt32)
+    y = x
+    y ⊻= y >> 16; y *= UInt32(0x7feb352d)
+    y ⊻= y >> 15; y *= UInt32(0x846ca68b)
+    y ⊻= y >> 16
+    return y
+end
+
+@inline function _column_jitter(ix::Int32, iy::Int32, mag::Float32)
+    h = _u32_hash(UInt32(ix) * UInt32(0x9e3779b9) + UInt32(iy) * UInt32(0x7f4a7c15))
+    jx = (Float32(h & UInt32(0xFFFF)) / 65535f0 - 0.5f0) * mag
+    jy = (Float32((h >> 16) & UInt32(0xFFFF)) / 65535f0 - 0.5f0) * mag
+    return jx, jy
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Narrow-band seeding
+# ──────────────────────────────────────────────────────────────────────────────
+
+function _seed_kernel!(
+    packed::CuDeviceArray{UInt64,3},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
-    i0::CuDeviceVector{Int32}, i1::CuDeviceVector{Int32}, i2::CuDeviceVector{Int32},
-    fnx::CuDeviceVector{Float32}, fny::CuDeviceVector{Float32}, fnz::CuDeviceVector{Float32},
-    eabx::CuDeviceVector{Float32}, eaby::CuDeviceVector{Float32}, eabz::CuDeviceVector{Float32},
-    eacx::CuDeviceVector{Float32}, eacy::CuDeviceVector{Float32}, eacz::CuDeviceVector{Float32},
-    ebcx::CuDeviceVector{Float32}, ebcy::CuDeviceVector{Float32}, ebcz::CuDeviceVector{Float32},
-    vnx::CuDeviceVector{Float32}, vny::CuDeviceVector{Float32}, vnz::CuDeviceVector{Float32},
-    start::Float32, step::Float32, n_grid::Int32, n_faces::Int32, ε²::Float32,
-    ::Val{TILE}
-) where {TILE}
-    ix = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    iy = (blockIdx().y - 1) * blockDim().y + threadIdx().y
-    iz = (blockIdx().z - 1) * blockDim().z + threadIdx().z
-
-    if (ix > n_grid) | (iy > n_grid) | (iz > n_grid)
-        return nothing
-    end
-
-    px = start + Float32(ix - 1) * step
-    py = start + Float32(iy - 1) * step
-    pz = start + Float32(iz - 1) * step
-
-    # Shared geometry tile (9 arrays)
-    sh_v0x = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_v0y = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_v0z = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_e0x = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_e0y = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_e0z = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_e1x = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_e1y = CUDA.CuStaticSharedArray(Float32, TILE)
-    sh_e1z = CUDA.CuStaticSharedArray(Float32, TILE)
-
-    tx = blockDim().x
-    ty = blockDim().y
-    tz = blockDim().z
-    tid = (threadIdx().z - 1) * (tx * ty) + (threadIdx().y - 1) * tx + threadIdx().x
-    stride = tx * ty * tz
-
-    best_d² = Inf32
-    best_face = Int32(1)
-
-    tile_start = Int32(1)
-    while tile_start <= n_faces
-        cnt = n_faces - tile_start + Int32(1)
-        if cnt > Int32(TILE)
-            cnt = Int32(TILE)
-        end
-
-        # cooperative load
-        t = tid
-        while t <= cnt
-            g = tile_start + Int32(t) - Int32(1)
-            @inbounds begin
-                sh_v0x[t] = v0x[g]
-                sh_v0y[t] = v0y[g]
-                sh_v0z[t] = v0z[g]
-                sh_e0x[t] = e0x[g]
-                sh_e0y[t] = e0y[g]
-                sh_e0z[t] = e0z[g]
-                sh_e1x[t] = e1x[g]
-                sh_e1y[t] = e1y[g]
-                sh_e1z[t] = e1z[g]
-            end
-            t += stride
-        end
-        CUDA.sync_threads()
-
-        # process tile: compute dist² only (region/closest point computed once after the minimum is known)
-        t = Int32(1)
-        while t <= cnt
-            ax = sh_v0x[t]
-            ay = sh_v0y[t]
-            az = sh_v0z[t]
-            abx = sh_e0x[t]
-            aby = sh_e0y[t]
-            abz = sh_e0z[t]
-            acx = sh_e1x[t]
-            acy = sh_e1y[t]
-            acz = sh_e1z[t]
-
-            # distance-only computation for the hot inner loop
-            d² = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
-            if d² < best_d²
-                best_d² = d²
-                best_face = tile_start + t - Int32(1)
-            end
-            t += Int32(1)
-        end
-
-        CUDA.sync_threads()
-        tile_start += Int32(TILE)
-    end
-
-    # robust on-surface handling
-    if best_d² <= ε²
-        @inbounds sdf[ix, iy, iz] = 0.0f0
-        return nothing
-    end
-
-    # recompute closest point and region once for the winning triangle (for sign)
-    @inbounds begin
-        ax = v0x[best_face]
-        ay = v0y[best_face]
-        az = v0z[best_face]
-
-        abx = e0x[best_face]
-        aby = e0y[best_face]
-        abz = e0z[best_face]
-
-        acx = e1x[best_face]
-        acy = e1y[best_face]
-        acz = e1z[best_face]
-    end
-    best_d², region, qx, qy, qz = dist²_and_region(
-        px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz
-    )
-    # choose pseudo-normal (face/edge/vertex)
-    nx = 0.0f0
-    ny = 0.0f0
-    nz = 1.0f0
+    origin::Float32, step_val::Float32, inv_step::Float32,
+    n::Int32, band::Int32, n_faces::Int32,
+)
+    fi = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    fi > n_faces && return nothing
 
     @inbounds begin
-        if region == UInt8(0)
-            nx = fnx[best_face]
-            ny = fny[best_face]
-            nz = fnz[best_face]
-        elseif region == UInt8(1)
-            vi = i0[best_face]
-            nx = vnx[vi]
-            ny = vny[vi]
-            nz = vnz[vi]
-        elseif region == UInt8(2)
-            vi = i1[best_face]
-            nx = vnx[vi]
-            ny = vny[vi]
-            nz = vnz[vi]
-        elseif region == UInt8(3)
-            vi = i2[best_face]
-            nx = vnx[vi]
-            ny = vny[vi]
-            nz = vnz[vi]
-        elseif region == UInt8(4)   # AB
-            nx = eabx[best_face]
-            ny = eaby[best_face]
-            nz = eabz[best_face]
-        elseif region == UInt8(5)   # AC
-            nx = eacx[best_face]
-            ny = eacy[best_face]
-            nz = eacz[best_face]
-        else                        # BC
-            nx = ebcx[best_face]
-            ny = ebcy[best_face]
-            nz = ebcz[best_face]
-        end
+        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
+        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
+        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
     end
 
-    # sign computation using the closest point q and the chosen pseudo-normal
-    vx = px - qx
-    vy = py - qy
-    vz = pz - qz
-    s = dot3f(vx, vy, vz, nx, ny, nz)
-    d = √(best_d²)
-    @inbounds sdf[ix, iy, iz] = ifelse(s < 0.0f0, -d, d)
+    bx = ax + abx; by = ay + aby; bz = az + abz
+    cx = ax + acx; cy = ay + acy; cz = az + acz
+
+    i0 = max(unsafe_trunc(Int32, (min(ax, bx, cx) - origin) * inv_step) + Int32(1) - band, Int32(1))
+    i1 = min(unsafe_trunc(Int32, (max(ax, bx, cx) - origin) * inv_step) + Int32(1) + band, n)
+    j0 = max(unsafe_trunc(Int32, (min(ay, by, cy) - origin) * inv_step) + Int32(1) - band, Int32(1))
+    j1 = min(unsafe_trunc(Int32, (max(ay, by, cy) - origin) * inv_step) + Int32(1) + band, n)
+    k0 = max(unsafe_trunc(Int32, (min(az, bz, cz) - origin) * inv_step) + Int32(1) - band, Int32(1))
+    k1 = min(unsafe_trunc(Int32, (max(az, bz, cz) - origin) * inv_step) + Int32(1) + band, n)
+
+    i = i0
+    while i <= i1
+        px = muladd(Float32(i - Int32(1)), step_val, origin)
+        j = j0
+        while j <= j1
+            py = muladd(Float32(j - Int32(1)), step_val, origin)
+            k = k0
+            while k <= k1
+                pz = muladd(Float32(k - Int32(1)), step_val, origin)
+                d2 = _dist2_point_triangle(px, py, pz, ax, ay, az,
+                                           abx, aby, abz, acx, acy, acz)
+                lin = i + (j - Int32(1)) * n + (k - Int32(1)) * n * n
+                CUDA.atomic_min!(pointer(packed, lin), _pack_dist2_idx(d2, fi))
+                k += Int32(1)
+            end
+            j += Int32(1)
+        end
+        i += Int32(1)
+    end
     return nothing
 end
 
-# =============================================================================
-# Public API (drop-in replacement style)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 1b — Extract indices
+# ──────────────────────────────────────────────────────────────────────────────
 
-function compute_sdf(mesh::Mesh{3,Float32}, n::Int=128; tile_size::Int=256)
-    rng = range(-1.0f0, 1.0f0; length=n)
-    vertices = coordinates(mesh)
-    fcs = faces(mesh)
-    sdf = compute_sdf(vertices, fcs, rng; tile_size)
-    return sdf::CuArray{Float32,3}
+function _extract_indices_kernel!(
+    idx::CuDeviceArray{Int32,3},
+    packed::CuDeviceArray{UInt64,3},
+    n::Int32,
+)
+    ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    iz = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    (ix > n) | (iy > n) | (iz > n) && return nothing
+
+    @inbounds p = packed[ix, iy, iz]
+    @inbounds idx[ix, iy, iz] = p == _SENTINEL_U64 ? _NO_TRIANGLE : _unpack_idx(p)
+    return nothing
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 2 — JFA pass (propagate triangle indices)
+# ──────────────────────────────────────────────────────────────────────────────
+
+function _jfa_pass_kernel!(
+    grid_out::CuDeviceArray{Int32,3},
+    grid_in::CuDeviceArray{Int32,3},
+    v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
+    e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
+    e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
+    origin::Float32, step_val::Float32, n::Int32, jump::Int32,
+)
+    ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    iz = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    (ix > n) | (iy > n) | (iz > n) && return nothing
+
+    px = muladd(Float32(ix - Int32(1)), step_val, origin)
+    py = muladd(Float32(iy - Int32(1)), step_val, origin)
+    pz = muladd(Float32(iz - Int32(1)), step_val, origin)
+
+    @inbounds best_idx = grid_in[ix, iy, iz]
+    best_d2 = Inf32
+
+    if best_idx != _NO_TRIANGLE
+        @inbounds begin
+            ax = v0x[best_idx]; ay = v0y[best_idx]; az = v0z[best_idx]
+            abx = e0x[best_idx]; aby = e0y[best_idx]; abz = e0z[best_idx]
+            acx = e1x[best_idx]; acy = e1y[best_idx]; acz = e1z[best_idx]
+        end
+        best_d2 = _dist2_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
+    end
+
+    @inbounds for dz in Int32(-1):Int32(1)
+        nz = iz + dz * jump
+        (nz < Int32(1)) | (nz > n) && continue
+        for dy in Int32(-1):Int32(1)
+            ny = iy + dy * jump
+            (ny < Int32(1)) | (ny > n) && continue
+            for dx in Int32(-1):Int32(1)
+                nx = ix + dx * jump
+                (nx < Int32(1)) | (nx > n) && continue
+                (dx == Int32(0)) & (dy == Int32(0)) & (dz == Int32(0)) && continue
+
+                nb = grid_in[nx, ny, nz]
+                (nb == _NO_TRIANGLE) | (nb == best_idx) && continue
+
+                ax = v0x[nb]; ay = v0y[nb]; az = v0z[nb]
+                abx = e0x[nb]; aby = e0y[nb]; abz = e0z[nb]
+                acx = e1x[nb]; acy = e1y[nb]; acz = e1z[nb]
+
+                d2 = _dist2_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
+                if d2 < best_d2
+                    best_d2 = d2
+                    best_idx = nb
+                end
+            end
+        end
+    end
+
+    @inbounds grid_out[ix, iy, iz] = best_idx
+    return nothing
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 3 — Parity rasterization (orientation-independent sign)
+# ──────────────────────────────────────────────────────────────────────────────
+
+function _parity_kernel!(
+    parity::CuDeviceArray{UInt32,3},
+    v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
+    e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
+    e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
+    origin::Float32, step_val::Float32, inv_step::Float32,
+    n::Int32, n_faces::Int32,
+    jitter_mag::Float32, det_eps::Float32, bary_eps::Float32,
+)
+    fi = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    fi > n_faces && return nothing
+
+    @inbounds begin
+        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
+        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
+        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+    end
+
+    # Solve barycentric using XY only for vertical rays. We use:
+    # det = aby*acx - abx*acy  (=-cross_z)
+    det = muladd(aby, acx, -abx * acy)
+    abs(det) <= det_eps && return nothing
+    inv_det = inv(det)
+
+    # XY bounding box (pad by one voxel + jitter)
+    bx = ax + abx; by = ay + aby
+    cx = ax + acx; cy = ay + acy
+
+    # Clamp to domain to keep trunc() behaving like floor (non-negative)
+    x_min = max(min(ax, bx, cx) - jitter_mag, origin)
+    x_max = min(max(ax, bx, cx) + jitter_mag, origin + step_val * Float32(n - Int32(1)))
+    y_min = max(min(ay, by, cy) - jitter_mag, origin)
+    y_max = min(max(ay, by, cy) + jitter_mag, origin + step_val * Float32(n - Int32(1)))
+
+    ix0 = max(unsafe_trunc(Int32, (x_min - origin) * inv_step) + Int32(1), Int32(1))
+    ix1 = min(unsafe_trunc(Int32, (x_max - origin) * inv_step) + Int32(2), n)
+    iy0 = max(unsafe_trunc(Int32, (y_min - origin) * inv_step) + Int32(1), Int32(1))
+    iy1 = min(unsafe_trunc(Int32, (y_max - origin) * inv_step) + Int32(2), n)
+
+    z_end = origin + step_val * Float32(n - Int32(1))
+
+    ix = ix0
+    while ix <= ix1
+        iy = iy0
+        while iy <= iy1
+            jx, jy = _column_jitter(ix, iy, jitter_mag)
+            rx = muladd(Float32(ix - Int32(1)), step_val, origin) + jx
+            ry = muladd(Float32(iy - Int32(1)), step_val, origin) + jy
+
+            sx = rx - ax
+            sy = ry - ay
+            u = (muladd(sy, acx, -sx * acy)) * inv_det
+            v = (muladd(sx, aby, -sy * abx)) * inv_det
+
+            # Half-open rule: exclude edges/vertices to avoid double-counting.
+            if (u <= bary_eps) | (v <= bary_eps) | ((u + v) >= (1f0 - bary_eps))
+                iy += Int32(1)
+                continue
+            end
+
+            z_hit = az + u * abz + v * acz
+
+            # Half-open in z: only hits strictly inside (origin, z_end)
+            if (z_hit <= origin) | (z_hit >= z_end)
+                iy += Int32(1)
+                continue
+            end
+
+            # Toggle at the first grid sample strictly above z_hit.
+            t = (z_hit - origin) * inv_step  # in (0, n-1)
+            z_idx = unsafe_trunc(Int32, t) + Int32(2)
+
+            if z_idx <= n
+                lin = ix + (iy - Int32(1)) * n + (z_idx - Int32(1)) * n * n
+                CUDA.atomic_xor!(pointer(parity, lin), UInt32(1))
+            end
+            iy += Int32(1)
+        end
+        ix += Int32(1)
+    end
+    return nothing
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 4 — Finalize (prefix XOR parity + exact distance)
+# ──────────────────────────────────────────────────────────────────────────────
+
+function _finalize_kernel!(
+    sdf::CuDeviceArray{Float32,3},
+    idx_grid::CuDeviceArray{Int32,3},
+    parity::CuDeviceArray{UInt32,3},
+    v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
+    e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
+    e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
+    origin::Float32, step_val::Float32, n::Int32,
+    fallback_dist::Float32,
+)
+    ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    (ix > n) | (iy > n) && return nothing
+
+    px = muladd(Float32(ix - Int32(1)), step_val, origin)
+    py = muladd(Float32(iy - Int32(1)), step_val, origin)
+
+    parity_acc = UInt32(0)
+
+    iz = Int32(1)
+    while iz <= n
+        pz = muladd(Float32(iz - Int32(1)), step_val, origin)
+
+        @inbounds parity_acc ⊻= parity[ix, iy, iz]
+        is_inside = (parity_acc & UInt32(1)) == UInt32(1)
+
+        @inbounds tri = idx_grid[ix, iy, iz]
+        if tri != _NO_TRIANGLE
+            @inbounds begin
+                ax = v0x[tri]; ay = v0y[tri]; az = v0z[tri]
+                abx = e0x[tri]; aby = e0y[tri]; abz = e0z[tri]
+                acx = e1x[tri]; acy = e1y[tri]; acz = e1z[tri]
+            end
+            d = sqrt(_dist2_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz))
+            @inbounds sdf[ix, iy, iz] = is_inside ? -d : d
+        else
+            # Should not happen for reasonable band; keep sign consistent anyway.
+            @inbounds sdf[ix, iy, iz] = is_inside ? -fallback_dist : fallback_dist
+        end
+
+        iz += Int32(1)
+    end
+    return nothing
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CPU preprocessing: mesh → SoA triangle arrays
+# ──────────────────────────────────────────────────────────────────────────────
+
+"""Preprocess mesh into SoA Float32 arrays: vertex A + edges AB, AC.
+
+• Edge vectors are computed in Float64 first to reduce cancellation.
+• Degenerate triangles are dropped.
+"""
+function _preprocess_geometry(
+    vertices::AbstractVector{<:GeometryBasics.Point{3}},
+    fcs::AbstractVector;
+    eps2::Float64 = 1e-20,
+)
+    nf = length(fcs)
+    arrays = ntuple(_ -> sizehint!(Float32[], nf), 9)
+    v0x, v0y, v0z, e0x, e0y, e0z, e1x, e1y, e1z = arrays
+
+    @inbounds for face in fcs
+        # Works for TriangleFace / GLTriangleFace; we only need integer indices.
+        a, b, c = Int.(GeometryBasics.value.(face))
+        A  = Float64.(vertices[a])
+        ab = Float64.(vertices[b]) .- A
+        ac = Float64.(vertices[c]) .- A
+        nx = ab[2]*ac[3] - ab[3]*ac[2]
+        ny = ab[3]*ac[1] - ab[1]*ac[3]
+        nz = ab[1]*ac[2] - ab[2]*ac[1]
+        (nx*nx + ny*ny + nz*nz) <= eps2 && continue
+
+        push!(v0x, Float32(A[1])); push!(v0y, Float32(A[2])); push!(v0z, Float32(A[3]))
+        push!(e0x, Float32(ab[1])); push!(e0y, Float32(ab[2])); push!(e0z, Float32(ab[3]))
+        push!(e1x, Float32(ac[1])); push!(e1y, Float32(ac[2])); push!(e1z, Float32(ac[3]))
+    end
+
+    n_faces = Int32(length(v0x))
+    n_faces > 0 || error("All faces degenerate after filtering")
+
+    return (v0x=v0x, v0y=v0y, v0z=v0z,
+            e0x=e0x, e0y=e0y, e0z=e0z,
+            e1x=e1x, e1y=e1y, e1z=e1z,
+            n_faces=n_faces)
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────────────────
+
+"""Compute the signed distance field on a uniform [-1,1]³ grid.
+
+Returns a `CuArray{Float32,3}` of size `(n,n,n)`.
+
+Keyword arguments (good defaults for 256³):
+
+• `band=5`
+    Half-width (in voxels) of the seed AABB expansion around each triangle.
+    Larger = better JFA coverage, slower seeding.
+
+• `jfa_corrections=2`
+    Number of extra JFA passes at `jump=1` after the main pyramid.
+
+• `jitter_scale=1f-3`
+    Ray jitter magnitude as a *fraction of grid spacing* (so physical jitter is
+    `jitter_scale * step`). This helps avoid measure-zero edge/vertex cases.
+
+• `det_eps=1f-10`
+    Threshold for skipping triangles whose XY projection is nearly degenerate.
+
+• `bary_eps=1f-7`
+    Half-open barycentric margin (excludes edges to avoid double-counting).
+
+• `fallback_dist=10f0`
+    Used only if some voxels remain unassigned after JFA (rare if `band` is sane).
+"""
+function compute_sdf(mesh::Mesh, n::Int=256; kwargs...)
+    compute_sdf(coordinates(mesh), faces(mesh), n; kwargs...)
 end
 
 function compute_sdf(
-    vertices::Vector{Point3{Float32}},
-    fcs::Vector{GLTriangleFace},
-    rng::StepRangeLen{Float32};
-    tile_size::Int=256
+    vertices::AbstractVector{<:GeometryBasics.Point{3}},
+    fcs::AbstractVector,
+    n::Int = 256;
+    band::Int = 5,
+    jfa_corrections::Int = 2,
+    jitter_scale::Float32 = 1f-3,
+    det_eps::Float32 = 1f-10,
+    bary_eps::Float32 = 1f-7,
+    fallback_dist::Float32 = 10f0,
 )
-    # - analytic grid coordinate generation (no d_grid loads)
-    # - true Float64 CPU preprocessing for normals/angles
-    # - precomputed triangle edges (v0,e0,e1) to reduce kernel FLOPs
-    # - shared memory holds only geometry (9 floats/tri)
-    # - sign computed once from closest feature (face/edge/vertex pseudo-normal)
-    # - robust on-surface epsilon (return 0)
-    # - generic thread indexing and tunable TILE_SIZE (64/128/256)
-    (tile_size ∈ (64, 128, 256)) || error("tile_size must be 64, 128, or 256")
+    n32      = Int32(n)
+    origin   = -1f0
+    step_val = 2f0 / Float32(n - 1)
+    inv_step = inv(step_val)
 
-    data_cpu = precompute_data_on_cpu(vertices, fcs)
+    # Geometry → SoA → GPU
+    geom = _preprocess_geometry(vertices, fcs)
+    nf   = geom.n_faces
 
-    # Upload to GPU
-    d_v0x = CuArray(data_cpu.v0x)
-    d_v0y = CuArray(data_cpu.v0y)
-    d_v0z = CuArray(data_cpu.v0z)
+    d_v0x = CuArray(geom.v0x); d_v0y = CuArray(geom.v0y); d_v0z = CuArray(geom.v0z)
+    d_e0x = CuArray(geom.e0x); d_e0y = CuArray(geom.e0y); d_e0z = CuArray(geom.e0z)
+    d_e1x = CuArray(geom.e1x); d_e1y = CuArray(geom.e1y); d_e1z = CuArray(geom.e1z)
+    G = (d_v0x, d_v0y, d_v0z, d_e0x, d_e0y, d_e0z, d_e1x, d_e1y, d_e1z)
 
-    d_e0x = CuArray(data_cpu.e0x)
-    d_e0y = CuArray(data_cpu.e0y)
-    d_e0z = CuArray(data_cpu.e0z)
+    # Launch configs
+    tri_threads = 256
+    tri_blocks  = cld(Int(nf), tri_threads)
+    blk3 = (8, 8, 4)
+    grd3 = cld.(Int.((n32, n32, n32)), blk3)
 
-    d_e1x = CuArray(data_cpu.e1x)
-    d_e1y = CuArray(data_cpu.e1y)
-    d_e1z = CuArray(data_cpu.e1z)
+    # ── Phase 1: Seed ───────────────────────────────────────────────────
+    packed = CUDA.fill(_SENTINEL_U64, n32, n32, n32)
+    @cuda threads=tri_threads blocks=tri_blocks _seed_kernel!(
+        packed, G..., origin, step_val, inv_step, n32, Int32(band), nf)
 
-    d_i0 = CuArray(data_cpu.i0)
-    d_i1 = CuArray(data_cpu.i1)
-    d_i2 = CuArray(data_cpu.i2)
+    # ── Phase 1b: Extract indices ───────────────────────────────────────
+    grid_a = CUDA.zeros(Int32, n32, n32, n32)
+    @cuda threads=blk3 blocks=grd3 _extract_indices_kernel!(grid_a, packed, n32)
 
-    d_fnx = CuArray(data_cpu.fnx)
-    d_fny = CuArray(data_cpu.fny)
-    d_fnz = CuArray(data_cpu.fnz)
+    # ── Phase 2: JFA ────────────────────────────────────────────────────
+    grid_b = CUDA.zeros(Int32, n32, n32, n32)
+    curr_in, curr_out = grid_a, grid_b
 
-    d_eabx = CuArray(data_cpu.eabx)
-    d_eaby = CuArray(data_cpu.eaby)
-    d_eabz = CuArray(data_cpu.eabz)
-
-    d_eacx = CuArray(data_cpu.eacx)
-    d_eacy = CuArray(data_cpu.eacy)
-    d_eacz = CuArray(data_cpu.eacz)
-
-    d_ebcx = CuArray(data_cpu.ebcx)
-    d_ebcy = CuArray(data_cpu.ebcy)
-    d_ebcz = CuArray(data_cpu.ebcz)
-
-    d_vnx = CuArray(data_cpu.vnx)
-    d_vny = CuArray(data_cpu.vny)
-    d_vnz = CuArray(data_cpu.vnz)
-
-    n_grid = Int32(length(rng))
-    start = Float32(first(rng))
-    Δ = Float32(step(rng))
-
-    # Robust on-surface epsilon
-    ε = max(1.0f-6, 1.0f-3 * Δ)
-    ε² = ε * ε
-
-    sdf = CUDA.zeros(Float32, n_grid, n_grid, n_grid)
-
-    if tile_size == 64
-        val_tile_size = Val(64)
-        threads = (32, 2, 1)
-    elseif tile_size == 128
-        val_tile_size = Val(128)
-        threads = (32, 4, 1)
-    else
-        val_tile_size = Val(256)
-        threads = (32, 4, 2)
+    jump = Int32(n ÷ 2)
+    while jump >= Int32(1)
+        @cuda threads=blk3 blocks=grd3 _jfa_pass_kernel!(
+            curr_out, curr_in, G..., origin, step_val, n32, jump)
+        curr_in, curr_out = curr_out, curr_in
+        jump >>= Int32(1)
     end
 
-    tx, ty, tz = threads
-    blocks = (cld(Int(n_grid), tx), cld(Int(n_grid), ty), cld(Int(n_grid), tz))
+    for _ in 1:jfa_corrections
+        @cuda threads=blk3 blocks=grd3 _jfa_pass_kernel!(
+            curr_out, curr_in, G..., origin, step_val, n32, Int32(1))
+        curr_in, curr_out = curr_out, curr_in
+    end
 
-    @cuda threads=threads blocks=blocks compute_sdf_kernel!(
-        sdf,
-        d_v0x, d_v0y, d_v0z,
-        d_e0x, d_e0y, d_e0z,
-        d_e1x, d_e1y, d_e1z,
-        d_i0,  d_i1,  d_i2,
-        d_fnx, d_fny, d_fnz,
-        d_eabx, d_eaby, d_eabz,
-        d_eacx, d_eacy, d_eacz,
-        d_ebcx, d_ebcy, d_ebcz,
-        d_vnx, d_vny, d_vnz,
-        start, Δ, n_grid, data_cpu.n_faces, ε², val_tile_size
-    )
-    return sdf::CuArray{Float32,3}
+    idx_grid = curr_in
+    # (curr_out is a scratch buffer we can drop)
+
+    # ── Phase 3: Parity rasterization ───────────────────────────────────
+    parity = CUDA.zeros(UInt32, n32, n32, n32)
+    jitter_mag = jitter_scale * step_val
+
+    @cuda threads=tri_threads blocks=tri_blocks _parity_kernel!(
+        parity, G..., origin, step_val, inv_step, n32, nf,
+        jitter_mag, det_eps, bary_eps)
+
+    # ── Phase 4: Finalize ───────────────────────────────────────────────
+    sdf = CUDA.zeros(Float32, n32, n32, n32)
+    blk2 = (16, 16)
+    grd2 = cld.(Int.((n32, n32)), blk2)
+
+    @cuda threads=blk2 blocks=grd2 _finalize_kernel!(
+        sdf, idx_grid, parity, G..., origin, step_val, n32, fallback_dist)
+
+    return sdf
 end
