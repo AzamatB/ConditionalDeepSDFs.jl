@@ -126,7 +126,7 @@ end
 end
 
 @inline function unpack_idx(p::UInt64)
-    return Int32(p & 0xFFFF_FFFF)
+    return (p & 0xFFFF_FFFF) % Int32
 end
 
 # deterministic (x,y) jitter (cheap integer hash)
