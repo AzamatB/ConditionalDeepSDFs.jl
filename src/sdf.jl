@@ -119,18 +119,18 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
 end
 
 # packing (dist², tri_idx) into UInt64 for atomic_min
-@inline function _pack_dist2_idx(d2::Float32, idx::Int32)
+@inline function pack_dist2_idx(d2::Float32, idx::Int32)
     # High 32 bits: dist² as UInt32 (positive floats preserve ordering)
     # Low  32 bits: triangle index
     (UInt64(reinterpret(UInt32, d2)) << 32) | UInt64(UInt32(idx))
 end
 
-@inline function _unpack_idx(p::UInt64)
+@inline function unpack_idx(p::UInt64)
     reinterpret(Int32, UInt32(p & 0xFFFF_FFFF))
 end
 
 # deterministic (x,y) jitter (cheap integer hash)
-@inline function _u32_hash(x::UInt32)
+@inline function u32_hash(x::UInt32)
     y = x
     y ⊻= y >> 16
     y *= UInt32(0x7feb352d)
@@ -140,8 +140,8 @@ end
     return y
 end
 
-@inline function _column_jitter(ix::Int32, iy::Int32, mag::Float32)
-    h = _u32_hash(UInt32(ix) * UInt32(0x9e3779b9) + UInt32(iy) * UInt32(0x7f4a7c15))
+@inline function column_jitter(ix::Int32, iy::Int32, mag::Float32)
+    h = u32_hash(UInt32(ix) * UInt32(0x9e3779b9) + UInt32(iy) * UInt32(0x7f4a7c15))
     jx = (Float32(h & UInt32(0xFFFF)) / 65535f0 - 0.5f0) * mag
     jy = (Float32((h >> 16) & UInt32(0xFFFF)) / 65535f0 - 0.5f0) * mag
     return jx, jy
@@ -149,7 +149,7 @@ end
 
 ############################   Phase 1a — narrow-band seeding   ############################
 
-function _seed_kernel!(
+function seed_kernel!(
     packed::CuDeviceArray{UInt64,3},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
@@ -198,7 +198,7 @@ function _seed_kernel!(
                 d2 = dist²_point_triangle(px, py, pz, ax, ay, az,
                     abx, aby, abz, acx, acy, acz)
                 lin = i + (j - Int32(1)) * n + (k - Int32(1)) * n * n
-                CUDA.atomic_min!(pointer(packed, lin), _pack_dist2_idx(d2, fi))
+                CUDA.atomic_min!(pointer(packed, lin), pack_dist2_idx(d2, fi))
                 k += Int32(1)
             end
             j += Int32(1)
@@ -210,7 +210,7 @@ end
 
 ##############################   Phase 1b — extract indices   ##############################
 
-function _extract_indices_kernel!(
+function extract_indices_kernel!(
     idx::CuDeviceArray{Int32,3},
     packed::CuDeviceArray{UInt64,3},
     n::Int32,
@@ -221,12 +221,12 @@ function _extract_indices_kernel!(
     (ix > n) | (iy > n) | (iz > n) && return nothing
 
     @inbounds p = packed[ix, iy, iz]
-    @inbounds idx[ix, iy, iz] = p == SENTINEL_U64 ? NO_TRIANGLE : _unpack_idx(p)
+    @inbounds idx[ix, iy, iz] = p == SENTINEL_U64 ? NO_TRIANGLE : unpack_idx(p)
     return nothing
 end
 
 ###################   Phase 2 — JFA pass (propagate triangle indices)   ###################
-function _jfa_pass_kernel!(
+function jfa_pass_kernel!(
     grid_out::CuDeviceArray{Int32,3},
     grid_in::CuDeviceArray{Int32,3},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
@@ -300,7 +300,7 @@ end
 
 ############   Phase 3 — parity rasterization (orientation-independent sign)   ############
 
-function _parity_kernel!(
+function parity_kernel!(
     parity::CuDeviceArray{UInt32,3},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
@@ -353,7 +353,7 @@ function _parity_kernel!(
     while ix <= ix1
         iy = iy0
         while iy <= iy1
-            jx, jy = _column_jitter(ix, iy, jitter_mag)
+            jx, jy = column_jitter(ix, iy, jitter_mag)
             rx = muladd(Float32(ix - Int32(1)), step_val, origin) + jx
             ry = muladd(Float32(iy - Int32(1)), step_val, origin) + jy
 
@@ -393,7 +393,7 @@ end
 
 ###############   Phase 4 — finalize (prefix XOR parity + exact distance)   ###############
 
-function _finalize_kernel!(
+function finalize_kernel!(
     sdf::CuDeviceArray{Float32,3},
     idx_grid::CuDeviceArray{Int32,3},
     parity::CuDeviceArray{UInt32,3},
@@ -451,7 +451,7 @@ end
 • Edge vectors are computed in Float64 first to reduce cancellation.
 • Degenerate triangles are dropped.
 """
-function _preprocess_geometry(
+function preprocess_geometry(
     vertices::AbstractVector{<:GeometryBasics.Point{3}},
     fcs::AbstractVector;
     eps2::Float64=1e-20,
@@ -540,7 +540,7 @@ function compute_sdf(
     inv_step = inv(step_val)
 
     # Geometry → SoA → GPU
-    geom = _preprocess_geometry(vertices, fcs)
+    geom = preprocess_geometry(vertices, fcs)
     nf = geom.n_faces
 
     d_v0x = CuArray(geom.v0x)
@@ -562,12 +562,12 @@ function compute_sdf(
 
     # ── Phase 1: Seed ───────────────────────────────────────────────────
     packed = CUDA.fill(SENTINEL_U64, n32, n32, n32)
-    @cuda threads = tri_threads blocks = tri_blocks _seed_kernel!(
+    @cuda threads = tri_threads blocks = tri_blocks seed_kernel!(
         packed, G..., origin, step_val, inv_step, n32, Int32(band), nf)
 
     # ── Phase 1b: Extract indices ───────────────────────────────────────
     grid_a = CUDA.zeros(Int32, n32, n32, n32)
-    @cuda threads = blk3 blocks = grd3 _extract_indices_kernel!(grid_a, packed, n32)
+    @cuda threads = blk3 blocks = grd3 extract_indices_kernel!(grid_a, packed, n32)
 
     # ── Phase 2: JFA ────────────────────────────────────────────────────
     grid_b = CUDA.zeros(Int32, n32, n32, n32)
@@ -575,14 +575,14 @@ function compute_sdf(
 
     jump = Int32(n ÷ 2)
     while jump >= Int32(1)
-        @cuda threads = blk3 blocks = grd3 _jfa_pass_kernel!(
+        @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
             curr_out, curr_in, G..., origin, step_val, n32, jump)
         curr_in, curr_out = curr_out, curr_in
         jump >>= Int32(1)
     end
 
     for _ in 1:jfa_corrections
-        @cuda threads = blk3 blocks = grd3 _jfa_pass_kernel!(
+        @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
             curr_out, curr_in, G..., origin, step_val, n32, Int32(1))
         curr_in, curr_out = curr_out, curr_in
     end
@@ -594,7 +594,7 @@ function compute_sdf(
     parity = CUDA.zeros(UInt32, n32, n32, n32)
     jitter_mag = jitter_scale * step_val
 
-    @cuda threads = tri_threads blocks = tri_blocks _parity_kernel!(
+    @cuda threads = tri_threads blocks = tri_blocks parity_kernel!(
         parity, G..., origin, step_val, inv_step, n32, nf,
         jitter_mag, det_eps, bary_eps)
 
@@ -603,7 +603,7 @@ function compute_sdf(
     blk2 = (16, 16)
     grd2 = cld.(Int.((n32, n32)), blk2)
 
-    @cuda threads = blk2 blocks = grd2 _finalize_kernel!(
+    @cuda threads = blk2 blocks = grd2 finalize_kernel!(
         sdf, idx_grid, parity, G..., origin, step_val, n32, fallback_dist)
 
     return sdf
