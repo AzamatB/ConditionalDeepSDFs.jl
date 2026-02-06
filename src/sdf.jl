@@ -57,7 +57,7 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     apz = pz - az
     d1 = dot3(abx, aby, abz, apx, apy, apz)
     d2 = dot3(acx, acy, acz, apx, apy, apz)
-    if (d1 <= 0f0) && (d2 <= 0f0)
+    if (d1 <= 0f0) & (d2 <= 0f0)
         return dot3(apx, apy, apz, apx, apy, apz)
     end
 
@@ -66,7 +66,7 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     bpz = apz - abz
     d3 = dot3(abx, aby, abz, bpx, bpy, bpz)
     d4 = dot3(acx, acy, acz, bpx, bpy, bpz)
-    if (d3 >= 0f0) && (d4 <= d3)
+    if (d3 >= 0f0) & (d4 <= d3)
         return dot3(bpx, bpy, bpz, bpx, bpy, bpz)
     end
 
@@ -75,12 +75,12 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     cpz = apz - acz
     d5 = dot3(abx, aby, abz, cpx, cpy, cpz)
     d6 = dot3(acx, acy, acz, cpx, cpy, cpz)
-    if (d6 >= 0f0) && (d5 <= d6)
+    if (d6 >= 0f0) & (d5 <= d6)
         return dot3(cpx, cpy, cpz, cpx, cpy, cpz)
     end
 
     vc = d1 * d4 - d3 * d2
-    if (vc <= 0f0) && (d1 >= 0f0) && (d3 <= 0f0)
+    if (vc <= 0f0) & (d1 >= 0f0) & (d3 <= 0f0)
         v = d1 / (d1 - d3)
         dx = apx - v * abx
         dy = apy - v * aby
@@ -89,7 +89,7 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     end
 
     vb = d5 * d2 - d1 * d6
-    if (vb <= 0f0) && (d2 >= 0f0) && (d6 <= 0f0)
+    if (vb <= 0f0) & (d2 >= 0f0) & (d6 <= 0f0)
         w = d2 / (d2 - d6)
         dx = apx - w * acx
         dy = apy - w * acy
@@ -98,7 +98,7 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     end
 
     va = d3 * d6 - d5 * d4
-    if (va <= 0f0) && ((d4 - d3) >= 0f0) && ((d5 - d6) >= 0f0)
+    if (va <= 0f0) & ((d4 - d3) >= 0f0) & ((d5 - d6) >= 0f0)
         w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
         bcx = acx - abx
         bcy = acy - aby
@@ -158,7 +158,7 @@ function seed_kernel!(
     n::Int32, band::Int32, n_faces::Int32,
 )
     fi = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    fi > n_faces && return nothing
+    (fi > n_faces) && return nothing
 
     @inbounds begin
         ax = v0x[fi]
@@ -216,7 +216,7 @@ function extract_indices_kernel!(
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     iz = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    (ix > n) || (iy > n) || (iz > n) && return nothing
+    ((ix > n) | (iy > n) | (iz > n)) && return nothing
 
     @inbounds p = packed[ix, iy, iz]
     @inbounds idx[ix, iy, iz] = p == SENTINEL_U64 ? NO_TRIANGLE : unpack_idx(p)
@@ -235,7 +235,7 @@ function jfa_pass_kernel!(
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     iz = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    (ix > n) || (iy > n) || (iz > n) && return nothing
+    ((ix > n) | (iy > n) | (iz > n)) && return nothing
 
     px = muladd(Float32(ix - Int32(1)), step_val, origin)
     py = muladd(Float32(iy - Int32(1)), step_val, origin)
@@ -259,17 +259,17 @@ function jfa_pass_kernel!(
 
     @inbounds for dz in Int32(-1):Int32(1)
         nz = iz + dz * jump
-        (nz < Int32(1)) || (nz > n) && continue
+        ((nz < Int32(1)) | (nz > n)) && continue
         for dy in Int32(-1):Int32(1)
             ny = iy + dy * jump
-            (ny < Int32(1)) || (ny > n) && continue
+            ((ny < Int32(1)) | (ny > n)) && continue
             for dx in Int32(-1):Int32(1)
                 nx = ix + dx * jump
-                (nx < Int32(1)) || (nx > n) && continue
-                (dx == Int32(0)) && (dy == Int32(0)) && (dz == Int32(0)) && continue
+                ((nx < Int32(1)) | (nx > n)) && continue
+                ((dx == Int32(0)) & (dy == Int32(0)) & (dz == Int32(0))) && continue
 
                 nb = grid_in[nx, ny, nz]
-                ((nb == NO_TRIANGLE) || (nb == best_idx)) && continue
+                ((nb == NO_TRIANGLE) | (nb == best_idx)) && continue
 
                 ax = v0x[nb]
                 ay = v0y[nb]
@@ -359,7 +359,7 @@ function parity_kernel!(
             v = (muladd(sx, aby, -sy * abx)) * inv_det
 
             # Half-open rule: exclude edges/vertices to avoid double-counting.
-            if (u <= ε_bary) || (v <= ε_bary) || ((u + v) >= (1f0 - ε_bary))
+            if (u <= ε_bary) | (v <= ε_bary) | ((u + v) >= (1f0 - ε_bary))
                 iy += Int32(1)
                 continue
             end
@@ -367,7 +367,7 @@ function parity_kernel!(
             z_hit = az + u * abz + v * acz
 
             # Half-open in z: only hits strictly inside (origin, z_end)
-            if (z_hit <= origin) || (z_hit >= z_end)
+            if (z_hit <= origin) | (z_hit >= z_end)
                 iy += Int32(1)
                 continue
             end
@@ -401,13 +401,12 @@ function finalize_kernel!(
 )
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    (ix > n) || (iy > n) && return nothing
+    ((ix > n) | (iy > n)) && return nothing
 
     px = muladd(Float32(ix - Int32(1)), step_val, origin)
     py = muladd(Float32(iy - Int32(1)), step_val, origin)
 
     parity_acc = UInt32(0)
-
     iz = Int32(1)
     while iz <= n
         pz = muladd(Float32(iz - Int32(1)), step_val, origin)
@@ -465,7 +464,7 @@ function preprocess_geometry(
         nx = ab[2] * ac[3] - ab[3] * ac[2]
         ny = ab[3] * ac[1] - ab[1] * ac[3]
         nz = ab[1] * ac[2] - ab[2] * ac[1]
-        (nx * nx + ny * ny + nz * nz) <= ε² && continue
+        ((nx * nx + ny * ny + nz * nz) <= ε²) && continue
 
         push!(v0x, Float32(A[1]))
         push!(v0y, Float32(A[2]))
@@ -479,8 +478,7 @@ function preprocess_geometry(
     end
 
     n_faces = Int32(length(v0x))
-    n_faces > 0 || error("All faces degenerate after filtering")
-
+    (n_faces > 0) || error("All faces degenerate after filtering")
     return (;
         v0x, v0y, v0z,
         e0x, e0y, e0z,
