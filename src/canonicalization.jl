@@ -4,11 +4,11 @@ using LinearAlgebra
 
 function canonicalize(mesh::Mesh{3,Float32,GLTriangleFace})
     # weld vertices that are within distance ε (single-linkage via union-find)
-    mesh_repaired = weld_vertices(mesh)
+    mesh_welded = weld_vertices(mesh)
     # shift the mesh so that its vertex centroid is at the origin
-    shift_to_origin!(mesh_repaired)
+    shift_to_origin!(mesh_welded)
     # reorient the mesh so that its faces are oriented outward
-    mesh_oriented = reorient_outward(mesh_repaired)
+    mesh_oriented = reorient_outward(mesh_welded)
     # align the mesh so that its principal axes are aligned with the coordinate axes
     # and rescale it to fit the unit sphere (runs on GPU)
     mesh_normalized = align_and_rescale(mesh_oriented)

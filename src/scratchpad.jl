@@ -9,21 +9,6 @@ mesh = load(mesh_path)
 
 @time mesh = canonicalize(mesh)
 
-@time sdf = compute_sdf(mesh, 256);
-sdf_cpu = Array(sdf);
-
-using Meshing
-
-points, fcs = isosurface(sdf_cpu, MarchingCubes())
-points, fcs = isosurface(sdf_cpu, MarchingTetrahedra())
-
-ps = reinterpret(Point3{Float64}, points)
-fs = reinterpret(TriangleFace{Int}, fcs)
-msh = GeometryBasics.Mesh(ps, fs)
-
-using GLMakie
-
-figure = Figure()
-lscene = LScene(figure[1, 1])  # LScene for full 3D camera control
-mesh!(lscene, msh, color = :lightblue, shading = true)
-figure
+@time sdf = construct_sdf(mesh, 256);
+@time mesh = construct_mesh(sdf)
+visualize(mesh)

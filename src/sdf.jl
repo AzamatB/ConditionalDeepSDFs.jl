@@ -28,10 +28,37 @@ Notes:
 
 using CUDA
 using GeometryBasics
+using GLMakie
+using Meshing
 
 # constants
 const SENTINEL_U64 = typemax(UInt64)
 const NO_TRIANGLE = Int32(0)   # 1-based triangle indices; 0 = unassigned
+
+function construct_mesh(
+    sdf::CuArray{Float32,3}, method::M=MarchingCubes{Float32}()
+) where {M<:Union{MarchingCubes{Float32},MarchingTetrahedra{Float32,Float32}}}
+    sdf_cpu = Array(sdf)
+    mesh = construct_mesh(sdf_cpu, method)
+    return mesh::Mesh{3,Float32,TriangleFace{Int}}
+end
+
+function construct_mesh(
+    sdf::Array{Float32,3}, method::M=MarchingCubes{Float32}()
+) where {M<:Union{MarchingCubes{Float32},MarchingTetrahedra{Float32,Float32}}}
+    (vertices_t, faces_t) = isosurface(sdf, method)
+    vertices = reinterpret(Point3f, vertices_t)
+    faces = reinterpret(TriangleFace{Int}, faces_t)
+    mesh = Mesh(vertices, faces)
+    return mesh::Mesh{3,Float32,TriangleFace{Int}}
+end
+
+function visualize(mesh::Mesh{3,Float32})
+    figure = Figure()
+    lscene = LScene(figure[1, 1])  # LScene for full 3D camera control
+    mesh!(lscene, mesh, color=:lightblue, shading=true)
+    return figure
+end
 
 ##################################   Low-level GPU math   ##################################
 
@@ -510,11 +537,11 @@ Keyword arguments (good defaults for 256³):
 • `dist_fallback=10f0`
     Used only if some voxels remain unassigned after JFA (rare if `band` is sane).
 """
-function compute_sdf(mesh::Mesh{3,Float32,GLTriangleFace}, n::Int=256; kwargs...)
-    return compute_sdf(coordinates(mesh), faces(mesh), n; kwargs...)
+function construct_sdf(mesh::Mesh{3,Float32,GLTriangleFace}, n::Int=256; kwargs...)
+    return construct_sdf(coordinates(mesh), faces(mesh), n; kwargs...)
 end
 
-function compute_sdf(
+function construct_sdf(
     vertices::AbstractVector{<:GeometryBasics.Point{3}},
     fcs::AbstractVector,
     n::Int=256;
