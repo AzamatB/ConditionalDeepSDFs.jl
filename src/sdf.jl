@@ -211,9 +211,7 @@ end
 ##############################   Phase 1b — extract indices   ##############################
 
 function extract_indices_kernel!(
-    idx::CuDeviceArray{Int32,3},
-    packed::CuDeviceArray{UInt64,3},
-    n::Int32,
+    idx::CuDeviceArray{Int32,3}, packed::CuDeviceArray{UInt64,3}, n::Int32
 )
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -228,8 +226,7 @@ end
 ###################   Phase 2 — JFA pass (propagate triangle indices)   ###################
 
 function jfa_pass_kernel!(
-    grid_out::CuDeviceArray{Int32,3},
-    grid_in::CuDeviceArray{Int32,3},
+    grid_out::CuDeviceArray{Int32,3}, grid_in::CuDeviceArray{Int32,3},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
@@ -306,10 +303,10 @@ function parity_kernel!(
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
     origin::Float32, step_val::Float32, inv_step::Float32,
     n::Int32, n_faces::Int32,
-    jitter_mag::Float32, det_eps::Float32, bary_eps::Float32,
+    jitter_mag::Float32, ε_det::Float32, ε_bary::Float32
 )
     fi = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    fi > n_faces && return nothing
+    (fi > n_faces) && return nothing
 
     @inbounds begin
         ax = v0x[fi]
@@ -326,7 +323,7 @@ function parity_kernel!(
     # Solve barycentric using XY only for vertical rays. We use:
     # det = aby*acx - abx*acy  (=-cross_z)
     det = muladd(aby, acx, -abx * acy)
-    abs(det) <= det_eps && return nothing
+    (abs(det) <= ε_det) && return nothing
     inv_det = inv(det)
 
     # XY bounding box (pad by one voxel + jitter)
@@ -362,7 +359,7 @@ function parity_kernel!(
             v = (muladd(sx, aby, -sy * abx)) * inv_det
 
             # Half-open rule: exclude edges/vertices to avoid double-counting.
-            if (u <= bary_eps) || (v <= bary_eps) || ((u + v) >= (1f0 - bary_eps))
+            if (u <= ε_bary) || (v <= ε_bary) || ((u + v) >= (1f0 - ε_bary))
                 iy += Int32(1)
                 continue
             end
@@ -400,7 +397,7 @@ function finalize_kernel!(
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
     origin::Float32, step_val::Float32, n::Int32,
-    fallback_dist::Float32,
+    dist_fallback::Float32,
 )
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -435,7 +432,7 @@ function finalize_kernel!(
             @inbounds sdf[ix, iy, iz] = is_inside ? -d : d
         else
             # Should not happen for reasonable band; keep sign consistent anyway.
-            @inbounds sdf[ix, iy, iz] = is_inside ? -fallback_dist : fallback_dist
+            @inbounds sdf[ix, iy, iz] = is_inside ? -dist_fallback : dist_fallback
         end
 
         iz += Int32(1)
@@ -453,10 +450,10 @@ end
 function preprocess_geometry(
     vertices::AbstractVector{<:GeometryBasics.Point{3}},
     fcs::AbstractVector;
-    eps2::Float64=1e-20,
+    ε²::Float64=1e-20
 )
-    nf = length(fcs)
-    arrays = ntuple(_ -> sizehint!(Float32[], nf), 9)
+    num_faces = length(fcs)
+    arrays = ntuple(_ -> sizehint!(Float32[], num_faces), 9)
     v0x, v0y, v0z, e0x, e0y, e0z, e1x, e1y, e1z = arrays
 
     @inbounds for face in fcs
@@ -468,7 +465,7 @@ function preprocess_geometry(
         nx = ab[2] * ac[3] - ab[3] * ac[2]
         ny = ab[3] * ac[1] - ab[1] * ac[3]
         nz = ab[1] * ac[2] - ab[2] * ac[1]
-        (nx * nx + ny * ny + nz * nz) <= eps2 && continue
+        (nx * nx + ny * ny + nz * nz) <= ε² && continue
 
         push!(v0x, Float32(A[1]))
         push!(v0y, Float32(A[2]))
@@ -484,42 +481,39 @@ function preprocess_geometry(
     n_faces = Int32(length(v0x))
     n_faces > 0 || error("All faces degenerate after filtering")
 
-    return (v0x=v0x, v0y=v0y, v0z=v0z,
-        e0x=e0x, e0y=e0y, e0z=e0z,
-        e1x=e1x, e1y=e1y, e1z=e1z,
-        n_faces=n_faces)
+    return (;
+        v0x, v0y, v0z,
+        e0x, e0y, e0z,
+        e1x, e1y, e1z,
+        n_faces
+    )
 end
 
 ######################################   Public API   ######################################
 
-"""Compute the signed distance field on a uniform [-1,1]³ grid.
+"""
+Compute the signed distance field on a uniform [-1,1]³ grid.
 
 Returns a `CuArray{Float32,3}` of size `(n,n,n)`.
 
 Keyword arguments (good defaults for 256³):
-
 • `band=5`
     Half-width (in voxels) of the seed AABB expansion around each triangle.
     Larger = better JFA coverage, slower seeding.
-
 • `jfa_corrections=2`
     Number of extra JFA passes at `jump=1` after the main pyramid.
-
 • `jitter_scale=1f-3`
-    Ray jitter magnitude as a *fraction of grid spacing* (so physical jitter is
+    Ray jitter magnitude as a fraction of grid spacing (so physical jitter is
     `jitter_scale * step`). This helps avoid measure-zero edge/vertex cases.
-
-• `det_eps=1f-10`
+• `ε_det=1f-10`
     Threshold for skipping triangles whose XY projection is nearly degenerate.
-
-• `bary_eps=1f-7`
+• `ε_bary=1f-7`
     Half-open barycentric margin (excludes edges to avoid double-counting).
-
-• `fallback_dist=10f0`
+• `dist_fallback=10f0`
     Used only if some voxels remain unassigned after JFA (rare if `band` is sane).
 """
-function compute_sdf(mesh::Mesh, n::Int=256; kwargs...)
-    compute_sdf(coordinates(mesh), faces(mesh), n; kwargs...)
+function compute_sdf(mesh::Mesh{3,Float32,GLTriangleFace}, n::Int=256; kwargs...)
+    return compute_sdf(coordinates(mesh), faces(mesh), n; kwargs...)
 end
 
 function compute_sdf(
@@ -529,18 +523,18 @@ function compute_sdf(
     band::Int=5,
     jfa_corrections::Int=2,
     jitter_scale::Float32=1f-3,
-    det_eps::Float32=1f-10,
-    bary_eps::Float32=1f-7,
-    fallback_dist::Float32=10f0,
+    ε_det::Float32=1f-10,
+    ε_bary::Float32=1f-7,
+    dist_fallback::Float32=10f0
 )
     n32 = Int32(n)
     origin = -1f0
     step_val = 2f0 / Float32(n - 1)
     inv_step = inv(step_val)
 
-    # Geometry → SoA → GPU
+    # geometry → SoA → GPU
     geom = preprocess_geometry(vertices, fcs)
-    nf = geom.n_faces
+    num_faces = geom.n_faces
 
     d_v0x = CuArray(geom.v0x)
     d_v0y = CuArray(geom.v0y)
@@ -551,59 +545,60 @@ function compute_sdf(
     d_e1x = CuArray(geom.e1x)
     d_e1y = CuArray(geom.e1y)
     d_e1z = CuArray(geom.e1z)
-    G = (d_v0x, d_v0y, d_v0z, d_e0x, d_e0y, d_e0z, d_e1x, d_e1y, d_e1z)
+    soa = (d_v0x, d_v0y, d_v0z, d_e0x, d_e0y, d_e0z, d_e1x, d_e1y, d_e1z)
 
-    # Launch configs
+    # launch configs
     tri_threads = 256
-    tri_blocks = cld(Int(nf), tri_threads)
+    tri_blocks = cld(Int(num_faces), tri_threads)
     blk3 = (8, 8, 4)
     grd3 = cld.(Int.((n32, n32, n32)), blk3)
 
-    # ── Phase 1: Seed ───────────────────────────────────────────────────
+    # phase 1: seed
     packed = CUDA.fill(SENTINEL_U64, n32, n32, n32)
     @cuda threads = tri_threads blocks = tri_blocks seed_kernel!(
-        packed, G..., origin, step_val, inv_step, n32, Int32(band), nf)
-
-    # ── Phase 1b: Extract indices ───────────────────────────────────────
+        packed, soa..., origin, step_val, inv_step, n32, Int32(band), num_faces
+    )
+    # phase 1b: extract indices
     grid_a = CUDA.zeros(Int32, n32, n32, n32)
     @cuda threads = blk3 blocks = grd3 extract_indices_kernel!(grid_a, packed, n32)
 
-    # ── Phase 2: JFA ────────────────────────────────────────────────────
+    # phase 2: JFA
     grid_b = CUDA.zeros(Int32, n32, n32, n32)
     curr_in, curr_out = grid_a, grid_b
 
     jump = Int32(n ÷ 2)
     while jump >= Int32(1)
         @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
-            curr_out, curr_in, G..., origin, step_val, n32, jump)
-        curr_in, curr_out = curr_out, curr_in
+            curr_out, curr_in, soa..., origin, step_val, n32, jump
+        )
+        (curr_in, curr_out) = (curr_out, curr_in)
         jump >>= Int32(1)
     end
 
     for _ in 1:jfa_corrections
         @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
-            curr_out, curr_in, G..., origin, step_val, n32, Int32(1))
-        curr_in, curr_out = curr_out, curr_in
+            curr_out, curr_in, soa..., origin, step_val, n32, Int32(1)
+        )
+        (curr_in, curr_out) = (curr_out, curr_in)
     end
 
     idx_grid = curr_in
     # (curr_out is a scratch buffer we can drop)
 
-    # ── Phase 3: Parity rasterization ───────────────────────────────────
+    # phase 3: parity rasterization
     parity = CUDA.zeros(UInt32, n32, n32, n32)
     jitter_mag = jitter_scale * step_val
 
     @cuda threads = tri_threads blocks = tri_blocks parity_kernel!(
-        parity, G..., origin, step_val, inv_step, n32, nf,
-        jitter_mag, det_eps, bary_eps)
-
-    # ── Phase 4: Finalize ───────────────────────────────────────────────
+        parity, soa..., origin, step_val, inv_step, n32, num_faces, jitter_mag, ε_det, ε_bary
+    )
+    # phase 4: finalize
     sdf = CUDA.zeros(Float32, n32, n32, n32)
     blk2 = (16, 16)
     grd2 = cld.(Int.((n32, n32)), blk2)
 
     @cuda threads = blk2 blocks = grd2 finalize_kernel!(
-        sdf, idx_grid, parity, G..., origin, step_val, n32, fallback_dist)
-
+        sdf, idx_grid, parity, soa..., origin, step_val, n32, dist_fallback
+    )
     return sdf
 end
