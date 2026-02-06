@@ -122,11 +122,11 @@ end
 @inline function pack_dist2_idx(d2::Float32, idx::Int32)
     # High 32 bits: dist² as UInt32 (positive floats preserve ordering)
     # Low  32 bits: triangle index
-    (UInt64(reinterpret(UInt32, d2)) << 32) | UInt64(UInt32(idx))
+    return (UInt64(reinterpret(UInt32, d2)) << 32) | UInt64(UInt32(idx))
 end
 
 @inline function unpack_idx(p::UInt64)
-    reinterpret(Int32, UInt32(p & 0xFFFF_FFFF))
+    return Int32(p & 0xFFFF_FFFF)
 end
 
 # deterministic (x,y) jitter (cheap integer hash)
@@ -141,10 +141,10 @@ end
 end
 
 @inline function column_jitter(ix::Int32, iy::Int32, mag::Float32)
-    h = u32_hash(UInt32(ix) * UInt32(0x9e3779b9) + UInt32(iy) * UInt32(0x7f4a7c15))
-    jx = (Float32(h & UInt32(0xFFFF)) / 65535f0 - 0.5f0) * mag
-    jy = (Float32((h >> 16) & UInt32(0xFFFF)) / 65535f0 - 0.5f0) * mag
-    return jx, jy
+    h = u32_hash(UInt32(ix) * 0x9e3779b9 + UInt32(iy) * 0x7f4a7c15)
+    jx = (Float32(h & 0xFFFF) / 65535f0 - 0.5f0) * mag
+    jy = (Float32((h >> 16) & 0xFFFF) / 65535f0 - 0.5f0) * mag
+    return (jx, jy)
 end
 
 ############################   Phase 1a — narrow-band seeding   ############################
@@ -218,7 +218,7 @@ function extract_indices_kernel!(
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     iz = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    (ix > n) | (iy > n) | (iz > n) && return nothing
+    (ix > n) || (iy > n) || (iz > n) && return nothing
 
     @inbounds p = packed[ix, iy, iz]
     @inbounds idx[ix, iy, iz] = p == SENTINEL_U64 ? NO_TRIANGLE : unpack_idx(p)
@@ -226,6 +226,7 @@ function extract_indices_kernel!(
 end
 
 ###################   Phase 2 — JFA pass (propagate triangle indices)   ###################
+
 function jfa_pass_kernel!(
     grid_out::CuDeviceArray{Int32,3},
     grid_in::CuDeviceArray{Int32,3},
@@ -237,7 +238,7 @@ function jfa_pass_kernel!(
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     iz = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    (ix > n) | (iy > n) | (iz > n) && return nothing
+    (ix > n) || (iy > n) || (iz > n) && return nothing
 
     px = muladd(Float32(ix - Int32(1)), step_val, origin)
     py = muladd(Float32(iy - Int32(1)), step_val, origin)
@@ -246,34 +247,32 @@ function jfa_pass_kernel!(
     @inbounds best_idx = grid_in[ix, iy, iz]
     best_d2 = Inf32
 
-    if best_idx != NO_TRIANGLE
-        @inbounds begin
-            ax = v0x[best_idx]
-            ay = v0y[best_idx]
-            az = v0z[best_idx]
-            abx = e0x[best_idx]
-            aby = e0y[best_idx]
-            abz = e0z[best_idx]
-            acx = e1x[best_idx]
-            acy = e1y[best_idx]
-            acz = e1z[best_idx]
-        end
+    @inbounds if best_idx != NO_TRIANGLE
+        ax = v0x[best_idx]
+        ay = v0y[best_idx]
+        az = v0z[best_idx]
+        abx = e0x[best_idx]
+        aby = e0y[best_idx]
+        abz = e0z[best_idx]
+        acx = e1x[best_idx]
+        acy = e1y[best_idx]
+        acz = e1z[best_idx]
         best_d2 = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
     end
 
     @inbounds for dz in Int32(-1):Int32(1)
         nz = iz + dz * jump
-        (nz < Int32(1)) | (nz > n) && continue
+        (nz < Int32(1)) || (nz > n) && continue
         for dy in Int32(-1):Int32(1)
             ny = iy + dy * jump
-            (ny < Int32(1)) | (ny > n) && continue
+            (ny < Int32(1)) || (ny > n) && continue
             for dx in Int32(-1):Int32(1)
                 nx = ix + dx * jump
-                (nx < Int32(1)) | (nx > n) && continue
-                (dx == Int32(0)) & (dy == Int32(0)) & (dz == Int32(0)) && continue
+                (nx < Int32(1)) || (nx > n) && continue
+                (dx == Int32(0)) && (dy == Int32(0)) && (dz == Int32(0)) && continue
 
                 nb = grid_in[nx, ny, nz]
-                (nb == NO_TRIANGLE) | (nb == best_idx) && continue
+                ((nb == NO_TRIANGLE) || (nb == best_idx)) && continue
 
                 ax = v0x[nb]
                 ay = v0y[nb]
@@ -363,7 +362,7 @@ function parity_kernel!(
             v = (muladd(sx, aby, -sy * abx)) * inv_det
 
             # Half-open rule: exclude edges/vertices to avoid double-counting.
-            if (u <= bary_eps) | (v <= bary_eps) | ((u + v) >= (1f0 - bary_eps))
+            if (u <= bary_eps) || (v <= bary_eps) || ((u + v) >= (1f0 - bary_eps))
                 iy += Int32(1)
                 continue
             end
@@ -371,7 +370,7 @@ function parity_kernel!(
             z_hit = az + u * abz + v * acz
 
             # Half-open in z: only hits strictly inside (origin, z_end)
-            if (z_hit <= origin) | (z_hit >= z_end)
+            if (z_hit <= origin) || (z_hit >= z_end)
                 iy += Int32(1)
                 continue
             end
@@ -405,7 +404,7 @@ function finalize_kernel!(
 )
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    (ix > n) | (iy > n) && return nothing
+    (ix > n) || (iy > n) && return nothing
 
     px = muladd(Float32(ix - Int32(1)), step_val, origin)
     py = muladd(Float32(iy - Int32(1)), step_val, origin)
