@@ -3,6 +3,7 @@ using GeometryBasics
 using LinearAlgebra
 
 function canonicalize(mesh::Mesh{3,Float32,GLTriangleFace})
+    isempty(coordinates(mesh)) && return mesh
     # weld vertices that are within distance ε (single-linkage via union-find)
     mesh_welded = weld_vertices(mesh)
     # shift the mesh so that its vertex centroid is at the origin
@@ -12,7 +13,7 @@ function canonicalize(mesh::Mesh{3,Float32,GLTriangleFace})
     # align the mesh so that its principal axes are aligned with the coordinate axes
     # and rescale it to fit the unit sphere (runs on GPU)
     mesh_normalized = align_and_rescale(mesh_oriented)
-    return mesh_normalized
+    return mesh_normalized::Mesh{3,Float32,GLTriangleFace}
 end
 
 ###############################   Welding of Mesh Vertices   ###############################
@@ -413,19 +414,19 @@ Normalize a 3D point cloud on the GPU assuming that it is already centered at th
 Points should be 3×N matrix where columns are 3D points.
 Returns a new normalized matrix and transformation parameters (scale, rotation).
 """
-function align_and_rescale(mesh::Mesh{3,Float32})
+function align_and_rescale(mesh::Mesh{3,Float32,GLTriangleFace})
     vertices = coordinates(mesh)
     fcs = faces(mesh)
-    (vertices_normalized, _) = align_and_rescale(vertices)
+    vertices_normalized = align_and_rescale(vertices)
     mesh_normalized = Mesh(vertices_normalized, fcs)
-    return mesh_normalized::Mesh{3,Float32}
+    return mesh_normalized::Mesh{3,Float32,GLTriangleFace}
 end
 
 function align_and_rescale(points::Vector{Point3f})
     points_mat = CuMatrix(vector_to_matrix(points))
-    (points_normalized_mat, params) = align_and_rescale(points_mat)
+    points_normalized_mat = align_and_rescale(points_mat)
     points_normalized = matrix_to_vector(Matrix(points_normalized_mat))
-    return (points_normalized, params)
+    return points_normalized
 end
 
 function align_and_rescale(points::CuMatrix{Float32})
@@ -463,9 +464,7 @@ function align_and_rescale(points::CuMatrix{Float32})
     is_zero = iszero(radius_max)
     scale = inv(radius_max + is_zero)
     points = scale .* points
-
-    params = (; scale=radius_max, rotation)
-    return (points, params)
+    return points
 end
 
 function vector_to_matrix(points::Vector{Point3{T}}) where {T<:Real}

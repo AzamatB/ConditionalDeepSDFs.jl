@@ -28,15 +28,15 @@ Notes:
 
 using CUDA
 using GeometryBasics
-using GLMakie
-using Meshing
+using GLMakie: Figure, LScene, mesh!
+using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
 
 # constants
 const SENTINEL_U64 = typemax(UInt64)
 const NO_TRIANGLE = Int32(0)   # 1-based triangle indices; 0 = unassigned
 
 function construct_mesh(
-    sdf::CuArray{Float32,3}, method::M=MarchingCubes{Float32}()
+    sdf::CuArray{Float32,3}, method::M=MarchingTetrahedra{Float32,Float32}()
 ) where {M<:Union{MarchingCubes{Float32},MarchingTetrahedra{Float32,Float32}}}
     sdf_cpu = Array(sdf)
     mesh = construct_mesh(sdf_cpu, method)
@@ -44,7 +44,7 @@ function construct_mesh(
 end
 
 function construct_mesh(
-    sdf::Array{Float32,3}, method::M=MarchingCubes{Float32}()
+    sdf::Array{Float32,3}, method::M=MarchingTetrahedra{Float32,Float32}()
 ) where {M<:Union{MarchingCubes{Float32},MarchingTetrahedra{Float32,Float32}}}
     (vertices_t, faces_t) = isosurface(sdf, method)
     vertices = reinterpret(Point3f, vertices_t)
@@ -55,7 +55,8 @@ end
 
 function visualize(mesh::Mesh{3,Float32})
     figure = Figure()
-    lscene = LScene(figure[1, 1])  # LScene for full 3D camera control
+    # LScene for full 3D camera control
+    lscene = LScene(figure[1, 1])
     mesh!(lscene, mesh, color=:lightblue, shading=true)
     return figure
 end
@@ -553,6 +554,7 @@ function construct_sdf(
     ε_bary::Float32=1f-7,
     dist_fallback::Float32=10f0
 )
+    (n > 7) || error("Grid size n must be greater than 7!")
     n32 = Int32(n)
     origin = -1f0
     step_val = 2f0 / Float32(n - 1)
