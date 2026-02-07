@@ -1,4 +1,3 @@
-using CUDA
 using GeometryBasics
 using LinearAlgebra
 
@@ -10,8 +9,7 @@ function canonicalize(mesh::Mesh{3,Float32,GLTriangleFace})
     shift_to_origin!(mesh_welded)
     # reorient the mesh so that its faces are oriented outward
     mesh_oriented = reorient_outward(mesh_welded)
-    # align the mesh so that its principal axes are aligned with the coordinate axes
-    # and rescale it to fit the unit sphere (runs on GPU)
+    # align the principal axes of the mesh and rescale it to fit the unit sphere
     mesh_normalized = align_and_rescale(mesh_oriented)
     return mesh_normalized::Mesh{3,Float32,GLTriangleFace}
 end
@@ -405,14 +403,13 @@ function shift_to_origin!(mesh::Mesh{3,Float32,GLTriangleFace})
 end
 
 """
-    align_and_rescale(points::CuMatrix{Float32})
+    align_and_rescale(vertices::Vector{Point3f})
 
-Normalize a 3D point cloud on the GPU assuming that it is already centered at the origin:
-- Scales to fit within unit sphere
+Normalize a 3D mesh assuming that it is already centered at the origin:
 - Aligns principal axes (largest variance along x, then y, then z)
+- Scales to fit within a unit sphere
 
-Points should be 3×N matrix where columns are 3D points.
-Returns a new normalized matrix and transformation parameters (scale, rotation).
+Returns a new normalized mesh.
 """
 function align_and_rescale(mesh::Mesh{3,Float32,GLTriangleFace})
     vertices = coordinates(mesh)
@@ -422,58 +419,37 @@ function align_and_rescale(mesh::Mesh{3,Float32,GLTriangleFace})
     return mesh_normalized::Mesh{3,Float32,GLTriangleFace}
 end
 
-function align_and_rescale(points::Vector{Point3f})
-    points_mat = CuMatrix(vector_to_matrix(points))
-    points_normalized_mat = align_and_rescale(points_mat)
-    points_normalized = matrix_to_vector(Matrix(points_normalized_mat))
-    return points_normalized
-end
-
-function align_and_rescale(points::CuMatrix{Float32})
-    @assert size(points, 1) == 3 "Expected 3×N matrix with columns as points"
-    n = size(points, 2)
-    # step 1: compute covariance matrix for PCA (on GPU, then transfer small 3×3)
-    cov_mat = (points * points') ./ n
-    cov_cpu = Matrix(cov_mat)  # 3×3, cheap transfer
-
+function align_and_rescale(vertices::Vector{Point3f})
+    isempty(vertices) && return vertices
+    # step 1: compute covariance matrix for PCA
+    vertices_mat = reinterpret(reshape, Float32, vertices)
+    weight = 1.0f0 / length(vertices)
+    # cov_mat = weight * (vertices_mat * vertices_mat')
+    cov_mat = Symmetric(BLAS.syrk('U', 'N', weight, vertices_mat), :U)
     # step 2: perform SVD for principal axes alignment
-    F = svd(cov_cpu) # eigenvectors of covariance give principal directions
+    F = svd(cov_mat) # eigenvectors of covariance give principal directions
     rotation = F.U  # rotation matrix (principal axes)
 
     # canonical sign convention: ensure diagonal elements are positive
     # this makes the principal axes point in consistent directions
     for col in eachcol(rotation)
         (_, idx_max) = findmax(abs, col)
-        flip = col[idx_max] < 0
-        c = 1 - 2flip
-        col .*= c
+        sgn = ifelse(col[idx_max] < 0.0f0, -1.0f0, 1.0f0)
+        col .*= sgn
     end
-
     # ensure proper rotation (det = +1), not reflection
-    flip = det(rotation) < 0
-    c = 1 - 2flip
-    rotation[:, 3] .*= c
+    sgn = ifelse(det(rotation) < 0.0f0, -1.0f0, 1.0f0)
+    rotation[:, 3] .*= sgn
 
     # step 3: invert rotation via transpose to align principal axes
-    rot_inv = CuMatrix(rotation')
-    points = rot_inv * points
-
+    vertices_mat_rotated = rotation' * vertices_mat
+    vertices_rotated = reinterpret(reshape, Point3f, vertices_mat_rotated)
     # step 4: scale to unit sphere
-    distances² = sum(abs2, points; dims=1)
+    distances² = sum(abs2, vertices_mat_rotated; dims=1)
     radius_max = √(maximum(distances²))
     is_zero = iszero(radius_max)
-    scale = inv(radius_max + is_zero)
-    points = scale .* points
-    return points
-end
+    scale = 1.0f0 / (radius_max + is_zero)
 
-function vector_to_matrix(points::Vector{Point3{T}}) where {T<:Real}
-    matrix = reinterpret(reshape, T, points)
-    return matrix
-end
-
-function matrix_to_vector(matrix::Matrix{T}) where {T<:Real}
-    @assert size(matrix, 1) == 3 "Expected 3×N matrix with columns as points"
-    vector = Point3{T}.(eachcol(matrix))
-    return vector::Vector{Point3{T}}
+    vertices_normalized = scale * vertices_rotated
+    return vertices_normalized::Vector{Point3f}
 end
