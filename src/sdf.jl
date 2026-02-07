@@ -198,12 +198,22 @@ function build_seed_tile_csr(
     n_faces = length(v0x)
 
     @inbounds for fi in 1:n_faces
-        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
-        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
-        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+        ax = v0x[fi]
+        ay = v0y[fi]
+        az = v0z[fi]
+        abx = e0x[fi]
+        aby = e0y[fi]
+        abz = e0z[fi]
+        acx = e1x[fi]
+        acy = e1y[fi]
+        acz = e1z[fi]
 
-        bx = ax + abx; by = ay + aby; bz = az + abz
-        cx = ax + acx; cy = ay + acy; cz = az + acz
+        bx = ax + abx
+        by = ay + aby
+        bz = az + abz
+        cx = ax + acx
+        cy = ay + acy
+        cz = az + acz
 
         i0 = max(unsafe_trunc(Int32, (min(ax, bx, cx) - origin) * inv_step) + Int32(1) - band, Int32(1))
         i1 = min(unsafe_trunc(Int32, (max(ax, bx, cx) - origin) * inv_step) + Int32(1) + band, n)
@@ -236,7 +246,7 @@ function build_seed_tile_csr(
     offsets = Vector{Int32}(undef, num_tiles + 1)
     offsets[1] = Int32(1)
     @inbounds for t in 1:num_tiles
-        offsets[t + 1] = offsets[t] + counts[t]
+        offsets[t+1] = offsets[t] + counts[t]
     end
     total_refs = Int(offsets[end] - Int32(1))
     tris = Vector{Int32}(undef, total_refs)
@@ -244,12 +254,22 @@ function build_seed_tile_csr(
     write_ptr = copy(offsets[1:end-1])
 
     @inbounds for fi in 1:n_faces
-        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
-        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
-        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+        ax = v0x[fi]
+        ay = v0y[fi]
+        az = v0z[fi]
+        abx = e0x[fi]
+        aby = e0y[fi]
+        abz = e0z[fi]
+        acx = e1x[fi]
+        acy = e1y[fi]
+        acz = e1z[fi]
 
-        bx = ax + abx; by = ay + aby; bz = az + abz
-        cx = ax + acx; cy = ay + acy; cz = az + acz
+        bx = ax + abx
+        by = ay + aby
+        bz = az + abz
+        cx = ax + acx
+        cy = ay + acy
+        cz = az + acz
 
         i0 = max(unsafe_trunc(Int32, (min(ax, bx, cx) - origin) * inv_step) + Int32(1) - band, Int32(1))
         i1 = min(unsafe_trunc(Int32, (max(ax, bx, cx) - origin) * inv_step) + Int32(1) + band, n)
@@ -323,15 +343,20 @@ function build_parity_tile_csr(
     domain_max = origin + step_val * Float32(n - Int32(1))
 
     @inbounds for fi in 1:n_faces
-        ax = v0x[fi]; ay = v0y[fi]
-        abx = e0x[fi]; aby = e0y[fi]
-        acx = e1x[fi]; acy = e1y[fi]
+        ax = v0x[fi]
+        ay = v0y[fi]
+        abx = e0x[fi]
+        aby = e0y[fi]
+        acx = e1x[fi]
+        acy = e1y[fi]
 
         det = muladd(aby, acx, -abx * acy)
         (abs(det) <= ε_det) && continue
 
-        bx = ax + abx; by = ay + aby
-        cx = ax + acx; cy = ay + acy
+        bx = ax + abx
+        by = ay + aby
+        cx = ax + acx
+        cy = ay + acy
 
         x_min = max(min(ax, bx, cx) - jitter_mag, origin)
         x_max = min(max(ax, bx, cx) + jitter_mag, domain_max)
@@ -361,7 +386,7 @@ function build_parity_tile_csr(
     offsets = Vector{Int32}(undef, num_tiles + 1)
     offsets[1] = Int32(1)
     @inbounds for t in 1:num_tiles
-        offsets[t + 1] = offsets[t] + counts[t]
+        offsets[t+1] = offsets[t] + counts[t]
     end
     total_refs = Int(offsets[end] - Int32(1))
     tris = Vector{Int32}(undef, total_refs)
@@ -369,15 +394,20 @@ function build_parity_tile_csr(
     write_ptr = copy(offsets[1:end-1])
 
     @inbounds for fi in 1:n_faces
-        ax = v0x[fi]; ay = v0y[fi]
-        abx = e0x[fi]; aby = e0y[fi]
-        acx = e1x[fi]; acy = e1y[fi]
+        ax = v0x[fi]
+        ay = v0y[fi]
+        abx = e0x[fi]
+        aby = e0y[fi]
+        acx = e1x[fi]
+        acy = e1y[fi]
 
         det = muladd(aby, acx, -abx * acy)
         (abs(det) <= ε_det) && continue
 
-        bx = ax + abx; by = ay + aby
-        cx = ax + acx; cy = ay + acy
+        bx = ax + abx
+        by = ay + aby
+        cx = ax + acx
+        cy = ay + acy
 
         x_min = max(min(ax, bx, cx) - jitter_mag, origin)
         x_max = min(max(ax, bx, cx) + jitter_mag, domain_max)
@@ -416,7 +446,7 @@ function build_parity_tile_csr(
     return (offsets, tris, active_tiles, ntx, nty)
 end
 
-#################################   Phase 1 — tiled seeding   #################################
+###############################   Phase 1 — tiled seeding   ###############################
 
 """Tile-binned narrow-band seed kernel.
 
@@ -464,14 +494,20 @@ function seed_tiled_kernel!(
     best_idx = NO_TRIANGLE
 
     start = @inbounds tile_offsets[tile_id]
-    stop = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
+    stop = @inbounds tile_offsets[tile_id+Int32(1)] - Int32(1)
 
     @inbounds for ptr in start:stop
         fi = tile_tris[ptr]
 
-        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
-        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
-        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+        ax = v0x[fi]
+        ay = v0y[fi]
+        az = v0z[fi]
+        abx = e0x[fi]
+        aby = e0y[fi]
+        abz = e0z[fi]
+        acx = e1x[fi]
+        acy = e1y[fi]
+        acz = e1z[fi]
 
         dd = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
         if dd < best_d2
@@ -488,11 +524,11 @@ function seed_tiled_kernel!(
     return nothing
 end
 
-###################   Phase 2 — JFA pass (propagate triangle indices + dist²)   ###################
+###############   Phase 2 — JFA pass (propagate triangle indices + dist²)   ###############
 
 function jfa_pass_kernel!(
     idx_out::CuDeviceArray{Int32,3}, d2_out::CuDeviceArray{Float32,3},
-    idx_in::CuDeviceArray{Int32,3},  d2_in::CuDeviceArray{Float32,3},
+    idx_in::CuDeviceArray{Int32,3}, d2_in::CuDeviceArray{Float32,3},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
@@ -508,7 +544,7 @@ function jfa_pass_kernel!(
     pz = muladd(Float32(iz - Int32(1)), step_val, origin)
 
     @inbounds best_idx = idx_in[ix, iy, iz]
-    @inbounds best_d2  = d2_in[ix, iy, iz]
+    @inbounds best_d2 = d2_in[ix, iy, iz]
 
     @inbounds for dz in Int32(-1):Int32(1)
         nz = iz + dz * jump
@@ -524,9 +560,15 @@ function jfa_pass_kernel!(
                 nb = idx_in[nx, ny, nz]
                 ((nb == NO_TRIANGLE) | (nb == best_idx)) && continue
 
-                ax = v0x[nb]; ay = v0y[nb]; az = v0z[nb]
-                abx = e0x[nb]; aby = e0y[nb]; abz = e0z[nb]
-                acx = e1x[nb]; acy = e1y[nb]; acz = e1z[nb]
+                ax = v0x[nb]
+                ay = v0y[nb]
+                az = v0z[nb]
+                abx = e0x[nb]
+                aby = e0y[nb]
+                abz = e0z[nb]
+                acx = e1x[nb]
+                acy = e1y[nb]
+                acz = e1z[nb]
 
                 dd = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
                 if dd < best_d2
@@ -539,12 +581,12 @@ function jfa_pass_kernel!(
 
     @inbounds begin
         idx_out[ix, iy, iz] = best_idx
-        d2_out[ix, iy, iz]  = best_d2
+        d2_out[ix, iy, iz] = best_d2
     end
     return nothing
 end
 
-############   Phase 3 — parity rasterization (tile-binned, no atomics)   ############
+###############   Phase 3 — parity rasterization (tile-binned, no atomics)   ###############
 
 """Tile-binned parity rasterization.
 
@@ -590,14 +632,20 @@ function parity_tiled_kernel!(
     z_end = origin + step_val * Float32(n - Int32(1))
 
     start = @inbounds tile_offsets[tile_id]
-    stop  = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
+    stop = @inbounds tile_offsets[tile_id+Int32(1)] - Int32(1)
 
     @inbounds for ptr in start:stop
         fi = tile_tris[ptr]
 
-        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
-        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
-        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+        ax = v0x[fi]
+        ay = v0y[fi]
+        az = v0z[fi]
+        abx = e0x[fi]
+        aby = e0y[fi]
+        abz = e0z[fi]
+        acx = e1x[fi]
+        acy = e1y[fi]
+        acz = e1z[fi]
 
         # det = aby*acx - abx*acy
         det = muladd(aby, acx, -abx * acy)
@@ -633,7 +681,7 @@ function parity_tiled_kernel!(
     return nothing
 end
 
-###############   Phase 4 — finalize (prefix XOR parity + sqrt(dist²))   ###############
+#################   Phase 4 — finalize (prefix XOR parity + sqrt(dist²))   #################
 
 function finalize_kernel!(
     sdf::CuDeviceArray{Float32,3},
@@ -758,43 +806,35 @@ function construct_sdf(
 
     # geometry → SoA (CPU)
     geom = preprocess_geometry(vertices, fcs)
-    num_faces = geom.n_faces
 
-    # ---------------------------------------------------------------------
-    # Phase 1 (CPU): build tile bins
-    # ---------------------------------------------------------------------
+    # phase 1 (CPU): build tile bins
     # Seeding tiles (3D)
     seed_blk = (8, 8, 4)
-    Tx_s = Int32(seed_blk[1]); Ty_s = Int32(seed_blk[2]); Tz_s = Int32(seed_blk[3])
+    Tx_s = Int32(seed_blk[1])
+    Ty_s = Int32(seed_blk[2])
+    Tz_s = Int32(seed_blk[3])
 
-    seed_offsets, seed_tris, seed_active, seed_ntx, seed_nty, seed_ntz = build_seed_tile_csr(
+    (seed_offsets, seed_tris, seed_active, seed_ntx, seed_nty, seed_ntz) = build_seed_tile_csr(
         geom.v0x, geom.v0y, geom.v0z,
         geom.e0x, geom.e0y, geom.e0z,
         geom.e1x, geom.e1y, geom.e1z,
-        origin, inv_step,
-        n32, Int32(band),
-        Tx_s, Ty_s, Tz_s,
+        origin, inv_step, n32, Int32(band), Tx_s, Ty_s, Tz_s
     )
 
     # Parity tiles (2D)
     parity_blk = (16, 16)
-    Tx_p = Int32(parity_blk[1]); Ty_p = Int32(parity_blk[2])
+    Tx_p = Int32(parity_blk[1])
+    Ty_p = Int32(parity_blk[2])
     jitter_mag = jitter_scale * step_val
 
-    parity_offsets, parity_tris, parity_active, parity_ntx, parity_nty = build_parity_tile_csr(
+    (parity_offsets, parity_tris, parity_active, parity_ntx, parity_nty) = build_parity_tile_csr(
         geom.v0x, geom.v0y, geom.v0z,
         geom.e0x, geom.e0y, geom.e0z,
         geom.e1x, geom.e1y, geom.e1z,
-        origin, step_val, inv_step,
-        n32,
-        Tx_p, Ty_p,
-        jitter_mag,
-        ε_det,
+        origin, step_val, inv_step, n32, Tx_p, Ty_p, jitter_mag, ε_det
     )
 
-    # ---------------------------------------------------------------------
-    # Upload geometry + bins to GPU
-    # ---------------------------------------------------------------------
+    # upload geometry + bins to GPU
     d_v0x = CuArray(geom.v0x)
     d_v0y = CuArray(geom.v0y)
     d_v0z = CuArray(geom.v0z)
@@ -807,34 +847,26 @@ function construct_sdf(
     soa = (d_v0x, d_v0y, d_v0z, d_e0x, d_e0y, d_e0z, d_e1x, d_e1y, d_e1z)
 
     d_seed_offsets = CuArray(seed_offsets)
-    d_seed_tris    = CuArray(seed_tris)
-    d_seed_active  = CuArray(seed_active)
+    d_seed_tris = CuArray(seed_tris)
+    d_seed_active = CuArray(seed_active)
 
     d_parity_offsets = CuArray(parity_offsets)
-    d_parity_tris    = CuArray(parity_tris)
-    d_parity_active  = CuArray(parity_active)
+    d_parity_tris = CuArray(parity_tris)
+    d_parity_active = CuArray(parity_active)
 
-    # ---------------------------------------------------------------------
-    # Phase 1 (GPU): tiled seeding
-    # ---------------------------------------------------------------------
+    # phase 1 (GPU): tiled seeding
     idx_a = CUDA.zeros(Int32, n32, n32, n32)
-    d2_a  = CUDA.fill(Inf32,  n32, n32, n32)
+    d2_a = CUDA.fill(Inf32, n32, n32, n32)
 
     # blocks = number of active tiles (1D)
     @cuda threads = seed_blk blocks = length(seed_active) seed_tiled_kernel!(
-        idx_a, d2_a,
-        d_seed_active, d_seed_offsets, d_seed_tris,
-        soa..., origin, step_val,
-        n32,
-        seed_ntx, seed_nty,
-        Tx_s, Ty_s, Tz_s,
+        idx_a, d2_a, d_seed_active, d_seed_offsets, d_seed_tris, soa...,
+        origin, step_val, n32, seed_ntx, seed_nty, Tx_s, Ty_s, Tz_s,
     )
 
-    # ---------------------------------------------------------------------
-    # Phase 2 (GPU): JFA (propagate idx + dist²)
-    # ---------------------------------------------------------------------
+    # phase 2 (GPU): JFA (propagate idx + dist²)
     idx_b = CUDA.zeros(Int32, n32, n32, n32)
-    d2_b  = CUDA.fill(Inf32,  n32, n32, n32)
+    d2_b = CUDA.fill(Inf32, n32, n32, n32)
 
     blk3 = seed_blk
     grd3 = cld.(Int.((n32, n32, n32)), blk3)
@@ -845,57 +877,39 @@ function construct_sdf(
     jump = Int32(n ÷ 2)
     while jump >= Int32(1)
         @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
-            curr_idx_out, curr_d2_out,
-            curr_idx_in,  curr_d2_in,
-            soa..., origin, step_val, n32, jump
+            curr_idx_out, curr_d2_out, curr_idx_in, curr_d2_in, soa...,
+            origin, step_val, n32, jump
         )
         (curr_idx_in, curr_idx_out) = (curr_idx_out, curr_idx_in)
-        (curr_d2_in,  curr_d2_out)  = (curr_d2_out,  curr_d2_in)
+        (curr_d2_in, curr_d2_out) = (curr_d2_out, curr_d2_in)
         jump >>= Int32(1)
     end
 
     for _ in 1:jfa_corrections
         @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
-            curr_idx_out, curr_d2_out,
-            curr_idx_in,  curr_d2_in,
-            soa..., origin, step_val, n32, Int32(1)
+            curr_idx_out, curr_d2_out, curr_idx_in, curr_d2_in, soa...,
+            origin, step_val, n32, Int32(1)
         )
         (curr_idx_in, curr_idx_out) = (curr_idx_out, curr_idx_in)
-        (curr_d2_in,  curr_d2_out)  = (curr_d2_out,  curr_d2_in)
+        (curr_d2_in, curr_d2_out) = (curr_d2_out, curr_d2_in)
     end
+    d2_grid = curr_d2_in
 
-    idx_grid = curr_idx_in
-    d2_grid  = curr_d2_in
-
-    # ---------------------------------------------------------------------
-    # Phase 3 (GPU): parity rasterization (tile-binned, no atomics)
-    # ---------------------------------------------------------------------
+    # phase 3 (GPU): parity rasterization (tile-binned, no atomics)
     parity = CUDA.zeros(UInt8, n32, n32, n32)
 
     @cuda threads = parity_blk blocks = length(parity_active) parity_tiled_kernel!(
-        parity,
-        d_parity_active, d_parity_offsets, d_parity_tris,
-        soa..., origin, step_val, inv_step,
-        n32,
-        parity_ntx,
-        Tx_p, Ty_p,
-        jitter_mag,
-        ε_det,
-        ε_bary,
+        parity, d_parity_active, d_parity_offsets, d_parity_tris, soa...,
+        origin, step_val, inv_step, n32, parity_ntx, Tx_p, Ty_p, jitter_mag, ε_det, ε_bary
     )
 
-    # ---------------------------------------------------------------------
-    # Phase 4 (GPU): finalize (prefix XOR parity + sqrt(dist²) + sign)
-    # ---------------------------------------------------------------------
+    # phase 4 (GPU): finalize (prefix XOR parity + sqrt(dist²) + sign)
     sdf = CUDA.zeros(Float32, n32, n32, n32)
     blk2 = (16, 16)
     grd2 = cld.(Int.((n32, n32)), blk2)
 
     @cuda threads = blk2 blocks = grd2 finalize_kernel!(
-        sdf, d2_grid, parity,
-        origin, step_val, n32,
-        dist_fallback
+        sdf, d2_grid, parity, origin, step_val, n32, dist_fallback
     )
-
     return sdf
 end
