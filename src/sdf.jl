@@ -3,27 +3,32 @@ GPU-Accelerated Signed Distance Field (SDF)
 ══════════════════════════════════════════
 
 This file computes a signed distance field on a uniform grid over the fixed
-domain [-1, 1]³. It is designed to be:
+domain [-1, 1]³.
+
+It is designed to be:
 
 • Robust: sign is computed via ray parity (odd/even).
-• Fast on GPU: distance uses a narrow-band seed + jump flooding (JFA) over
-  triangle indices; sign uses triangle rasterization + a per-column prefix XOR.
+• Fast on GPU: distance uses narrow-band seeds + jump flooding (JFA) over
+  triangle indices.
 
-Pipeline:
-  Phase 1  — Seed:   atomic_min of packed (dist², tri_idx) within a voxel band.
-  Phase 1b — Index:  unpack the winning triangle index per voxel.
-  Phase 2  — JFA:    propagate triangle indices (26-neighborhood) with exact
-                     point-to-triangle distance checks per candidate.
-  Phase 3  — Parity: rasterize triangle XY footprint; for each (x,y) cast a jittered +z ray,
-                     toggle parity at the hit sample index (half-open convention).
-  Phase 4  — Final:  prefix-XOR parity per (x,y) column; recompute exact distance
-                     to assigned triangle; apply sign.
+Pipeline (optimized version):
+  Phase 1  — Seed:   **tile-binned gather seeding** within a voxel band (no global atomics).
+  Phase 2  — JFA:    propagate nearest-triangle assignment (26-neighborhood), carrying
+                     both triangle index and **exact dist² for the current winner**.
+  Phase 3  — Parity: **tile-binned (x,y) column rasterization** for sign (no global atomics).
+  Phase 4  — Final:  prefix-XOR parity per (x,y) column; **sqrt(dist²)**; apply sign.
 
 Notes:
 • Parity sign is orientation-independent (unlike winding-number methods).
 • The JFA nearest-triangle assignment is an excellent approximation in practice
   but is not mathematically guaranteed exact for triangle distance; it is,
   however, far faster than brute force for large meshes.
+
+Implementation highlights (vs. the original atomic-splat version):
+• Seeding and parity both flip from triangle→voxel scatter (variable loops + atomics)
+  to tile/voxel→triangle gather using a CPU-built CSR binning structure.
+• Distances are stored as dist² and propagated through JFA so finalize does not
+  recompute point–triangle distance.
 """
 
 using CUDA
@@ -32,7 +37,6 @@ using GLMakie: Figure, LScene, mesh!
 using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
 
 # constants
-const SENTINEL_U64 = typemax(UInt64)
 const NO_TRIANGLE = Int32(0)   # 1-based triangle indices; 0 = unassigned
 
 function construct_mesh(
@@ -146,17 +150,6 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     return dot3(dx, dy, dz, dx, dy, dz)
 end
 
-# packing (dist², tri_idx) into UInt64 for atomic_min
-@inline function pack_dist2_idx(d2::Float32, idx::Int32)
-    # High 32 bits: dist² as UInt32 (positive floats preserve ordering)
-    # Low  32 bits: triangle index
-    return (UInt64(reinterpret(UInt32, d2)) << 32) | UInt64(UInt32(idx))
-end
-
-@inline function unpack_idx(p::UInt64)
-    return (p & 0xFFFF_FFFF) % Int32
-end
-
 # deterministic (x,y) jitter (cheap integer hash)
 @inline function u32_hash(x::UInt32)
     y = x
@@ -175,86 +168,331 @@ end
     return (jx, jy)
 end
 
-############################   Phase 1a — narrow-band seeding   ############################
+#################################   CPU tiling / binning   #################################
 
-function seed_kernel!(
-    packed::CuDeviceArray{UInt64,3},
+"""Build a 3D tile→triangles CSR for narrow-band seeding.
+
+Tiles are axis-aligned bricks of size (Tx,Ty,Tz) in voxel index space.
+A triangle contributes to every tile overlapped by its (voxel) AABB expanded by `band`.
+
+Returns:
+  offsets::Vector{Int32}  (length num_tiles+1, 1-based CSR offsets)
+  tris::Vector{Int32}     (flattened triangle indices)
+  active_tiles::Vector{Int32} (tile ids with nonzero triangle counts)
+  ntx, nty, ntz::Int32    (tile grid dimensions)
+"""
+function build_seed_tile_csr(
+    v0x::Vector{Float32}, v0y::Vector{Float32}, v0z::Vector{Float32},
+    e0x::Vector{Float32}, e0y::Vector{Float32}, e0z::Vector{Float32},
+    e1x::Vector{Float32}, e1y::Vector{Float32}, e1z::Vector{Float32},
+    origin::Float32, inv_step::Float32,
+    n::Int32, band::Int32,
+    Tx::Int32, Ty::Int32, Tz::Int32,
+)
+    ntx = Int32(cld(Int(n), Int(Tx)))
+    nty = Int32(cld(Int(n), Int(Ty)))
+    ntz = Int32(cld(Int(n), Int(Tz)))
+    num_tiles = Int(ntx) * Int(nty) * Int(ntz)
+
+    counts = zeros(Int32, num_tiles)
+    n_faces = length(v0x)
+
+    @inbounds for fi in 1:n_faces
+        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
+        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
+        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+
+        bx = ax + abx; by = ay + aby; bz = az + abz
+        cx = ax + acx; cy = ay + acy; cz = az + acz
+
+        i0 = max(unsafe_trunc(Int32, (min(ax, bx, cx) - origin) * inv_step) + Int32(1) - band, Int32(1))
+        i1 = min(unsafe_trunc(Int32, (max(ax, bx, cx) - origin) * inv_step) + Int32(1) + band, n)
+        j0 = max(unsafe_trunc(Int32, (min(ay, by, cy) - origin) * inv_step) + Int32(1) - band, Int32(1))
+        j1 = min(unsafe_trunc(Int32, (max(ay, by, cy) - origin) * inv_step) + Int32(1) + band, n)
+        k0 = max(unsafe_trunc(Int32, (min(az, bz, cz) - origin) * inv_step) + Int32(1) - band, Int32(1))
+        k1 = min(unsafe_trunc(Int32, (max(az, bz, cz) - origin) * inv_step) + Int32(1) + band, n)
+
+        # tile ranges (0-based)
+        tx0 = max((i0 - Int32(1)) ÷ Tx, Int32(0))
+        tx1 = min((i1 - Int32(1)) ÷ Tx, ntx - Int32(1))
+        ty0 = max((j0 - Int32(1)) ÷ Ty, Int32(0))
+        ty1 = min((j1 - Int32(1)) ÷ Ty, nty - Int32(1))
+        tz0 = max((k0 - Int32(1)) ÷ Tz, Int32(0))
+        tz1 = min((k1 - Int32(1)) ÷ Tz, ntz - Int32(1))
+
+        for tz in tz0:tz1
+            base_tz = tz * ntx * nty
+            for ty in ty0:ty1
+                base_ty = base_tz + ty * ntx
+                for tx in tx0:tx1
+                    tile = Int(base_ty + tx + Int32(1))
+                    counts[tile] += Int32(1)
+                end
+            end
+        end
+    end
+
+    # CSR offsets (1-based)
+    offsets = Vector{Int32}(undef, num_tiles + 1)
+    offsets[1] = Int32(1)
+    @inbounds for t in 1:num_tiles
+        offsets[t + 1] = offsets[t] + counts[t]
+    end
+    total_refs = Int(offsets[end] - Int32(1))
+    tris = Vector{Int32}(undef, total_refs)
+
+    write_ptr = copy(offsets[1:end-1])
+
+    @inbounds for fi in 1:n_faces
+        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
+        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
+        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+
+        bx = ax + abx; by = ay + aby; bz = az + abz
+        cx = ax + acx; cy = ay + acy; cz = az + acz
+
+        i0 = max(unsafe_trunc(Int32, (min(ax, bx, cx) - origin) * inv_step) + Int32(1) - band, Int32(1))
+        i1 = min(unsafe_trunc(Int32, (max(ax, bx, cx) - origin) * inv_step) + Int32(1) + band, n)
+        j0 = max(unsafe_trunc(Int32, (min(ay, by, cy) - origin) * inv_step) + Int32(1) - band, Int32(1))
+        j1 = min(unsafe_trunc(Int32, (max(ay, by, cy) - origin) * inv_step) + Int32(1) + band, n)
+        k0 = max(unsafe_trunc(Int32, (min(az, bz, cz) - origin) * inv_step) + Int32(1) - band, Int32(1))
+        k1 = min(unsafe_trunc(Int32, (max(az, bz, cz) - origin) * inv_step) + Int32(1) + band, n)
+
+        tx0 = max((i0 - Int32(1)) ÷ Tx, Int32(0))
+        tx1 = min((i1 - Int32(1)) ÷ Tx, ntx - Int32(1))
+        ty0 = max((j0 - Int32(1)) ÷ Ty, Int32(0))
+        ty1 = min((j1 - Int32(1)) ÷ Ty, nty - Int32(1))
+        tz0 = max((k0 - Int32(1)) ÷ Tz, Int32(0))
+        tz1 = min((k1 - Int32(1)) ÷ Tz, ntz - Int32(1))
+
+        fi32 = Int32(fi)
+        for tz in tz0:tz1
+            base_tz = tz * ntx * nty
+            for ty in ty0:ty1
+                base_ty = base_tz + ty * ntx
+                for tx in tx0:tx1
+                    tile = Int(base_ty + tx + Int32(1))
+                    pos = write_ptr[tile]
+                    tris[Int(pos)] = fi32
+                    write_ptr[tile] = pos + Int32(1)
+                end
+            end
+        end
+    end
+
+    # list active tiles (for smaller GPU launch)
+    active_tiles = Vector{Int32}()
+    sizehint!(active_tiles, num_tiles)
+    @inbounds for t in 1:num_tiles
+        (counts[t] == Int32(0)) && continue
+        push!(active_tiles, Int32(t))
+    end
+
+    return (offsets, tris, active_tiles, ntx, nty, ntz)
+end
+
+"""Build a 2D tile→triangles CSR for parity rasterization (vertical +z rays).
+
+Tiles are (Tx,Ty) bricks in the XY plane in voxel index space.
+Triangles are binned by their XY AABB (expanded by `jitter_mag`).
+Triangles whose XY projection is nearly degenerate (|det| <= ε_det) are skipped.
+
+Returns:
+  offsets::Vector{Int32}  (length num_tiles+1, 1-based CSR offsets)
+  tris::Vector{Int32}     (flattened triangle indices)
+  active_tiles::Vector{Int32} (tile ids with nonzero triangle counts)
+  ntx, nty::Int32         (tile grid dimensions)
+"""
+function build_parity_tile_csr(
+    v0x::Vector{Float32}, v0y::Vector{Float32}, v0z::Vector{Float32},
+    e0x::Vector{Float32}, e0y::Vector{Float32}, e0z::Vector{Float32},
+    e1x::Vector{Float32}, e1y::Vector{Float32}, e1z::Vector{Float32},
+    origin::Float32, step_val::Float32, inv_step::Float32,
+    n::Int32,
+    Tx::Int32, Ty::Int32,
+    jitter_mag::Float32,
+    ε_det::Float32,
+)
+    ntx = Int32(cld(Int(n), Int(Tx)))
+    nty = Int32(cld(Int(n), Int(Ty)))
+    num_tiles = Int(ntx) * Int(nty)
+
+    counts = zeros(Int32, num_tiles)
+    n_faces = length(v0x)
+
+    domain_max = origin + step_val * Float32(n - Int32(1))
+
+    @inbounds for fi in 1:n_faces
+        ax = v0x[fi]; ay = v0y[fi]
+        abx = e0x[fi]; aby = e0y[fi]
+        acx = e1x[fi]; acy = e1y[fi]
+
+        det = muladd(aby, acx, -abx * acy)
+        (abs(det) <= ε_det) && continue
+
+        bx = ax + abx; by = ay + aby
+        cx = ax + acx; cy = ay + acy
+
+        x_min = max(min(ax, bx, cx) - jitter_mag, origin)
+        x_max = min(max(ax, bx, cx) + jitter_mag, domain_max)
+        y_min = max(min(ay, by, cy) - jitter_mag, origin)
+        y_max = min(max(ay, by, cy) + jitter_mag, domain_max)
+
+        # match the kernel's convention
+        ix0 = max(unsafe_trunc(Int32, (x_min - origin) * inv_step) + Int32(1), Int32(1))
+        ix1 = min(unsafe_trunc(Int32, (x_max - origin) * inv_step) + Int32(2), n)
+        iy0 = max(unsafe_trunc(Int32, (y_min - origin) * inv_step) + Int32(1), Int32(1))
+        iy1 = min(unsafe_trunc(Int32, (y_max - origin) * inv_step) + Int32(2), n)
+
+        tx0 = max((ix0 - Int32(1)) ÷ Tx, Int32(0))
+        tx1 = min((ix1 - Int32(1)) ÷ Tx, ntx - Int32(1))
+        ty0 = max((iy0 - Int32(1)) ÷ Ty, Int32(0))
+        ty1 = min((iy1 - Int32(1)) ÷ Ty, nty - Int32(1))
+
+        for ty in ty0:ty1
+            base_ty = ty * ntx
+            for tx in tx0:tx1
+                tile = Int(base_ty + tx + Int32(1))
+                counts[tile] += Int32(1)
+            end
+        end
+    end
+
+    offsets = Vector{Int32}(undef, num_tiles + 1)
+    offsets[1] = Int32(1)
+    @inbounds for t in 1:num_tiles
+        offsets[t + 1] = offsets[t] + counts[t]
+    end
+    total_refs = Int(offsets[end] - Int32(1))
+    tris = Vector{Int32}(undef, total_refs)
+
+    write_ptr = copy(offsets[1:end-1])
+
+    @inbounds for fi in 1:n_faces
+        ax = v0x[fi]; ay = v0y[fi]
+        abx = e0x[fi]; aby = e0y[fi]
+        acx = e1x[fi]; acy = e1y[fi]
+
+        det = muladd(aby, acx, -abx * acy)
+        (abs(det) <= ε_det) && continue
+
+        bx = ax + abx; by = ay + aby
+        cx = ax + acx; cy = ay + acy
+
+        x_min = max(min(ax, bx, cx) - jitter_mag, origin)
+        x_max = min(max(ax, bx, cx) + jitter_mag, domain_max)
+        y_min = max(min(ay, by, cy) - jitter_mag, origin)
+        y_max = min(max(ay, by, cy) + jitter_mag, domain_max)
+
+        ix0 = max(unsafe_trunc(Int32, (x_min - origin) * inv_step) + Int32(1), Int32(1))
+        ix1 = min(unsafe_trunc(Int32, (x_max - origin) * inv_step) + Int32(2), n)
+        iy0 = max(unsafe_trunc(Int32, (y_min - origin) * inv_step) + Int32(1), Int32(1))
+        iy1 = min(unsafe_trunc(Int32, (y_max - origin) * inv_step) + Int32(2), n)
+
+        tx0 = max((ix0 - Int32(1)) ÷ Tx, Int32(0))
+        tx1 = min((ix1 - Int32(1)) ÷ Tx, ntx - Int32(1))
+        ty0 = max((iy0 - Int32(1)) ÷ Ty, Int32(0))
+        ty1 = min((iy1 - Int32(1)) ÷ Ty, nty - Int32(1))
+
+        fi32 = Int32(fi)
+        for ty in ty0:ty1
+            base_ty = ty * ntx
+            for tx in tx0:tx1
+                tile = Int(base_ty + tx + Int32(1))
+                pos = write_ptr[tile]
+                tris[Int(pos)] = fi32
+                write_ptr[tile] = pos + Int32(1)
+            end
+        end
+    end
+
+    active_tiles = Vector{Int32}()
+    sizehint!(active_tiles, num_tiles)
+    @inbounds for t in 1:num_tiles
+        (counts[t] == Int32(0)) && continue
+        push!(active_tiles, Int32(t))
+    end
+
+    return (offsets, tris, active_tiles, ntx, nty)
+end
+
+#################################   Phase 1 — tiled seeding   #################################
+
+"""Tile-binned narrow-band seed kernel.
+
+Each block processes one active 3D tile. Threads correspond to voxels in the tile.
+Each voxel gathers candidate triangles from the tile's CSR list, computes exact
+point–triangle dist², and writes the best (idx, dist²).
+
+No atomics; each voxel is owned by exactly one thread.
+"""
+function seed_tiled_kernel!(
+    idx::CuDeviceArray{Int32,3},
+    d2::CuDeviceArray{Float32,3},
+    active_tiles::CuDeviceVector{Int32},
+    tile_offsets::CuDeviceVector{Int32},
+    tile_tris::CuDeviceVector{Int32},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
-    origin::Float32, step_val::Float32, inv_step::Float32,
-    n::Int32, band::Int32, n_faces::Int32,
+    origin::Float32, step_val::Float32,
+    n::Int32,
+    ntx::Int32, nty::Int32,
+    Tx::Int32, Ty::Int32, Tz::Int32,
 )
-    fi = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    (fi > n_faces) && return nothing
+    # map block -> global tile id (1-based)
+    tile_id = @inbounds active_tiles[blockIdx().x]
 
-    @inbounds begin
-        ax = v0x[fi]
-        ay = v0y[fi]
-        az = v0z[fi]
-        abx = e0x[fi]
-        aby = e0y[fi]
-        abz = e0z[fi]
-        acx = e1x[fi]
-        acy = e1y[fi]
-        acz = e1z[fi]
-    end
+    # 0-based tile coordinates
+    t0 = tile_id - Int32(1)
+    tx = t0 % ntx
+    t1 = t0 ÷ ntx
+    ty = t1 % nty
+    tz = t1 ÷ nty
 
-    bx = ax + abx
-    by = ay + aby
-    bz = az + abz
-    cx = ax + acx
-    cy = ay + acy
-    cz = az + acz
+    ix = tx * Tx + threadIdx().x
+    iy = ty * Ty + threadIdx().y
+    iz = tz * Tz + threadIdx().z
 
-    i0 = max(unsafe_trunc(Int32, (min(ax, bx, cx) - origin) * inv_step) + Int32(1) - band, Int32(1))
-    i1 = min(unsafe_trunc(Int32, (max(ax, bx, cx) - origin) * inv_step) + Int32(1) + band, n)
-    j0 = max(unsafe_trunc(Int32, (min(ay, by, cy) - origin) * inv_step) + Int32(1) - band, Int32(1))
-    j1 = min(unsafe_trunc(Int32, (max(ay, by, cy) - origin) * inv_step) + Int32(1) + band, n)
-    k0 = max(unsafe_trunc(Int32, (min(az, bz, cz) - origin) * inv_step) + Int32(1) - band, Int32(1))
-    k1 = min(unsafe_trunc(Int32, (max(az, bz, cz) - origin) * inv_step) + Int32(1) + band, n)
-
-    i = i0
-    while i <= i1
-        px = muladd(Float32(i - Int32(1)), step_val, origin)
-        j = j0
-        while j <= j1
-            py = muladd(Float32(j - Int32(1)), step_val, origin)
-            k = k0
-            while k <= k1
-                pz = muladd(Float32(k - Int32(1)), step_val, origin)
-                d2 = dist²_point_triangle(px, py, pz, ax, ay, az,
-                    abx, aby, abz, acx, acy, acz)
-                lin = i + (j - Int32(1)) * n + (k - Int32(1)) * n * n
-                CUDA.atomic_min!(pointer(packed, lin), pack_dist2_idx(d2, fi))
-                k += Int32(1)
-            end
-            j += Int32(1)
-        end
-        i += Int32(1)
-    end
-    return nothing
-end
-
-##############################   Phase 1b — extract indices   ##############################
-
-function extract_indices_kernel!(
-    idx::CuDeviceArray{Int32,3}, packed::CuDeviceArray{UInt64,3}, n::Int32
-)
-    ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    iz = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
     ((ix > n) | (iy > n) | (iz > n)) && return nothing
 
-    @inbounds p = packed[ix, iy, iz]
-    @inbounds idx[ix, iy, iz] = p == SENTINEL_U64 ? NO_TRIANGLE : unpack_idx(p)
+    px = muladd(Float32(ix - Int32(1)), step_val, origin)
+    py = muladd(Float32(iy - Int32(1)), step_val, origin)
+    pz = muladd(Float32(iz - Int32(1)), step_val, origin)
+
+    best_d2 = Inf32
+    best_idx = NO_TRIANGLE
+
+    start = @inbounds tile_offsets[tile_id]
+    stop = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
+
+    @inbounds for ptr in start:stop
+        fi = tile_tris[ptr]
+
+        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
+        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
+        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
+
+        dd = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
+        if dd < best_d2
+            best_d2 = dd
+            best_idx = fi
+        end
+    end
+
+    @inbounds begin
+        idx[ix, iy, iz] = best_idx
+        d2[ix, iy, iz] = best_d2
+    end
+
     return nothing
 end
 
-###################   Phase 2 — JFA pass (propagate triangle indices)   ###################
+###################   Phase 2 — JFA pass (propagate triangle indices + dist²)   ###################
 
 function jfa_pass_kernel!(
-    grid_out::CuDeviceArray{Int32,3}, grid_in::CuDeviceArray{Int32,3},
+    idx_out::CuDeviceArray{Int32,3}, d2_out::CuDeviceArray{Float32,3},
+    idx_in::CuDeviceArray{Int32,3},  d2_in::CuDeviceArray{Float32,3},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
@@ -269,21 +507,8 @@ function jfa_pass_kernel!(
     py = muladd(Float32(iy - Int32(1)), step_val, origin)
     pz = muladd(Float32(iz - Int32(1)), step_val, origin)
 
-    @inbounds best_idx = grid_in[ix, iy, iz]
-    best_d2 = Inf32
-
-    @inbounds if best_idx != NO_TRIANGLE
-        ax = v0x[best_idx]
-        ay = v0y[best_idx]
-        az = v0z[best_idx]
-        abx = e0x[best_idx]
-        aby = e0y[best_idx]
-        abz = e0z[best_idx]
-        acx = e1x[best_idx]
-        acy = e1y[best_idx]
-        acz = e1z[best_idx]
-        best_d2 = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
-    end
+    @inbounds best_idx = idx_in[ix, iy, iz]
+    @inbounds best_d2  = d2_in[ix, iy, iz]
 
     @inbounds for dz in Int32(-1):Int32(1)
         nz = iz + dz * jump
@@ -296,134 +521,124 @@ function jfa_pass_kernel!(
                 ((nx < Int32(1)) | (nx > n)) && continue
                 ((dx == Int32(0)) & (dy == Int32(0)) & (dz == Int32(0))) && continue
 
-                nb = grid_in[nx, ny, nz]
+                nb = idx_in[nx, ny, nz]
                 ((nb == NO_TRIANGLE) | (nb == best_idx)) && continue
 
-                ax = v0x[nb]
-                ay = v0y[nb]
-                az = v0z[nb]
-                abx = e0x[nb]
-                aby = e0y[nb]
-                abz = e0z[nb]
-                acx = e1x[nb]
-                acy = e1y[nb]
-                acz = e1z[nb]
+                ax = v0x[nb]; ay = v0y[nb]; az = v0z[nb]
+                abx = e0x[nb]; aby = e0y[nb]; abz = e0z[nb]
+                acx = e1x[nb]; acy = e1y[nb]; acz = e1z[nb]
 
-                d2 = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
-                if d2 < best_d2
-                    best_d2 = d2
+                dd = dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz)
+                if dd < best_d2
+                    best_d2 = dd
                     best_idx = nb
                 end
             end
         end
     end
 
-    @inbounds grid_out[ix, iy, iz] = best_idx
+    @inbounds begin
+        idx_out[ix, iy, iz] = best_idx
+        d2_out[ix, iy, iz]  = best_d2
+    end
     return nothing
 end
 
-############   Phase 3 — parity rasterization (orientation-independent sign)   ############
+############   Phase 3 — parity rasterization (tile-binned, no atomics)   ############
 
-function parity_kernel!(
-    parity::CuDeviceArray{UInt32,3},
+"""Tile-binned parity rasterization.
+
+Each block processes one active XY tile; each thread owns one (ix,iy) column.
+Threads iterate triangles binned to the tile and toggle parity at the hit sample
+index along +z.
+
+Because each (ix,iy) column is owned by exactly one thread, toggles can be plain
+XOR stores (no global atomics).
+"""
+function parity_tiled_kernel!(
+    parity::CuDeviceArray{UInt8,3},
+    active_tiles::CuDeviceVector{Int32},
+    tile_offsets::CuDeviceVector{Int32},
+    tile_tris::CuDeviceVector{Int32},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
     origin::Float32, step_val::Float32, inv_step::Float32,
-    n::Int32, n_faces::Int32,
-    jitter_mag::Float32, ε_det::Float32, ε_bary::Float32
+    n::Int32,
+    ntx::Int32,
+    Tx::Int32, Ty::Int32,
+    jitter_mag::Float32,
+    ε_det::Float32,
+    ε_bary::Float32,
 )
-    fi = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    (fi > n_faces) && return nothing
+    tile_id = @inbounds active_tiles[blockIdx().x]
 
-    @inbounds begin
-        ax = v0x[fi]
-        ay = v0y[fi]
-        az = v0z[fi]
-        abx = e0x[fi]
-        aby = e0y[fi]
-        abz = e0z[fi]
-        acx = e1x[fi]
-        acy = e1y[fi]
-        acz = e1z[fi]
-    end
+    # 0-based tile coords
+    t0 = tile_id - Int32(1)
+    tx = t0 % ntx
+    ty = t0 ÷ ntx
 
-    # Solve barycentric using XY only for vertical rays. We use:
-    # det = aby*acx - abx*acy  (=-cross_z)
-    det = muladd(aby, acx, -abx * acy)
-    (abs(det) <= ε_det) && return nothing
-    inv_det = inv(det)
+    ix = tx * Tx + threadIdx().x
+    iy = ty * Ty + threadIdx().y
+    ((ix > n) | (iy > n)) && return nothing
 
-    # XY bounding box (pad by one voxel + jitter)
-    bx = ax + abx
-    by = ay + aby
-    cx = ax + acx
-    cy = ay + acy
-
-    # Clamp to domain to keep trunc() behaving like floor (non-negative)
-    x_min = max(min(ax, bx, cx) - jitter_mag, origin)
-    x_max = min(max(ax, bx, cx) + jitter_mag, origin + step_val * Float32(n - Int32(1)))
-    y_min = max(min(ay, by, cy) - jitter_mag, origin)
-    y_max = min(max(ay, by, cy) + jitter_mag, origin + step_val * Float32(n - Int32(1)))
-
-    ix0 = max(unsafe_trunc(Int32, (x_min - origin) * inv_step) + Int32(1), Int32(1))
-    ix1 = min(unsafe_trunc(Int32, (x_max - origin) * inv_step) + Int32(2), n)
-    iy0 = max(unsafe_trunc(Int32, (y_min - origin) * inv_step) + Int32(1), Int32(1))
-    iy1 = min(unsafe_trunc(Int32, (y_max - origin) * inv_step) + Int32(2), n)
+    # jittered ray origin (x,y)
+    jx, jy = column_jitter(ix, iy, jitter_mag)
+    rx = muladd(Float32(ix - Int32(1)), step_val, origin) + jx
+    ry = muladd(Float32(iy - Int32(1)), step_val, origin) + jy
 
     z_end = origin + step_val * Float32(n - Int32(1))
 
-    ix = ix0
-    while ix <= ix1
-        iy = iy0
-        while iy <= iy1
-            jx, jy = column_jitter(ix, iy, jitter_mag)
-            rx = muladd(Float32(ix - Int32(1)), step_val, origin) + jx
-            ry = muladd(Float32(iy - Int32(1)), step_val, origin) + jy
+    start = @inbounds tile_offsets[tile_id]
+    stop  = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
 
-            sx = rx - ax
-            sy = ry - ay
-            u = (muladd(sy, acx, -sx * acy)) * inv_det
-            v = (muladd(sx, aby, -sy * abx)) * inv_det
+    @inbounds for ptr in start:stop
+        fi = tile_tris[ptr]
 
-            # Half-open rule: exclude edges/vertices to avoid double-counting.
-            if (u <= ε_bary) | (v <= ε_bary) | ((u + v) >= (1f0 - ε_bary))
-                iy += Int32(1)
-                continue
-            end
+        ax = v0x[fi]; ay = v0y[fi]; az = v0z[fi]
+        abx = e0x[fi]; aby = e0y[fi]; abz = e0z[fi]
+        acx = e1x[fi]; acy = e1y[fi]; acz = e1z[fi]
 
-            z_hit = az + u * abz + v * acz
+        # det = aby*acx - abx*acy
+        det = muladd(aby, acx, -abx * acy)
+        (abs(det) <= ε_det) && continue
+        inv_det = inv(det)
 
-            # Half-open in z: only hits strictly inside (origin, z_end)
-            if (z_hit <= origin) | (z_hit >= z_end)
-                iy += Int32(1)
-                continue
-            end
+        sx = rx - ax
+        sy = ry - ay
+        u = (muladd(sy, acx, -sx * acy)) * inv_det
+        v = (muladd(sx, aby, -sy * abx)) * inv_det
 
-            # Toggle at the first grid sample strictly above z_hit.
-            t = (z_hit - origin) * inv_step  # in (0, n-1)
-            z_idx = unsafe_trunc(Int32, t) + Int32(2)
-
-            if z_idx <= n
-                lin = ix + (iy - Int32(1)) * n + (z_idx - Int32(1)) * n * n
-                CUDA.atomic_xor!(pointer(parity, lin), UInt32(1))
-            end
-            iy += Int32(1)
+        # Half-open rule: exclude edges/vertices to avoid double-counting.
+        if (u <= ε_bary) | (v <= ε_bary) | ((u + v) >= (1f0 - ε_bary))
+            continue
         end
-        ix += Int32(1)
+
+        z_hit = az + u * abz + v * acz
+
+        # Half-open in z: only hits strictly inside (origin, z_end)
+        if (z_hit <= origin) | (z_hit >= z_end)
+            continue
+        end
+
+        # Toggle at the first grid sample strictly above z_hit.
+        t = (z_hit - origin) * inv_step  # in (0, n-1)
+        z_idx = unsafe_trunc(Int32, t) + Int32(2)
+
+        if z_idx <= n
+            @inbounds parity[ix, iy, z_idx] = parity[ix, iy, z_idx] ⊻ UInt8(1)
+        end
     end
+
     return nothing
 end
 
-###############   Phase 4 — finalize (prefix XOR parity + exact distance)   ###############
+###############   Phase 4 — finalize (prefix XOR parity + sqrt(dist²))   ###############
 
 function finalize_kernel!(
     sdf::CuDeviceArray{Float32,3},
-    idx_grid::CuDeviceArray{Int32,3},
-    parity::CuDeviceArray{UInt32,3},
-    v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
-    e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
-    e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
+    d2_grid::CuDeviceArray{Float32,3},
+    parity::CuDeviceArray{UInt8,3},
     origin::Float32, step_val::Float32, n::Int32,
     dist_fallback::Float32,
 )
@@ -431,39 +646,20 @@ function finalize_kernel!(
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     ((ix > n) | (iy > n)) && return nothing
 
-    px = muladd(Float32(ix - Int32(1)), step_val, origin)
-    py = muladd(Float32(iy - Int32(1)), step_val, origin)
-
-    parity_acc = UInt32(0)
+    parity_acc = UInt8(0)
     iz = Int32(1)
     while iz <= n
-        pz = muladd(Float32(iz - Int32(1)), step_val, origin)
-
         @inbounds parity_acc ⊻= parity[ix, iy, iz]
-        is_inside = (parity_acc & UInt32(1)) == UInt32(1)
+        is_inside = (parity_acc & UInt8(1)) == UInt8(1)
 
-        @inbounds tri = idx_grid[ix, iy, iz]
-        if tri != NO_TRIANGLE
-            @inbounds begin
-                ax = v0x[tri]
-                ay = v0y[tri]
-                az = v0z[tri]
-                abx = e0x[tri]
-                aby = e0y[tri]
-                abz = e0z[tri]
-                acx = e1x[tri]
-                acy = e1y[tri]
-                acz = e1z[tri]
-            end
-            d = sqrt(dist²_point_triangle(px, py, pz, ax, ay, az, abx, aby, abz, acx, acy, acz))
-            @inbounds sdf[ix, iy, iz] = is_inside ? -d : d
-        else
-            # Should not happen for reasonable band; keep sign consistent anyway.
-            @inbounds sdf[ix, iy, iz] = is_inside ? -dist_fallback : dist_fallback
-        end
+        @inbounds dd = d2_grid[ix, iy, iz]
+        d = (dd < Inf32) ? sqrt(dd) : dist_fallback
+
+        @inbounds sdf[ix, iy, iz] = is_inside ? -d : d
 
         iz += Int32(1)
     end
+
     return nothing
 end
 
@@ -560,10 +756,45 @@ function construct_sdf(
     step_val = 2f0 / Float32(n - 1)
     inv_step = inv(step_val)
 
-    # geometry → SoA → GPU
+    # geometry → SoA (CPU)
     geom = preprocess_geometry(vertices, fcs)
     num_faces = geom.n_faces
 
+    # ---------------------------------------------------------------------
+    # Phase 1 (CPU): build tile bins
+    # ---------------------------------------------------------------------
+    # Seeding tiles (3D)
+    seed_blk = (8, 8, 4)
+    Tx_s = Int32(seed_blk[1]); Ty_s = Int32(seed_blk[2]); Tz_s = Int32(seed_blk[3])
+
+    seed_offsets, seed_tris, seed_active, seed_ntx, seed_nty, seed_ntz = build_seed_tile_csr(
+        geom.v0x, geom.v0y, geom.v0z,
+        geom.e0x, geom.e0y, geom.e0z,
+        geom.e1x, geom.e1y, geom.e1z,
+        origin, inv_step,
+        n32, Int32(band),
+        Tx_s, Ty_s, Tz_s,
+    )
+
+    # Parity tiles (2D)
+    parity_blk = (16, 16)
+    Tx_p = Int32(parity_blk[1]); Ty_p = Int32(parity_blk[2])
+    jitter_mag = jitter_scale * step_val
+
+    parity_offsets, parity_tris, parity_active, parity_ntx, parity_nty = build_parity_tile_csr(
+        geom.v0x, geom.v0y, geom.v0z,
+        geom.e0x, geom.e0y, geom.e0z,
+        geom.e1x, geom.e1y, geom.e1z,
+        origin, step_val, inv_step,
+        n32,
+        Tx_p, Ty_p,
+        jitter_mag,
+        ε_det,
+    )
+
+    # ---------------------------------------------------------------------
+    # Upload geometry + bins to GPU
+    # ---------------------------------------------------------------------
     d_v0x = CuArray(geom.v0x)
     d_v0y = CuArray(geom.v0y)
     d_v0z = CuArray(geom.v0z)
@@ -575,58 +806,96 @@ function construct_sdf(
     d_e1z = CuArray(geom.e1z)
     soa = (d_v0x, d_v0y, d_v0z, d_e0x, d_e0y, d_e0z, d_e1x, d_e1y, d_e1z)
 
-    # launch configs
-    tri_threads = 256
-    tri_blocks = cld(Int(num_faces), tri_threads)
-    blk3 = (8, 8, 4)
+    d_seed_offsets = CuArray(seed_offsets)
+    d_seed_tris    = CuArray(seed_tris)
+    d_seed_active  = CuArray(seed_active)
+
+    d_parity_offsets = CuArray(parity_offsets)
+    d_parity_tris    = CuArray(parity_tris)
+    d_parity_active  = CuArray(parity_active)
+
+    # ---------------------------------------------------------------------
+    # Phase 1 (GPU): tiled seeding
+    # ---------------------------------------------------------------------
+    idx_a = CUDA.zeros(Int32, n32, n32, n32)
+    d2_a  = CUDA.fill(Inf32,  n32, n32, n32)
+
+    # blocks = number of active tiles (1D)
+    @cuda threads = seed_blk blocks = length(seed_active) seed_tiled_kernel!(
+        idx_a, d2_a,
+        d_seed_active, d_seed_offsets, d_seed_tris,
+        soa..., origin, step_val,
+        n32,
+        seed_ntx, seed_nty,
+        Tx_s, Ty_s, Tz_s,
+    )
+
+    # ---------------------------------------------------------------------
+    # Phase 2 (GPU): JFA (propagate idx + dist²)
+    # ---------------------------------------------------------------------
+    idx_b = CUDA.zeros(Int32, n32, n32, n32)
+    d2_b  = CUDA.fill(Inf32,  n32, n32, n32)
+
+    blk3 = seed_blk
     grd3 = cld.(Int.((n32, n32, n32)), blk3)
 
-    # phase 1: seed
-    packed = CUDA.fill(SENTINEL_U64, n32, n32, n32)
-    @cuda threads = tri_threads blocks = tri_blocks seed_kernel!(
-        packed, soa..., origin, step_val, inv_step, n32, Int32(band), num_faces
-    )
-    # phase 1b: extract indices
-    grid_a = CUDA.zeros(Int32, n32, n32, n32)
-    @cuda threads = blk3 blocks = grd3 extract_indices_kernel!(grid_a, packed, n32)
-
-    # phase 2: JFA
-    grid_b = CUDA.zeros(Int32, n32, n32, n32)
-    curr_in, curr_out = grid_a, grid_b
+    curr_idx_in, curr_d2_in = idx_a, d2_a
+    curr_idx_out, curr_d2_out = idx_b, d2_b
 
     jump = Int32(n ÷ 2)
     while jump >= Int32(1)
         @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
-            curr_out, curr_in, soa..., origin, step_val, n32, jump
+            curr_idx_out, curr_d2_out,
+            curr_idx_in,  curr_d2_in,
+            soa..., origin, step_val, n32, jump
         )
-        (curr_in, curr_out) = (curr_out, curr_in)
+        (curr_idx_in, curr_idx_out) = (curr_idx_out, curr_idx_in)
+        (curr_d2_in,  curr_d2_out)  = (curr_d2_out,  curr_d2_in)
         jump >>= Int32(1)
     end
 
     for _ in 1:jfa_corrections
         @cuda threads = blk3 blocks = grd3 jfa_pass_kernel!(
-            curr_out, curr_in, soa..., origin, step_val, n32, Int32(1)
+            curr_idx_out, curr_d2_out,
+            curr_idx_in,  curr_d2_in,
+            soa..., origin, step_val, n32, Int32(1)
         )
-        (curr_in, curr_out) = (curr_out, curr_in)
+        (curr_idx_in, curr_idx_out) = (curr_idx_out, curr_idx_in)
+        (curr_d2_in,  curr_d2_out)  = (curr_d2_out,  curr_d2_in)
     end
 
-    idx_grid = curr_in
-    # (curr_out is a scratch buffer we can drop)
+    idx_grid = curr_idx_in
+    d2_grid  = curr_d2_in
 
-    # phase 3: parity rasterization
-    parity = CUDA.zeros(UInt32, n32, n32, n32)
-    jitter_mag = jitter_scale * step_val
+    # ---------------------------------------------------------------------
+    # Phase 3 (GPU): parity rasterization (tile-binned, no atomics)
+    # ---------------------------------------------------------------------
+    parity = CUDA.zeros(UInt8, n32, n32, n32)
 
-    @cuda threads = tri_threads blocks = tri_blocks parity_kernel!(
-        parity, soa..., origin, step_val, inv_step, n32, num_faces, jitter_mag, ε_det, ε_bary
+    @cuda threads = parity_blk blocks = length(parity_active) parity_tiled_kernel!(
+        parity,
+        d_parity_active, d_parity_offsets, d_parity_tris,
+        soa..., origin, step_val, inv_step,
+        n32,
+        parity_ntx,
+        Tx_p, Ty_p,
+        jitter_mag,
+        ε_det,
+        ε_bary,
     )
-    # phase 4: finalize
+
+    # ---------------------------------------------------------------------
+    # Phase 4 (GPU): finalize (prefix XOR parity + sqrt(dist²) + sign)
+    # ---------------------------------------------------------------------
     sdf = CUDA.zeros(Float32, n32, n32, n32)
     blk2 = (16, 16)
     grd2 = cld.(Int.((n32, n32)), blk2)
 
     @cuda threads = blk2 blocks = grd2 finalize_kernel!(
-        sdf, idx_grid, parity, soa..., origin, step_val, n32, dist_fallback
+        sdf, d2_grid, parity,
+        origin, step_val, n32,
+        dist_fallback
     )
+
     return sdf
 end
