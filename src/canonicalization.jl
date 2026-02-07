@@ -422,7 +422,7 @@ end
 function align_and_rescale(vertices::Vector{Point3f})
     isempty(vertices) && return vertices
     # step 1: compute covariance matrix for PCA
-    vertices_mat = reinterpret(reshape, Float32, vertices)
+    vertices_mat = reinterpret(reshape, Float32, vertices) # Vector{Point3f} -> 3×N Matrix
     weight = 1.0f0 / length(vertices)
     # cov_mat = weight * (vertices_mat * vertices_mat')
     cov_mat = Symmetric(BLAS.syrk('U', 'N', weight, vertices_mat), :U)
@@ -443,7 +443,7 @@ function align_and_rescale(vertices::Vector{Point3f})
 
     # step 3: invert rotation via transpose to align principal axes
     vertices_mat_rotated = rotation' * vertices_mat
-    vertices_rotated = reinterpret(reshape, Point3f, vertices_mat_rotated)
+    vertices_rotated = reinterpret(reshape, Point3f, vertices_mat_rotated) # 3×N Matrix -> Vector{Point3f}
     # step 4: scale to unit sphere
     distances² = sum(abs2, vertices_mat_rotated; dims=1)
     radius_max = √(maximum(distances²))
