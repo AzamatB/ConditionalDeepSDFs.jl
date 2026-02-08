@@ -195,13 +195,13 @@ function build_seed_tile_csr(
     num_tiles = Int(ntx) * Int(nty) * Int(ntz)
 
     counts = zeros(Int32, num_tiles)
-    n_faces = length(v0x)
+    num_faces = length(v0x)
     # Cache per-face tile ranges so we don't repeat heavy AABB/range math in the fill pass.
     # (one contiguous stream is typically friendlier to caches/prefetch than 6 separate arrays)
-    ranges = Vector{NTuple{6,Int32}}(undef, n_faces)  # (tx0,tx1,ty0,ty1,tz0,tz1)
+    ranges = Vector{NTuple{6,Int32}}(undef, num_faces)  # (tx0,tx1,ty0,ty1,tz0,tz1)
     txy = ntx * nty
 
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in 1:num_faces
         ax = v0x[fi]
         ay = v0y[fi]
         az = v0z[fi]
@@ -259,7 +259,7 @@ function build_seed_tile_csr(
 
     write_ptr = copy(offsets[1:end-1])
 
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in 1:num_faces
         tx0, tx1, ty0, ty1, tz0, tz1 = ranges[fi]
 
         fi32 = Int32(fi)
@@ -316,14 +316,14 @@ function build_parity_tile_csr(
 
     counts = zeros(Int32, num_tiles)
     domain_max = origin + step_val * Float32(n - Int32(1))
-
+    num_faces = length(v0x)
     # Cache per-face tile ranges so we don't redo projection/AABB math in the fill pass.
     # Degenerate XY projections are stored as an empty range (so both passes naturally skip them).
-    ranges = Vector{NTuple{4,Int32}}(undef, n_faces)  # (tx0,tx1,ty0,ty1)
+    ranges = Vector{NTuple{4,Int32}}(undef, num_faces)  # (tx0,tx1,ty0,ty1)
 
     empty_range = (Int32(1), Int32(0), Int32(1), Int32(0))
 
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in 1:num_faces
         ax = v0x[fi]
         ay = v0y[fi]
         abx = e0x[fi]
@@ -379,7 +379,7 @@ function build_parity_tile_csr(
 
     write_ptr = copy(offsets[1:end-1])
 
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in 1:num_faces
         tx0, tx1, ty0, ty1 = ranges[fi]
 
         fi32 = Int32(fi)
@@ -708,13 +708,13 @@ function preprocess_geometry(
         push!(e1z, Float32(ac[3]))
     end
 
-    n_faces = Int32(length(v0x))
-    (n_faces > 0) || error("All faces degenerate after filtering")
+    num_faces = Int32(length(v0x))
+    (num_faces > 0) || error("All faces degenerate after filtering")
     return (;
         v0x, v0y, v0z,
         e0x, e0y, e0z,
         e1x, e1y, e1z,
-        n_faces
+        num_faces
     )
 end
 
