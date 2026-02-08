@@ -4,7 +4,7 @@ using MeshIO
 include("canonicalization.jl")
 include("sdf.jl")
 
-mesh_path = "data/stl_files/28.stl"
+mesh_path = "data/stl_files/32.stl"
 mesh = load(mesh_path)
 
 @time mesh = canonicalize(mesh)

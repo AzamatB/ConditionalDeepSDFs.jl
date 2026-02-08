@@ -168,6 +168,37 @@ end
     return (jx, jy)
 end
 
+# Rasterization top-left ownership rule for a directed 2D edge.
+@inline function is_top_left(dx::Float32, dy::Float32)::Bool
+    return (dy > 0.0f0) | ((dy == 0.0f0) & (dx < 0.0f0))
+end
+
+"""Pack asymmetric parity edge-ownership bits for barycentric boundaries.
+
+Bits:
+  0x01 => owns `u = 0` edge (AC)
+  0x02 => owns `v = 0` edge (AB)
+  0x04 => owns `w = 0` edge (BC), where `w = 1 - u - v`
+"""
+@inline function pack_parity_edge_flags(
+    abx::Float32, aby::Float32,
+    acx::Float32, acy::Float32
+)::UInt8
+    det_xy = muladd(aby, acx, -abx * acy)
+    # Choose a consistent CCW edge orientation for top-left ownership.
+    s = ifelse(det_xy < 0.0f0, 1.0f0, -1.0f0)
+
+    own_u = is_top_left(-s * acx, -s * acy)                   # AC boundary (u = 0)
+    own_v = is_top_left(s * abx, s * aby)                     # AB boundary (v = 0)
+    own_w = is_top_left(s * (acx - abx), s * (acy - aby))     # BC boundary (w = 0)
+
+    flags = UInt8(0)
+    own_u && (flags |= UInt8(0x01))
+    own_v && (flags |= UInt8(0x02))
+    own_w && (flags |= UInt8(0x04))
+    return flags
+end
+
 #################################   CPU tiling / binning   #################################
 
 """Build a 3D tile→triangles CSR for narrow-band seeding.
@@ -560,6 +591,7 @@ function parity_tiled_kernel!(
     active_tiles::CuDeviceVector{Int32},
     tile_offsets::CuDeviceVector{Int32},
     tile_tris::CuDeviceVector{Int32},
+    edge_flags::CuDeviceVector{UInt8},
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
@@ -594,6 +626,7 @@ function parity_tiled_kernel!(
 
     @inbounds for ptr in start:stop
         fi = tile_tris[ptr]
+        flags = edge_flags[fi]
 
         ax = v0x[fi]
         ay = v0y[fi]
@@ -615,8 +648,23 @@ function parity_tiled_kernel!(
         u = (muladd(sy, acx, -sx * acy)) * inv_det
         v = (muladd(sx, aby, -sy * abx)) * inv_det
 
-        # half-open rule: exclude edges/vertices to avoid double-counting
-        if (u <= ε_bary) | (v <= ε_bary) | ((u + v) >= (1.0f0 - ε_bary))
+        # Asymmetric half-open rule via per-edge ownership flags.
+        # Boundary points are accepted only by the owning edge.
+        w = 1.0f0 - u - v
+
+        own_u = (flags & UInt8(0x01)) != UInt8(0)  # u = 0 edge (AC)
+        own_v = (flags & UInt8(0x02)) != UInt8(0)  # v = 0 edge (AB)
+        own_w = (flags & UInt8(0x04)) != UInt8(0)  # w = 0 edge (BC)
+
+        abs_u = abs(u)
+        abs_v = abs(v)
+        abs_w = abs(w)
+
+        in_u = (u > ε_bary) | ((abs_u <= ε_bary) & own_u)
+        in_v = (v > ε_bary) | ((abs_v <= ε_bary) & own_v)
+        in_w = (w > ε_bary) | ((abs_w <= ε_bary) & own_w)
+
+        if !(in_u & in_v & in_w)
             continue
         end
 
@@ -676,6 +724,7 @@ end
 
 • Edge vectors are computed in Float64 first to reduce cancellation.
 • Degenerate triangles are dropped.
+• Precomputes parity edge-ownership flags for asymmetric boundary tie-break.
 """
 function preprocess_geometry(
     vertices::AbstractVector{Point3f},
@@ -685,6 +734,7 @@ function preprocess_geometry(
     num_faces = length(fcs)
     arrays = ntuple(_ -> sizehint!(Float32[], num_faces), 9)
     (v0x, v0y, v0z, e0x, e0y, e0z, e1x, e1y, e1z) = arrays
+    parity_edge_flags = sizehint!(UInt8[], num_faces)
 
     @inbounds for face in fcs
         # works for TriangleFace / GLTriangleFace; we only need integer indices
@@ -698,15 +748,26 @@ function preprocess_geometry(
         norm² = muladd(nx, nx, muladd(ny, ny, nz * nz))  # = nx*nx + ny*ny + nz*nz
         (norm² <= ε²) && continue
 
-        push!(v0x, Float32(A[1]))
-        push!(v0y, Float32(A[2]))
-        push!(v0z, Float32(A[3]))
-        push!(e0x, Float32(ab[1]))
-        push!(e0y, Float32(ab[2]))
-        push!(e0z, Float32(ab[3]))
-        push!(e1x, Float32(ac[1]))
-        push!(e1y, Float32(ac[2]))
-        push!(e1z, Float32(ac[3]))
+        ax = Float32(A[1])
+        ay = Float32(A[2])
+        az = Float32(A[3])
+        abx32 = Float32(ab[1])
+        aby32 = Float32(ab[2])
+        abz32 = Float32(ab[3])
+        acx32 = Float32(ac[1])
+        acy32 = Float32(ac[2])
+        acz32 = Float32(ac[3])
+
+        push!(v0x, ax)
+        push!(v0y, ay)
+        push!(v0z, az)
+        push!(e0x, abx32)
+        push!(e0y, aby32)
+        push!(e0z, abz32)
+        push!(e1x, acx32)
+        push!(e1y, acy32)
+        push!(e1z, acz32)
+        push!(parity_edge_flags, pack_parity_edge_flags(abx32, aby32, acx32, acy32))
     end
 
     num_faces = Int32(length(v0x))
@@ -715,6 +776,7 @@ function preprocess_geometry(
         v0x, v0y, v0z,
         e0x, e0y, e0z,
         e1x, e1y, e1z,
+        parity_edge_flags,
         num_faces
     )
 end
@@ -740,9 +802,9 @@ Keyword arguments (good defaults for 256³):
 • `ε_det=1.0f-10`
     Threshold for skipping triangles whose XY projection is nearly degenerate.
 • `ε_bary=5.0f-8`
-    Half-open barycentric margin (excludes edges to avoid double-counting).
-    Smaller values are less likely to reject near-edge valid hits; larger values
-    are more conservative against edge/vertex double-counting.
+    Boundary tolerance for asymmetric edge ownership tie-break.
+    At `|u|,|v|,|w| <= ε_bary`, only the owner edge accepts the hit.
+    Smaller values reduce boundary snapping; larger values increase tie-band width.
 • `dist_fallback=10.0f0`
     Used only if some voxels remain unassigned after JFA (rare if `band` is sane).
 """
@@ -816,6 +878,7 @@ function construct_sdf(
     d_parity_offsets = CuArray(parity_offsets)
     d_parity_tris = CuArray(parity_tris)
     d_parity_active = CuArray(parity_active)
+    d_parity_edge_flags = CuArray(geom.parity_edge_flags)
 
     # phase 1 (GPU): tiled seeding
     idx_a = CUDA.zeros(Int32, n32, n32, n32)
@@ -862,7 +925,7 @@ function construct_sdf(
     parity = CUDA.zeros(UInt8, n32, n32, n32)
 
     @cuda threads = parity_blk blocks = length(parity_active) parity_tiled_kernel!(
-        parity, d_parity_active, d_parity_offsets, d_parity_tris, soa...,
+        parity, d_parity_active, d_parity_offsets, d_parity_tris, d_parity_edge_flags, soa...,
         origin, step_val, inv_step, n32, parity_ntx, Tx_p, Ty_p, jitter_mag, ε_det, ε_bary
     )
 
