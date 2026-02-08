@@ -33,7 +33,7 @@ Implementation highlights (vs. the original atomic-splat version):
 
 using CUDA
 using GeometryBasics
-using GLMakie: Figure, LScene, mesh!
+using GLMakie: Figure, LScene, Screen, mesh!
 using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
 
 # constants
@@ -58,10 +58,12 @@ function construct_mesh(
 end
 
 function visualize(mesh::Mesh{3,Float32})
+    screen = Screen()
     figure = Figure()
     # LScene for full 3D camera control
     lscene = LScene(figure[1, 1])
     mesh!(lscene, mesh; color=:lightblue, shading=true)
+    display(screen, figure)
     return figure
 end
 
@@ -283,7 +285,7 @@ function build_seed_tile_csr(
     offsets = Vector{Int32}(undef, num_tiles + 1)
     offsets[1] = Int32(1)
     @inbounds for t in eachindex(counts)
-        offsets[t + 1] = offsets[t] + counts[t]
+        offsets[t+1] = offsets[t] + counts[t]
     end
     total_refs = Int(offsets[end] - Int32(1))
     tris = Vector{Int32}(undef, total_refs)
@@ -403,7 +405,7 @@ function build_parity_tile_csr(
     offsets = Vector{Int32}(undef, num_tiles + 1)
     offsets[1] = Int32(1)
     @inbounds for t in eachindex(counts)
-        offsets[t + 1] = offsets[t] + counts[t]
+        offsets[t+1] = offsets[t] + counts[t]
     end
     total_refs = Int(offsets[end] - Int32(1))
     tris = Vector{Int32}(undef, total_refs)
@@ -483,7 +485,7 @@ function seed_tiled_kernel!(
     best_idx = NO_TRIANGLE
 
     start = @inbounds tile_offsets[tile_id]
-    stop = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
+    stop = @inbounds tile_offsets[tile_id+Int32(1)] - Int32(1)
 
     @inbounds for ptr in start:stop
         fi = tile_tris[ptr]
@@ -622,7 +624,7 @@ function parity_tiled_kernel!(
     z_end = origin + step_val * Float32(n - Int32(1))
 
     start = @inbounds tile_offsets[tile_id]
-    stop = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
+    stop = @inbounds tile_offsets[tile_id+Int32(1)] - Int32(1)
 
     @inbounds for ptr in start:stop
         fi = tile_tris[ptr]
