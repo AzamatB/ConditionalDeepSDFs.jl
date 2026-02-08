@@ -61,7 +61,7 @@ function visualize(mesh::Mesh{3,Float32})
     figure = Figure()
     # LScene for full 3D camera control
     lscene = LScene(figure[1, 1])
-    mesh!(lscene, mesh, color=:lightblue, shading=true)
+    mesh!(lscene, mesh; color=:lightblue, shading=true)
     return figure
 end
 
@@ -82,14 +82,14 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     px::Float32, py::Float32, pz::Float32,
     ax::Float32, ay::Float32, az::Float32,
     abx::Float32, aby::Float32, abz::Float32,
-    acx::Float32, acy::Float32, acz::Float32,
+    acx::Float32, acy::Float32, acz::Float32
 )
     apx = px - ax
     apy = py - ay
     apz = pz - az
     d1 = dot3(abx, aby, abz, apx, apy, apz)
     d2 = dot3(acx, acy, acz, apx, apy, apz)
-    if (d1 <= 0f0) & (d2 <= 0f0)
+    if (d1 <= 0.0f0) & (d2 <= 0.0f0)
         return dot3(apx, apy, apz, apx, apy, apz)
     end
 
@@ -98,7 +98,7 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     bpz = apz - abz
     d3 = dot3(abx, aby, abz, bpx, bpy, bpz)
     d4 = dot3(acx, acy, acz, bpx, bpy, bpz)
-    if (d3 >= 0f0) & (d4 <= d3)
+    if (d3 >= 0.0f0) & (d4 <= d3)
         return dot3(bpx, bpy, bpz, bpx, bpy, bpz)
     end
 
@@ -107,12 +107,12 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     cpz = apz - acz
     d5 = dot3(abx, aby, abz, cpx, cpy, cpz)
     d6 = dot3(acx, acy, acz, cpx, cpy, cpz)
-    if (d6 >= 0f0) & (d5 <= d6)
+    if (d6 >= 0.0f0) & (d5 <= d6)
         return dot3(cpx, cpy, cpz, cpx, cpy, cpz)
     end
 
     vc = d1 * d4 - d3 * d2
-    if (vc <= 0f0) & (d1 >= 0f0) & (d3 <= 0f0)
+    if (vc <= 0.0f0) & (d1 >= 0.0f0) & (d3 <= 0.0f0)
         v = d1 / (d1 - d3)
         dx = apx - v * abx
         dy = apy - v * aby
@@ -121,7 +121,7 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     end
 
     vb = d5 * d2 - d1 * d6
-    if (vb <= 0f0) & (d2 >= 0f0) & (d6 <= 0f0)
+    if (vb <= 0.0f0) & (d2 >= 0.0f0) & (d6 <= 0.0f0)
         w = d2 / (d2 - d6)
         dx = apx - w * acx
         dy = apy - w * acy
@@ -130,7 +130,7 @@ Voronoi-region closest-point (Ericson, Real-Time Collision Detection).
     end
 
     va = d3 * d6 - d5 * d4
-    if (va <= 0f0) & ((d4 - d3) >= 0f0) & ((d5 - d6) >= 0f0)
+    if (va <= 0.0f0) & ((d4 - d3) >= 0.0f0) & ((d5 - d6) >= 0.0f0)
         w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
         bcx = acx - abx
         bcy = acy - aby
@@ -163,8 +163,8 @@ end
 
 @inline function column_jitter(ix::Int32, iy::Int32, mag::Float32)
     h = u32_hash(UInt32(ix) * 0x9e3779b9 + UInt32(iy) * 0x7f4a7c15)
-    jx = (Float32(h & 0xFFFF) / 65535f0 - 0.5f0) * mag
-    jy = (Float32((h >> 16) & 0xFFFF) / 65535f0 - 0.5f0) * mag
+    jx = (Float32(h & 0xFFFF) / 65_535.0f0 - 0.5f0) * mag
+    jy = (Float32((h >> 16) & 0xFFFF) / 65_535.0f0 - 0.5f0) * mag
     return (jx, jy)
 end
 
@@ -187,7 +187,7 @@ function build_seed_tile_csr(
     e1x::Vector{Float32}, e1y::Vector{Float32}, e1z::Vector{Float32},
     origin::Float32, inv_step::Float32,
     n::Int32, band::Int32,
-    Tx::Int32, Ty::Int32, Tz::Int32,
+    Tx::Int32, Ty::Int32, Tz::Int32
 )
     ntx = Int32(cld(Int(n), Int(Tx)))
     nty = Int32(cld(Int(n), Int(Ty)))
@@ -195,9 +195,7 @@ function build_seed_tile_csr(
     num_tiles = Int(ntx) * Int(nty) * Int(ntz)
 
     counts = zeros(Int32, num_tiles)
-    n_faces = length(v0x)
-
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in eachindex(v0x)
         ax = v0x[fi]
         ay = v0y[fi]
         az = v0z[fi]
@@ -245,15 +243,15 @@ function build_seed_tile_csr(
     # CSR offsets (1-based)
     offsets = Vector{Int32}(undef, num_tiles + 1)
     offsets[1] = Int32(1)
-    @inbounds for t in 1:num_tiles
-        offsets[t+1] = offsets[t] + counts[t]
+    @inbounds for t in eachindex(counts)
+        offsets[t + 1] = offsets[t] + counts[t]
     end
     total_refs = Int(offsets[end] - Int32(1))
     tris = Vector{Int32}(undef, total_refs)
 
     write_ptr = copy(offsets[1:end-1])
 
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in eachindex(v0x)
         ax = v0x[fi]
         ay = v0y[fi]
         az = v0z[fi]
@@ -303,7 +301,7 @@ function build_seed_tile_csr(
     # list active tiles (for smaller GPU launch)
     active_tiles = Vector{Int32}()
     sizehint!(active_tiles, num_tiles)
-    @inbounds for t in 1:num_tiles
+    @inbounds for t in eachindex(counts)
         (counts[t] == Int32(0)) && continue
         push!(active_tiles, Int32(t))
     end
@@ -331,18 +329,16 @@ function build_parity_tile_csr(
     n::Int32,
     Tx::Int32, Ty::Int32,
     jitter_mag::Float32,
-    ε_det::Float32,
+    ε_det::Float32
 )
     ntx = Int32(cld(Int(n), Int(Tx)))
     nty = Int32(cld(Int(n), Int(Ty)))
     num_tiles = Int(ntx) * Int(nty)
 
     counts = zeros(Int32, num_tiles)
-    n_faces = length(v0x)
-
     domain_max = origin + step_val * Float32(n - Int32(1))
 
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in eachindex(v0x)
         ax = v0x[fi]
         ay = v0y[fi]
         abx = e0x[fi]
@@ -385,15 +381,15 @@ function build_parity_tile_csr(
 
     offsets = Vector{Int32}(undef, num_tiles + 1)
     offsets[1] = Int32(1)
-    @inbounds for t in 1:num_tiles
-        offsets[t+1] = offsets[t] + counts[t]
+    @inbounds for t in eachindex(counts)
+        offsets[t + 1] = offsets[t] + counts[t]
     end
     total_refs = Int(offsets[end] - Int32(1))
     tris = Vector{Int32}(undef, total_refs)
 
     write_ptr = copy(offsets[1:end-1])
 
-    @inbounds for fi in 1:n_faces
+    @inbounds for fi in eachindex(v0x)
         ax = v0x[fi]
         ay = v0y[fi]
         abx = e0x[fi]
@@ -438,7 +434,7 @@ function build_parity_tile_csr(
 
     active_tiles = Vector{Int32}()
     sizehint!(active_tiles, num_tiles)
-    @inbounds for t in 1:num_tiles
+    @inbounds for t in eachindex(counts)
         (counts[t] == Int32(0)) && continue
         push!(active_tiles, Int32(t))
     end
@@ -468,7 +464,7 @@ function seed_tiled_kernel!(
     origin::Float32, step_val::Float32,
     n::Int32,
     ntx::Int32, nty::Int32,
-    Tx::Int32, Ty::Int32, Tz::Int32,
+    Tx::Int32, Ty::Int32, Tz::Int32
 )
     # map block -> global tile id (1-based)
     tile_id = @inbounds active_tiles[blockIdx().x]
@@ -494,7 +490,7 @@ function seed_tiled_kernel!(
     best_idx = NO_TRIANGLE
 
     start = @inbounds tile_offsets[tile_id]
-    stop = @inbounds tile_offsets[tile_id+Int32(1)] - Int32(1)
+    stop = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
 
     @inbounds for ptr in start:stop
         fi = tile_tris[ptr]
@@ -532,7 +528,7 @@ function jfa_pass_kernel!(
     v0x::CuDeviceVector{Float32}, v0y::CuDeviceVector{Float32}, v0z::CuDeviceVector{Float32},
     e0x::CuDeviceVector{Float32}, e0y::CuDeviceVector{Float32}, e0z::CuDeviceVector{Float32},
     e1x::CuDeviceVector{Float32}, e1y::CuDeviceVector{Float32}, e1z::CuDeviceVector{Float32},
-    origin::Float32, step_val::Float32, n::Int32, jump::Int32,
+    origin::Float32, step_val::Float32, n::Int32, jump::Int32
 )
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -611,7 +607,7 @@ function parity_tiled_kernel!(
     Tx::Int32, Ty::Int32,
     jitter_mag::Float32,
     ε_det::Float32,
-    ε_bary::Float32,
+    ε_bary::Float32
 )
     tile_id = @inbounds active_tiles[blockIdx().x]
 
@@ -625,14 +621,14 @@ function parity_tiled_kernel!(
     ((ix > n) | (iy > n)) && return nothing
 
     # jittered ray origin (x,y)
-    jx, jy = column_jitter(ix, iy, jitter_mag)
+    (jx, jy) = column_jitter(ix, iy, jitter_mag)
     rx = muladd(Float32(ix - Int32(1)), step_val, origin) + jx
     ry = muladd(Float32(iy - Int32(1)), step_val, origin) + jy
 
     z_end = origin + step_val * Float32(n - Int32(1))
 
     start = @inbounds tile_offsets[tile_id]
-    stop = @inbounds tile_offsets[tile_id+Int32(1)] - Int32(1)
+    stop = @inbounds tile_offsets[tile_id + Int32(1)] - Int32(1)
 
     @inbounds for ptr in start:stop
         fi = tile_tris[ptr]
@@ -657,8 +653,8 @@ function parity_tiled_kernel!(
         u = (muladd(sy, acx, -sx * acy)) * inv_det
         v = (muladd(sx, aby, -sy * abx)) * inv_det
 
-        # Half-open rule: exclude edges/vertices to avoid double-counting.
-        if (u <= ε_bary) | (v <= ε_bary) | ((u + v) >= (1f0 - ε_bary))
+        # half-open rule: exclude edges/vertices to avoid double-counting
+        if (u <= ε_bary) | (v <= ε_bary) | ((u + v) >= (1.0f0 - ε_bary))
             continue
         end
 
@@ -669,7 +665,7 @@ function parity_tiled_kernel!(
             continue
         end
 
-        # Toggle at the first grid sample strictly above z_hit.
+        # toggle at the first grid sample strictly above z_hit
         t = (z_hit - origin) * inv_step  # in (0, n-1)
         z_idx = unsafe_trunc(Int32, t) + Int32(2)
 
@@ -688,7 +684,7 @@ function finalize_kernel!(
     d2_grid::CuDeviceArray{Float32,3},
     parity::CuDeviceArray{UInt8,3},
     origin::Float32, step_val::Float32, n::Int32,
-    dist_fallback::Float32,
+    dist_fallback::Float32
 )
     ix = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     iy = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -721,14 +717,14 @@ end
 function preprocess_geometry(
     vertices::AbstractVector{Point3f},
     fcs::AbstractVector{GLTriangleFace};
-    ε²::Float64=1e-20
+    ε²::Float64=1.0e-20
 )
     num_faces = length(fcs)
     arrays = ntuple(_ -> sizehint!(Float32[], num_faces), 9)
-    v0x, v0y, v0z, e0x, e0y, e0z, e1x, e1y, e1z = arrays
+    (v0x, v0y, v0z, e0x, e0y, e0z, e1x, e1y, e1z) = arrays
 
     @inbounds for face in fcs
-        # Works for TriangleFace / GLTriangleFace; we only need integer indices.
+        # works for TriangleFace / GLTriangleFace; we only need integer indices
         (a, b, c) = GeometryBasics.value.(face)
         A = Float64.(vertices[a])
         ab = Float64.(vertices[b]) .- A
@@ -773,14 +769,14 @@ Keyword arguments (good defaults for 256³):
     Larger = better JFA coverage, slower seeding.
 • `jfa_corrections=2`
     Number of extra JFA passes at `jump=1` after the main pyramid.
-• `jitter_scale=1f-3`
+• `jitter_scale=1.0f-3`
     Ray jitter magnitude as a fraction of grid spacing (so physical jitter is
     `jitter_scale * step`). This helps avoid measure-zero edge/vertex cases.
-• `ε_det=1f-10`
+• `ε_det=1.0f-10`
     Threshold for skipping triangles whose XY projection is nearly degenerate.
-• `ε_bary=1f-7`
+• `ε_bary=1.0f-7`
     Half-open barycentric margin (excludes edges to avoid double-counting).
-• `dist_fallback=10f0`
+• `dist_fallback=10.0f0`
     Used only if some voxels remain unassigned after JFA (rare if `band` is sane).
 """
 function construct_sdf(mesh::Mesh{3,Float32,GLTriangleFace}, n::Int=256; kwargs...)
@@ -793,22 +789,22 @@ function construct_sdf(
     n::Int=256;
     band::Int=5,
     jfa_corrections::Int=2,
-    jitter_scale::Float32=1f-3,
-    ε_det::Float32=1f-10,
-    ε_bary::Float32=1f-7,
-    dist_fallback::Float32=10f0
+    jitter_scale::Float32=1.0f-3,
+    ε_det::Float32=1.0f-10,
+    ε_bary::Float32=1.0f-7,
+    dist_fallback::Float32=10.0f0
 )
     (7 < n < 1025) || error("Grid size n must be between 7 and 1024!")
     n32 = Int32(n)
-    origin = -1f0
-    step_val = 2f0 / Float32(n - 1)
+    origin = -1.0f0
+    step_val = 2.0f0 / Float32(n - 1)
     inv_step = inv(step_val)
 
     # geometry → SoA (CPU)
     geom = preprocess_geometry(vertices, fcs)
 
     # phase 1 (CPU): build tile bins
-    # Seeding tiles (3D)
+    # seeding tiles (3D)
     seed_blk = (8, 8, 4)
     Tx_s = Int32(seed_blk[1])
     Ty_s = Int32(seed_blk[2])
@@ -821,7 +817,7 @@ function construct_sdf(
         origin, inv_step, n32, Int32(band), Tx_s, Ty_s, Tz_s
     )
 
-    # Parity tiles (2D)
+    # parity tiles (2D)
     parity_blk = (16, 16)
     Tx_p = Int32(parity_blk[1])
     Ty_p = Int32(parity_blk[2])
@@ -861,7 +857,7 @@ function construct_sdf(
     # blocks = number of active tiles (1D)
     @cuda threads = seed_blk blocks = length(seed_active) seed_tiled_kernel!(
         idx_a, d2_a, d_seed_active, d_seed_offsets, d_seed_tris, soa...,
-        origin, step_val, n32, seed_ntx, seed_nty, Tx_s, Ty_s, Tz_s,
+        origin, step_val, n32, seed_ntx, seed_nty, Tx_s, Ty_s, Tz_s
     )
 
     # phase 2 (GPU): JFA (propagate idx + dist²)
@@ -871,8 +867,8 @@ function construct_sdf(
     blk3 = seed_blk
     grd3 = cld.(Int.((n32, n32, n32)), blk3)
 
-    curr_idx_in, curr_d2_in = idx_a, d2_a
-    curr_idx_out, curr_d2_out = idx_b, d2_b
+    (curr_idx_in, curr_d2_in) = (idx_a, d2_a)
+    (curr_idx_out, curr_d2_out) = (idx_b, d2_b)
 
     jump = Int32(n ÷ 2)
     while jump >= Int32(1)

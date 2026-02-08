@@ -48,12 +48,12 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
         Δy = pi[2] - pj[2]
         Δz = pi[3] - pj[3]
         # prioritized comparison: x, then y, then z
-        cmp = ifelse(Δx == 0f0, Δy, Δx)
-        cmp = ifelse(cmp == 0f0, Δz, cmp)
-        return cmp < 0f0
+        cmp = ifelse(Δx == 0.0f0, Δy, Δx)
+        cmp = ifelse(cmp == 0.0f0, Δz, cmp)
+        return cmp < 0.0f0
     end
     perm = collect(1:num_vertices)
-    sort!(perm, lt=is_less)
+    sort!(perm; lt=is_less)
 
     # union-find (disjoint set union)
     parents = collect(1:num_vertices)
@@ -82,7 +82,7 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
 
     # sweep with sliding x-window: only compare to earlier vertices with x within ε
     lo = 1
-    @inbounds for hi in 1:num_vertices
+    @inbounds for hi in eachindex(perm)
         ii = perm[hi]
         pi = vertices[ii]
         xi = Float64(pi[1])
@@ -121,7 +121,7 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     Σz = zeros(Float64, num_vertices)
     count = zeros(Int32, num_vertices)
 
-    @inbounds for i in 1:num_vertices
+    @inbounds for i in eachindex(vertices)
         r = find(i)
         p = vertices[i]
         Σx[r] += p[1]
@@ -134,7 +134,7 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     vertices_new = Vector{VT}()
     sizehint!(vertices_new, num_vertices)
     root2new = zeros(Int32, num_vertices)
-    @inbounds for r in 1:num_vertices
+    @inbounds for r in eachindex(count)
         c = count[r]
         if c != 0
             weight = inv(c)
@@ -147,7 +147,7 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     end
 
     old2new = Vector{Int32}(undef, num_vertices)
-    @inbounds for i in 1:num_vertices
+    @inbounds for i in eachindex(old2new)
         old2new[i] = root2new[find(i)]
     end
     # remap faces and drop degenerate ones
@@ -156,7 +156,7 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     FT = eltype(faces_old)  # GLTriangleFace
     faces_new = Vector{FT}(undef, num_faces)
     k = 0
-    @inbounds for index in 1:num_faces
+    @inbounds for index in eachindex(faces_old)
         face = faces_old[index]
         a = old2new[face[1]]
         b = old2new[face[2]]
@@ -174,8 +174,8 @@ function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
     num_vertices_new = length(vertices_new)
     ratio_v = round(100 * num_vertices_new / num_vertices; digits=2)
     ratio_f = round(100 * k / num_faces; digits=2)
-    @info "$ratio_v% of the original $num_vertices vertices remain after performing the vertex welding."
-    @info "$ratio_f% of the original $num_faces faces remain after performing the vertex welding."
+    @info "$ratio_v% of the original $num_vertices vertices remain after performing the vertex welding"
+    @info "$ratio_f% of the original $num_faces faces remain after performing the vertex welding"
 
     return Mesh(vertices_new, faces_new)
 end
@@ -183,13 +183,13 @@ end
 @inline function sort_triplet(a::Int32, b::Int32, c::Int32)::NTuple{3,Int32}
     # compare-swap (a, b)
     gt = a > b
-    a, b = ifelse(gt, b, a), ifelse(gt, a, b)
+    (a, b) = (ifelse(gt, b, a), ifelse(gt, a, b))
     # compare-swap (b, c)
     gt = b > c
-    b, c = ifelse(gt, c, b), ifelse(gt, b, c)
+    (b, c) = (ifelse(gt, c, b), ifelse(gt, b, c))
     # compare-swap (a, b)
     gt = a > b
-    a, b = ifelse(gt, b, a), ifelse(gt, a, b)
+    (a, b) = (ifelse(gt, b, a), ifelse(gt, a, b))
     return (a, b, c)
 end
 
@@ -212,9 +212,9 @@ end
     uu = UInt64(GeometryBasics.value(u))
     vv = UInt64(GeometryBasics.value(v))
     if uu <= vv
-        return (uu << 32) | vv, Int8(1)
+        return ((uu << 32) | vv, Int8(1))
     else
-        return (vv << 32) | uu, Int8(-1)
+        return ((vv << 32) | uu, Int8(-1))
     end
 end
 
@@ -250,13 +250,13 @@ boundary or non-manifold edges are detected.
 function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true)
     fcs = faces(mesh)
     num_faces = length(fcs)
-    num_faces == 0 && return mesh
-    num_faces > typemax(Int32) && throw(ArgumentError("Too many faces ($num_faces) for Int32 adjacency indexing."))
+    (num_faces == 0) && return mesh
+    (num_faces > typemax(Int32)) && throw(ArgumentError("Too many faces ($num_faces) for Int32 adjacency indexing"))
 
     vertices = coordinates(mesh)
     # build adjacency using sort-based edge pairing
     edges = Vector{EdgeEntry}(undef, 3num_faces)
-    @inbounds for index in 1:num_faces
+    @inbounds for index in eachindex(fcs)
         face = fcs[index]
         (a, b, c) = face
         idx = Int32(index)
@@ -272,7 +272,7 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
 
     # neighbors[edge_id, face_id] -> adjacent face_id (0 if none)
     neighbors = zeros(Int32, 3, num_faces)
-    # toggle[edge_id, face_id] == true means neighbor flip must differ (xor) to satisfy consistency.
+    # toggle[edge_id, face_id] == true means neighbor flip must differ (xor) to satisfy consistency
     toggles = fill(false, 3, num_faces)
 
     boundary_edges = 0
@@ -297,8 +297,8 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
             face_id₂ = edge₂.face_id
             edge_id₂ = edge₂.edge_id
 
-            # If both faces traverse the shared edge in the same direction (same sign),
-            # then the faces must have opposite flip states to make the shared edge anti-parallel.
+            # if both faces traverse the shared edge in the same direction (same sign),
+            # then the faces must have opposite flip states to make the shared edge anti-parallel
             toggle = (edge₁.sign == edge₂.sign)
 
             neighbors[edge_id₁, face_id₁] = face_id₂
@@ -314,8 +314,8 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
     end
 
     if check
-        boundary_edges == 0 || throw(ArgumentError("Mesh is not closed/watertight: $boundary_edges boundary edges."))
-        nonmanifold_edges == 0 || throw(ArgumentError("Mesh is non-manifold: $nonmanifold_edges edges shared by >2 faces."))
+        boundary_edges == 0 || throw(ArgumentError("Mesh is not closed/watertight: $boundary_edges boundary edges"))
+        nonmanifold_edges == 0 || throw(ArgumentError("Mesh is non-manifold: $nonmanifold_edges edges shared by >2 faces"))
     end
 
     # BFS for consistent orientation + per-component outward fix
@@ -324,11 +324,11 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
 
     # preallocated BFS queue (also serves as the component face list: queue[1:tail])
     queue = Vector{Int}(undef, num_faces)
-    # reference point for numerically stable signed volume accumulation.
+    # reference point for numerically stable signed volume accumulation
     centroid = sum(vertices; init=zero(Point3d)) / length(vertices)
     (cx, cy, cz) = centroid
 
-    @inbounds for start in 1:num_faces
+    @inbounds for start in eachindex(fcs)
         seen[start] && continue
         head = 1
         tail = 1
@@ -351,7 +351,7 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
             vol6 += signed_volume(vertex1, vertex2, vertex3, cx, cy, cz)
 
             # propagate constraints to neighbors
-            for k in 1:3
+            for k in axes(neighbors, 1)
                 neighbor_id = neighbors[k, index]
                 (neighbor_id == 0) && continue
                 neighbor_id = Int(neighbor_id)
@@ -364,7 +364,7 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
                     tail += 1
                     queue[tail] = neighbor_id
                 elseif flip[neighbor_id] != required
-                    throw(ArgumentError("Mesh is not consistently orientable (conflicting constraints)."))
+                    throw(ArgumentError("Mesh is not consistently orientable (conflicting constraints)"))
                 end
             end
         end
@@ -384,7 +384,7 @@ function reorient_outward(mesh::Mesh{3,Float32,GLTriangleFace}; check::Bool=true
 
     FT = eltype(fcs)  # GLTriangleFace
     faces_new = Vector{FT}(undef, num_faces)
-    @inbounds for index in 1:num_faces
+    @inbounds for index in eachindex(fcs)
         face = fcs[index]
         faces_new[index] = ifelse(flip[index], FT(face[1], face[3], face[2]), face)
     end
@@ -422,7 +422,8 @@ end
 function align_and_rescale(vertices::Vector{Point3f})
     isempty(vertices) && return vertices
     # step 1: compute covariance matrix for PCA
-    vertices_mat = reinterpret(reshape, Float32, vertices) # Vector{Point3f} -> 3×N Matrix
+    # Vector{Point3f} -> 3×N Matrix
+    vertices_mat = reinterpret(reshape, Float32, vertices)
     weight = 1.0f0 / length(vertices)
     # cov_mat = weight * (vertices_mat * vertices_mat')
     cov_mat = Symmetric(BLAS.syrk('U', 'N', weight, vertices_mat), :U)
@@ -443,7 +444,8 @@ function align_and_rescale(vertices::Vector{Point3f})
 
     # step 3: invert rotation via transpose to align principal axes
     vertices_mat_rotated = rotation' * vertices_mat
-    vertices_rotated = reinterpret(reshape, Point3f, vertices_mat_rotated) # 3×N Matrix -> Vector{Point3f}
+    # 3×N Matrix -> Vector{Point3f}
+    vertices_rotated = reinterpret(reshape, Point3f, vertices_mat_rotated)
     # step 4: scale to unit sphere
     distances² = sum(abs2, vertices_mat_rotated; dims=1)
     radius_max = √(maximum(distances²))
