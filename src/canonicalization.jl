@@ -17,7 +17,7 @@ end
 ###############################   Welding of Mesh Vertices   ###############################
 
 """
-    weld_vertices(mesh::Mesh{3, Float32, GLTriangleFace}; ε::Float64=1e-7)
+    weld_vertices(mesh::Mesh{3, Float32, GLTriangleFace}; ε::Float64=1.0e-7)
 
 Deterministic vertex welding using lexicographic sort (x,y,z) + sweep line window on x.
 
@@ -30,7 +30,7 @@ Returns: `Mesh{3,Float32,GLTriangleFace}`.
 
 Note: Worst-case can be O(n^2) if many vertices fall into the same x-slab of width ε.
 """
-function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1e-7)
+function weld_vertices(mesh::Mesh{3,Float32,GLTriangleFace}; ε::Float64=1.0e-7)
     @assert ε > 0 "ε tolerance must be positive"
     vertices = coordinates(mesh)
     faces_old = faces(mesh)

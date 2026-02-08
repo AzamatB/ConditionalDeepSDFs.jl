@@ -195,7 +195,13 @@ function build_seed_tile_csr(
     num_tiles = Int(ntx) * Int(nty) * Int(ntz)
 
     counts = zeros(Int32, num_tiles)
-    @inbounds for fi in eachindex(v0x)
+    n_faces = length(v0x)
+    # Cache per-face tile ranges so we don't repeat heavy AABB/range math in the fill pass.
+    # (one contiguous stream is typically friendlier to caches/prefetch than 6 separate arrays)
+    ranges = Vector{NTuple{6,Int32}}(undef, n_faces)  # (tx0,tx1,ty0,ty1,tz0,tz1)
+    txy = ntx * nty
+
+    @inbounds for fi in 1:n_faces
         ax = v0x[fi]
         ay = v0y[fi]
         az = v0z[fi]
@@ -228,8 +234,10 @@ function build_seed_tile_csr(
         tz0 = max((k0 - Int32(1)) ÷ Tz, Int32(0))
         tz1 = min((k1 - Int32(1)) ÷ Tz, ntz - Int32(1))
 
+        ranges[fi] = (tx0, tx1, ty0, ty1, tz0, tz1)
+
         for tz in tz0:tz1
-            base_tz = tz * ntx * nty
+            base_tz = tz * txy
             for ty in ty0:ty1
                 base_ty = base_tz + ty * ntx
                 for tx in tx0:tx1
@@ -251,41 +259,12 @@ function build_seed_tile_csr(
 
     write_ptr = copy(offsets[1:end-1])
 
-    @inbounds for fi in eachindex(v0x)
-        ax = v0x[fi]
-        ay = v0y[fi]
-        az = v0z[fi]
-        abx = e0x[fi]
-        aby = e0y[fi]
-        abz = e0z[fi]
-        acx = e1x[fi]
-        acy = e1y[fi]
-        acz = e1z[fi]
-
-        bx = ax + abx
-        by = ay + aby
-        bz = az + abz
-        cx = ax + acx
-        cy = ay + acy
-        cz = az + acz
-
-        i0 = max(unsafe_trunc(Int32, (min(ax, bx, cx) - origin) * inv_step) + Int32(1) - band, Int32(1))
-        i1 = min(unsafe_trunc(Int32, (max(ax, bx, cx) - origin) * inv_step) + Int32(1) + band, n)
-        j0 = max(unsafe_trunc(Int32, (min(ay, by, cy) - origin) * inv_step) + Int32(1) - band, Int32(1))
-        j1 = min(unsafe_trunc(Int32, (max(ay, by, cy) - origin) * inv_step) + Int32(1) + band, n)
-        k0 = max(unsafe_trunc(Int32, (min(az, bz, cz) - origin) * inv_step) + Int32(1) - band, Int32(1))
-        k1 = min(unsafe_trunc(Int32, (max(az, bz, cz) - origin) * inv_step) + Int32(1) + band, n)
-
-        tx0 = max((i0 - Int32(1)) ÷ Tx, Int32(0))
-        tx1 = min((i1 - Int32(1)) ÷ Tx, ntx - Int32(1))
-        ty0 = max((j0 - Int32(1)) ÷ Ty, Int32(0))
-        ty1 = min((j1 - Int32(1)) ÷ Ty, nty - Int32(1))
-        tz0 = max((k0 - Int32(1)) ÷ Tz, Int32(0))
-        tz1 = min((k1 - Int32(1)) ÷ Tz, ntz - Int32(1))
+    @inbounds for fi in 1:n_faces
+        tx0, tx1, ty0, ty1, tz0, tz1 = ranges[fi]
 
         fi32 = Int32(fi)
         for tz in tz0:tz1
-            base_tz = tz * ntx * nty
+            base_tz = tz * txy
             for ty in ty0:ty1
                 base_ty = base_tz + ty * ntx
                 for tx in tx0:tx1
@@ -338,7 +317,13 @@ function build_parity_tile_csr(
     counts = zeros(Int32, num_tiles)
     domain_max = origin + step_val * Float32(n - Int32(1))
 
-    @inbounds for fi in eachindex(v0x)
+    # Cache per-face tile ranges so we don't redo projection/AABB math in the fill pass.
+    # Degenerate XY projections are stored as an empty range (so both passes naturally skip them).
+    ranges = Vector{NTuple{4,Int32}}(undef, n_faces)  # (tx0,tx1,ty0,ty1)
+
+    empty_range = (Int32(1), Int32(0), Int32(1), Int32(0))
+
+    @inbounds for fi in 1:n_faces
         ax = v0x[fi]
         ay = v0y[fi]
         abx = e0x[fi]
@@ -347,7 +332,10 @@ function build_parity_tile_csr(
         acy = e1y[fi]
 
         det = muladd(aby, acx, -abx * acy)
-        (abs(det) <= ε_det) && continue
+        if abs(det) <= ε_det
+            ranges[fi] = empty_range
+            continue
+        end
 
         bx = ax + abx
         by = ay + aby
@@ -370,6 +358,8 @@ function build_parity_tile_csr(
         ty0 = max((iy0 - Int32(1)) ÷ Ty, Int32(0))
         ty1 = min((iy1 - Int32(1)) ÷ Ty, nty - Int32(1))
 
+        ranges[fi] = (tx0, tx1, ty0, ty1)
+
         for ty in ty0:ty1
             base_ty = ty * ntx
             for tx in tx0:tx1
@@ -389,36 +379,8 @@ function build_parity_tile_csr(
 
     write_ptr = copy(offsets[1:end-1])
 
-    @inbounds for fi in eachindex(v0x)
-        ax = v0x[fi]
-        ay = v0y[fi]
-        abx = e0x[fi]
-        aby = e0y[fi]
-        acx = e1x[fi]
-        acy = e1y[fi]
-
-        det = muladd(aby, acx, -abx * acy)
-        (abs(det) <= ε_det) && continue
-
-        bx = ax + abx
-        by = ay + aby
-        cx = ax + acx
-        cy = ay + acy
-
-        x_min = max(min(ax, bx, cx) - jitter_mag, origin)
-        x_max = min(max(ax, bx, cx) + jitter_mag, domain_max)
-        y_min = max(min(ay, by, cy) - jitter_mag, origin)
-        y_max = min(max(ay, by, cy) + jitter_mag, domain_max)
-
-        ix0 = max(unsafe_trunc(Int32, (x_min - origin) * inv_step) + Int32(1), Int32(1))
-        ix1 = min(unsafe_trunc(Int32, (x_max - origin) * inv_step) + Int32(2), n)
-        iy0 = max(unsafe_trunc(Int32, (y_min - origin) * inv_step) + Int32(1), Int32(1))
-        iy1 = min(unsafe_trunc(Int32, (y_max - origin) * inv_step) + Int32(2), n)
-
-        tx0 = max((ix0 - Int32(1)) ÷ Tx, Int32(0))
-        tx1 = min((ix1 - Int32(1)) ÷ Tx, ntx - Int32(1))
-        ty0 = max((iy0 - Int32(1)) ÷ Ty, Int32(0))
-        ty1 = min((iy1 - Int32(1)) ÷ Ty, nty - Int32(1))
+    @inbounds for fi in 1:n_faces
+        tx0, tx1, ty0, ty1 = ranges[fi]
 
         fi32 = Int32(fi)
         for ty in ty0:ty1
