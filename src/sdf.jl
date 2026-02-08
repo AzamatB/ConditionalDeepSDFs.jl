@@ -798,7 +798,7 @@ function construct_sdf(
     ε_bary::Float32=1f-7,
     dist_fallback::Float32=10f0
 )
-    (n > 7) || error("Grid size n must be greater than 7!")
+    (7 < n < 1025) || error("Grid size n must be between 7 and 1024!")
     n32 = Int32(n)
     origin = -1f0
     step_val = 2f0 / Float32(n - 1)
