@@ -621,6 +621,7 @@ function parity_tiled_kernel!(
         end
 
         z_hit = az + u * abz + v * acz
+        isfinite(z_hit) || continue
 
         # Half-open in z: only hits strictly inside (origin, z_end)
         if (z_hit <= origin) | (z_hit >= z_end)
@@ -631,7 +632,7 @@ function parity_tiled_kernel!(
         t = (z_hit - origin) * inv_step  # in (0, n-1)
         z_idx = unsafe_trunc(Int32, t) + Int32(2)
 
-        if z_idx <= n
+        if (z_idx >= Int32(1)) & (z_idx <= n)
             @inbounds parity[ix, iy, z_idx] = parity[ix, iy, z_idx] ⊻ UInt8(1)
         end
     end
@@ -734,10 +735,14 @@ Keyword arguments (good defaults for 256³):
 • `jitter_scale=1.0f-3`
     Ray jitter magnitude as a fraction of grid spacing (so physical jitter is
     `jitter_scale * step`). This helps avoid measure-zero edge/vertex cases.
+    For meshes that show a rare parity-column artifact, reducing this value
+    (or setting it to 0) can be used as a workaround.
 • `ε_det=1.0f-10`
     Threshold for skipping triangles whose XY projection is nearly degenerate.
-• `ε_bary=1.0f-7`
+• `ε_bary=5.0f-8`
     Half-open barycentric margin (excludes edges to avoid double-counting).
+    Smaller values are less likely to reject near-edge valid hits; larger values
+    are more conservative against edge/vertex double-counting.
 • `dist_fallback=10.0f0`
     Used only if some voxels remain unassigned after JFA (rare if `band` is sane).
 """
@@ -753,7 +758,7 @@ function construct_sdf(
     jfa_corrections::Int=2,
     jitter_scale::Float32=1.0f-3,
     ε_det::Float32=1.0f-10,
-    ε_bary::Float32=1.0f-7,
+    ε_bary::Float32=5.0f-8,
     dist_fallback::Float32=10.0f0
 )
     (7 < n < 1025) || error("Grid size n must be between 7 and 1024!")
