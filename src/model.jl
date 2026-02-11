@@ -1,432 +1,359 @@
-using Random, Statistics, Printf
-
 using Lux
 using LuxCore
+using NNlib
 using Optimisers
-using Enzyme
+using Printf
+using Random
 using Reactant
-using WeightInitializers
-using NNlib: swish
+using Statistics
 
-# --------------------------
-# Utilities
-# --------------------------
-
-"""
-Smooth softplus with a "beta" sharpness parameter, implemented in a numerically stable way.
-Common choice for SDF MLPs is beta ~ 50..200.
-"""
-struct SoftplusBeta{T}
-    beta::T
-end
-
-@inline function (s::SoftplusBeta)(x)
-    β = s.beta
-    z = β * x
-    # stable softplus(z) = log1p(exp(-abs(z))) + max(z, 0)
-    return (log1p(exp(-abs(z))) + max(z, zero(z))) / β
-end
-
-
-# --------------------------
-# Fourier Feature Positional Encoding (state holds random matrix B)
-# --------------------------
+##############   Fourier Feature Positional Encoding (state holds random matrix B)   ##############
 
 """
 Fourier feature mapping: x (3×N) -> φ(x) (D×N), where
 φ(x) = [x; sin(2π Bx); cos(2π Bx)] if include_input=true
-B is sampled once at initialization and stored in the *state* (non-trainable).
+B is sampled once at initialization and stored in the state (non-trainable).
 """
 struct FourierFeatures{T} <: LuxCore.AbstractLuxLayer
-    nfeat::Int               # number of random frequencies
-    sigma::T                 # frequency scale
-    include_input::Bool
+    num_features::Int   # number of random frequencies
+    scale::T            # frequency scale
 end
 
-LuxCore.initialparameters(::AbstractRNG, ::FourierFeatures) = NamedTuple()
-
-function LuxCore.initialstates(rng::AbstractRNG, ff::FourierFeatures)
-    # B: (nfeat × 3)
-    B = ff.sigma .* randn(rng, Float32, ff.nfeat, 3)
-    return (B = B,)
+function LuxCore.initialparameters(rng::AbstractRNG, ::FourierFeatures)
+    return (;)
 end
 
-function (ff::FourierFeatures)(x::AbstractMatrix, ps, st::NamedTuple)
+function LuxCore.initialstates(rng::AbstractRNG, layer::FourierFeatures)
+    noise = randn(rng, Float32, layer.num_features, 3)   # num_features × 3
+    B = layer.scale .* noise                             # num_features × 3
+    return (; B)
+end
+
+function (layer::FourierFeatures)(x::AbstractMatrix, params::NamedTuple, states::NamedTuple)
     # x is 3×N
-    B = st.B
-    two_pi = 2f0 * Float32(pi)
-
-    proj = B * x                      # (nfeat×N)
-    s = sin.(two_pi .* proj)          # (nfeat×N)
-    c = cos.(two_pi .* proj)          # (nfeat×N)
-
-    y = ff.include_input ? vcat(x, s, c) : vcat(s, c)
-    return y, st
+    B = states.B
+    two_pi = 2.0f0 * π
+    proj = B * x                  # num_features × N
+    sins = sin.(two_pi .* proj)   # num_features × N
+    coss = cos.(two_pi .* proj)   # num_features × N
+    y = [x; sins; coss]           # (3 + 2*num_features) × N
+    return (y, states)
 end
 
-
-# --------------------------
-# Custom linear layers that inject p without explicit tiling
-# --------------------------
+##################   Custom linear layers that inject p without explicit tiling   ##################
 
 """
 Linear layer that takes (x, p) and computes: Wx*x + Wp*p + b
-- x: (Dx×N)
-- p: (Dp×1)
-- output: (Do×N)   (Wp*p is Do×1 and broadcasts across N)
+- x: (Dx × N)
+- p: (Dp × 1)
+- output: (Do × N)   (Wp*p is Do × 1 and broadcasts across N)
 """
-struct LinearXP{F1,F2} <: LuxCore.AbstractLuxLayer
-    x_in::Int
-    p_in::Int
-    out::Int
-    init_weight::F1
-    init_bias::F2
+struct LinearXP <: LuxCore.AbstractLuxLayer
+    dim_x_in::Int
+    dim_p_in::Int
+    dim_out::Int
 end
 
-function LinearXP(x_in::Int, p_in::Int, out::Int;
-                  init_weight=glorot_uniform, init_bias=zeros32)
-    return LinearXP{typeof(init_weight), typeof(init_bias)}(
-        x_in, p_in, out, init_weight, init_bias
+function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearXP)
+    dim_out = layer.dim_out
+    return (;
+        Wx = glorot_uniform(rng, dim_out, layer.dim_x_in),
+        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in),
+        b  = zeros(Float32, dim_out, 1)
     )
 end
 
-function LuxCore.initialparameters(rng::AbstractRNG, l::LinearXP)
-    return (
-        Wx = l.init_weight(rng, l.out, l.x_in),
-        Wp = l.init_weight(rng, l.out, l.p_in),
-        b  = l.init_bias(rng, l.out, 1),
-    )
+function LuxCore.initialstates(::AbstractRNG, ::LinearXP)
+    return (;)
 end
 
-LuxCore.initialstates(::AbstractRNG, ::LinearXP) = NamedTuple()
-
-function (l::LinearXP)(input::Tuple, ps, st::NamedTuple)
-    x, p = input
-    y = ps.Wx * x .+ ps.Wp * p .+ ps.b
-    return y, st
+function (layer::LinearXP)(input::NTuple{2}, params::NamedTuple, states::NamedTuple)
+    (x, p) = input
+    y = params.Wx * x .+ params.Wp * p .+ params.b
+    return (y, states)
 end
-
 
 """
-Skip-connection linear layer that takes (h, xenc, p) and computes:
-Wh*h + Wx*xenc + Wp*p + b
+Skip-connection linear layer that takes (h, x_enc, p) and computes:
+Wh*h + Wx*x_enc + Wp*p + b
 
-- h:    (Dh×N)
-- xenc: (Dx×N)
-- p:    (Dp×1)
+- h:      (Dh×N)
+- x_enc:  (Dx×N)
+- p:      (Dp×1)
 - output: (Do×N)
 """
-struct LinearHXP{F1,F2} <: LuxCore.AbstractLuxLayer
-    h_in::Int
-    x_in::Int
-    p_in::Int
-    out::Int
-    init_weight::F1
-    init_bias::F2
+struct LinearHXP <: LuxCore.AbstractLuxLayer
+    dim_h_in::Int
+    dim_x_in::Int
+    dim_p_in::Int
+    dim_out::Int
 end
 
-function LinearHXP(h_in::Int, x_in::Int, p_in::Int, out::Int;
-                   init_weight=glorot_uniform, init_bias=zeros32)
-    return LinearHXP{typeof(init_weight), typeof(init_bias)}(
-        h_in, x_in, p_in, out, init_weight, init_bias
+function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearHXP)
+    dim_out = layer.dim_out
+    return (;
+        Wh = glorot_uniform(rng, dim_out, layer.dim_h_in),
+        Wx = glorot_uniform(rng, dim_out, layer.dim_x_in),
+        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in),
+        b  = zeros(Float32, dim_out, 1)
     )
 end
 
-function LuxCore.initialparameters(rng::AbstractRNG, l::LinearHXP)
-    return (
-        Wh = l.init_weight(rng, l.out, l.h_in),
-        Wx = l.init_weight(rng, l.out, l.x_in),
-        Wp = l.init_weight(rng, l.out, l.p_in),
-        b  = l.init_bias(rng, l.out, 1),
-    )
+function LuxCore.initialstates(::AbstractRNG, ::LinearHXP)
+    return (;)
 end
 
-LuxCore.initialstates(::AbstractRNG, ::LinearHXP) = NamedTuple()
-
-function (l::LinearHXP)(input::Tuple, ps, st::NamedTuple)
-    h, xenc, p = input
-    y = ps.Wh * h .+ ps.Wx * xenc .+ ps.Wp * p .+ ps.b
-    return y, st
+function (layer::LinearHXP)(input::NTuple{3}, params::NamedTuple, states::NamedTuple)
+    (h, x_enc, p) = input
+    y = params.Wh * h .+ params.Wx * x_enc .+ params.Wp * p .+ params.b
+    return (y, states)
 end
 
+###################   FiLM-conditioned SDF Network (8 layers, skip at layer 5)   ###################
 
-# --------------------------
-# FiLM-conditioned SDF Network (8×512, skip at layer 5)
-# --------------------------
+struct FiLM{N} end
+
+function (film::FiLM{N})(h, params::AbstractArray{Float32,3}, scale::Float32, activation) where {N}
+    # FiLM params has shape (dim_hidden, 2, num_hidden)
+    γ_raw = params[:, 1:1, N]   # dim_hidden × 1
+    β_raw = params[:, 2:2, N]   # dim_hidden × 1
+
+    # "near-identity" initialization: gamma = 1 + scale*γ_raw, beta = scale*β_raw
+    γ = 1.0f0 .+ scale .* γ_raw
+    β = scale .* β_raw
+
+    y = h .* γ .+ β
+    out = activation.(y)
+    return out
+end
 
 """
-FiLM SDF network:
+Condition FiLM SDF network:
 - input: (x::3×N, p::4×1)
 - positional encoding: FourierFeatures(x)
 - conditioning: FiLM scales/shifts for each hidden layer from p via a small "hyper" MLP
-- skip connection after 4th hidden layer (layer 5 mixes h + xenc + p via LinearHXP)
+- skip connection after 4th hidden layer (layer 5 mixes h + x_enc + p via LinearHXP)
 - output: sdf values (1×N)
 """
-struct FiLMSDF{
-    PE, Film,
-    L1,L2,L3,L4,L5,L6,L7,L8,Out,
-    A
-} <: LuxCore.AbstractLuxContainerLayer{
-    (:posenc,:film,:l1,:l2,:l3,:l4,:l5,:l6,:l7,:l8,:out)
+struct ConditionalSDF{A,PE,FiLM,L1,L2,L3,L4,L5,L6,L7,L8,Out} <: LuxCore.AbstractLuxContainerLayer{
+    (:pos_encoder, :film, :layer_1, :layer_2, :layer_3, :layer_4, :layer_5, :layer_6, :layer_7, :layer_8, :out)
 }
-    posenc::PE
-    film::Film
+    dim_hidden::Int
+    num_hidden::Int
+    scale_film::Float32
+    scale_output::Float32
+    activation::A
 
-    l1::L1
-    l2::L2
-    l3::L3
-    l4::L4
-    l5::L5
-    l6::L6
-    l7::L7
-    l8::L8
+    pos_encoder::PE
+    film::FiLM
+    layer_1::L1
+    layer_2::L2
+    layer_3::L3
+    layer_4::L4
+    layer_5::L5
+    layer_6::L6
+    layer_7::L7
+    layer_8::L8
     out::Out
-
-    act::A
-    width::Int
-    n_layers::Int
-    film_scale::Float32
 end
 
 """
-Build a standard 8×512 FiLM SDF network.
+Build a standard 8 layer FiLM SDF network.
 """
-function build_film_sdf(;
-    n_fourier::Int = 64,
-    fourier_sigma::Float32 = 10f0,
-    include_xyz::Bool = true,
-    p_dim::Int = 4,
-    width::Int = 512,
-    n_hidden::Int = 8,                 # fixed at 8 in this implementation
-    film_hidden::Int = 128,
-    film_scale::Float32 = 0.1f0,
-    act = SoftplusBeta(100f0),
+function ConditionalSDF(;
+    activation = swish,
+    num_fourier::Int = 64,
+    fourier_scale::Float32 = 10.0f0,
+    scale_film::Float32 = 0.1f0,
+    scale_output::Float32 = 0.1f0,
+    dim_p::Int = 4,
+    dim_hidden::Int = 256,
+    dim_film::Int = 128
 )
-    @assert n_hidden == 8 "This implementation is wired for 8 hidden layers (as requested)."
-
     # Fourier feature output dimension
-    xenc_dim = (include_xyz ? 3 : 0) + 2 * n_fourier
+    num_hidden = 8
+    dim_x_enc = 3 + 2 * num_fourier
+    pos_encoder = FourierFeatures(num_fourier, fourier_scale)
 
-    posenc = FourierFeatures(n_fourier, fourier_sigma, include_xyz)
-
-    # FiLM hypernetwork: p -> (gamma,beta) for each of 8 hidden layers
-    # outputs: 2 * width * n_hidden values
+    # FiLM hypernetwork: p -> (γ, β) dim_hidden-dimensional conditioning vectors for each of 8 hidden layers
+    dim_film_out = dim_hidden * 2 * num_hidden # outputs: 2 * dim_hidden * num_hidden values
     film = Chain(
-        Dense(p_dim => film_hidden, swish),
-        Dense(film_hidden => film_hidden, swish),
-        Dense(film_hidden => 2 * width * n_hidden) # no activation
+        Dense(dim_p => dim_film, swish),
+        Dense(dim_film => dim_film, swish),
+        Dense(dim_film => dim_film_out) # no activation
     )
 
-    # Hidden layers:
-    # l1 consumes (xenc, p) without explicitly tiling p
-    l1 = LinearXP(xenc_dim, p_dim, width)
+    # hidden layers
+    # layer_1 consumes (x_enc, p) without explicitly tiling p
+    layer_1 = LinearXP(dim_x_enc, dim_p, dim_hidden)
+    # middle layers are standard dense (identity activation, as we apply activation ourselves after FiLM)
+    layer_2 = Dense(dim_hidden => dim_hidden)
+    layer_3 = Dense(dim_hidden => dim_hidden)
+    layer_4 = Dense(dim_hidden => dim_hidden)
+    # skip layer mixes (h, x_enc, p) again
+    layer_5 = LinearHXP(dim_hidden, dim_x_enc, dim_p, dim_hidden)
+    # final layers
+    layer_6 = Dense(dim_hidden => dim_hidden)
+    layer_7 = Dense(dim_hidden => dim_hidden)
+    layer_8 = Dense(dim_hidden => dim_hidden)
 
-    # middle layers are standard dense (identity activation, we apply act ourselves after FiLM)
-    l2 = Dense(width => width, identity)
-    l3 = Dense(width => width, identity)
-    l4 = Dense(width => width, identity)
-
-    # skip layer mixes (h, xenc, p) again
-    l5 = LinearHXP(width, xenc_dim, p_dim, width)
-
-    l6 = Dense(width => width, identity)
-    l7 = Dense(width => width, identity)
-    l8 = Dense(width => width, identity)
-
-    out = Dense(width => 1, identity)
-
-    return FiLMSDF(posenc, film, l1,l2,l3,l4,l5,l6,l7,l8,out, act, width, n_hidden, film_scale)
+    out = Dense(dim_hidden => 1)
+    film_sdf = ConditionalSDF(
+        dim_hidden,
+        num_hidden,
+        scale_film,
+        scale_output,
+        activation,
+        pos_encoder,
+        film,
+        layer_1,
+        layer_2,
+        layer_3,
+        layer_4,
+        layer_5,
+        layer_6,
+        layer_7,
+        layer_8,
+        out
+    )
+    return film_sdf
 end
 
-@inline function _apply_film!(h, film_params, layer_idx::Int, act, film_scale::Float32)
-    # film_params has shape: (2, width, n_layers, Bp)
-    γraw = film_params[1, :, layer_idx, :]  # (width×Bp)
-    βraw = film_params[2, :, layer_idx, :]  # (width×Bp)
-
-    # "near-identity" initialization: gamma = 1 + s*γraw, beta = s*βraw
-    γ = 1f0 .+ film_scale .* γraw
-    β = film_scale .* βraw
-
-    h = h .* γ .+ β
-    h = act.(h)
-    return h
-end
-
-function (m::FiLMSDF)(input::Tuple, ps, st::NamedTuple)
-    x, p = input                 # x: 3×N, p: 4×1
+function (model::ConditionalSDF)(input::NTuple{2}, params::NamedTuple, states::NamedTuple)
+    activation = model.activation
+    scale_film = model.scale_film
+    scale_output = model.scale_output
+    (x, p) = input   # x: 3×N, p: 4×1
 
     # positional encoding
-    xenc, st_pe = m.posenc(x, ps.posenc, st.posenc)
+    (x_enc, state_enc) = model.pos_encoder(x, params.pos_encoder, states.pos_encoder)
 
-    # FiLM params (gamma/beta per hidden layer)
-    film_out, st_film = m.film(p, ps.film, st.film)     # (2*width*n_layers)×Bp
-    Bp = size(film_out, 2)
-    film_params = reshape(film_out, 2, m.width, m.n_layers, Bp)
+    # FiLM params (γ, β pair per hidden layer)
+    (out_film, state_film) = model.film(p, params.film, states.film)   # (dim_hidden*2*num_hidden) × 1
+    params_film = reshape(out_film, model.dim_hidden, 2, model.num_hidden)
 
-    # layer 1: (xenc, p)
-    h, st_l1 = m.l1((xenc, p), ps.l1, st.l1)
-    h = _apply_film!(h, film_params, 1, m.act, m.film_scale)
+    # layer 1: (x_enc, p)
+    film_1 = FiLM{1}()
+    (h_1, state_1) = model.layer_1((x_enc, p), params.layer_1, states.layer_1)
+    x_2 = film_1(h_1, params_film, scale_film, activation)
 
     # layer 2
-    h, st_l2 = m.l2(h, ps.l2, st.l2)
-    h = _apply_film!(h, film_params, 2, m.act, m.film_scale)
+    film_2 = FiLM{2}()
+    (h_2, state_2) = model.layer_2(x_2, params.layer_2, states.layer_2)
+    x_3 = film_2(h_2, params_film, scale_film, activation)
 
     # layer 3
-    h, st_l3 = m.l3(h, ps.l3, st.l3)
-    h = _apply_film!(h, film_params, 3, m.act, m.film_scale)
+    film_3 = FiLM{3}()
+    (h_3, state_3) = model.layer_3(x_3, params.layer_3, states.layer_3)
+    x_4 = film_3(h_3, params_film, scale_film, activation)
 
     # layer 4
-    h, st_l4 = m.l4(h, ps.l4, st.l4)
-    h = _apply_film!(h, film_params, 4, m.act, m.film_scale)
+    film_4 = FiLM{4}()
+    (h_4, state_4) = model.layer_4(x_4, params.layer_4, states.layer_4)
+    x_5 = film_4(h_4, params_film, scale_film, activation)
 
-    # skip layer 5: (h, xenc, p)
-    h, st_l5 = m.l5((h, xenc, p), ps.l5, st.l5)
-    h = _apply_film!(h, film_params, 5, m.act, m.film_scale)
+    # skip layer 5: (h, x_enc, p)
+    film_5 = FiLM{5}()
+    (h_5, state_5) = model.layer_5((x_5, x_enc, p), params.layer_5, states.layer_5)
+    x_6 = film_5(h_5, params_film, scale_film, activation)
 
     # layer 6
-    h, st_l6 = m.l6(h, ps.l6, st.l6)
-    h = _apply_film!(h, film_params, 6, m.act, m.film_scale)
+    film_6 = FiLM{6}()
+    (h_6, state_6) = model.layer_6(x_6, params.layer_6, states.layer_6)
+    x_7 = film_6(h_6, params_film, scale_film, activation)
 
     # layer 7
-    h, st_l7 = m.l7(h, ps.l7, st.l7)
-    h = _apply_film!(h, film_params, 7, m.act, m.film_scale)
+    film_7 = FiLM{7}()
+    (h_7, state_7) = model.layer_7(x_7, params.layer_7, states.layer_7)
+    x_8 = film_7(h_7, params_film, scale_film, activation)
 
     # layer 8
-    h, st_l8 = m.l8(h, ps.l8, st.l8)
-    h = _apply_film!(h, film_params, 8, m.act, m.film_scale)
+    film_8 = FiLM{8}()
+    (h_8, state_8) = model.layer_8(x_8, params.layer_8, states.layer_8)
+    x_out = film_8(h_8, params_film, scale_film, activation)
 
     # output
-    y, st_out = m.out(h, ps.out, st.out)
+    (sdf, state_out) = model.out(x_out, params.out, states.out)
+    sdf_clamped = @. scale_output * tanh(sdf)
 
-    st_new = (
-        posenc = st_pe,
-        film   = st_film,
-        l1 = st_l1, l2 = st_l2, l3 = st_l3, l4 = st_l4,
-        l5 = st_l5, l6 = st_l6, l7 = st_l7, l8 = st_l8,
-        out = st_out
+    states_out = (;
+        pos_encoder = state_enc,
+        film = state_film,
+        layer_1 = state_1,
+        layer_2 = state_2,
+        layer_3 = state_3,
+        layer_4 = state_4,
+        layer_5 = state_5,
+        layer_6 = state_6,
+        layer_7 = state_7,
+        layer_8 = state_8,
+        out = state_out
     )
-    return y, st_new
+    return (sdf_clamped, states_out)
 end
 
+#######################   Loss: Truncated L₁ SDF + Eikonal Regularization   #######################
 
-# --------------------------
-# Objective: Truncated L1 SDF + Eikonal
-# --------------------------
-
+struct SDFEikonalLoss
+    weight_eik::Float32   # weight for eikonal regularization term
+end
 """
-Objective callable for Lux.Training.single_train_step!
+Loss function callable for Lux.Training.single_train_step!
 
 Expected data tuple: (x_sdf, d_sdf, x_eik, p)
-- x_sdf: 3×Nsdf   points with ground-truth SDF values
-- d_sdf: 1×Nsdf
-- x_eik: 3×Neik   points for eikonal term (no GT needed)
-- p:     4×1      shape parameters for the object
+- x_sdf: 3 × n_sdf  points with ground-truth SDF values
+- d_sdf: 1 × n_sdf
+- x_eik: 3 × n_eik  points for eikonal term (no GT needed)
+- p:     4 × 1      shape parameters for the object
 """
-struct SDFEikonalObjective{T}
-    trunc::T        # truncation distance (e.g. 0.05..0.2 in your normalized units)
-    λ_eik::T        # weight for eikonal term
-end
-
-function (obj::SDFEikonalObjective)(model, ps, st, data)
-    x_sdf, d_sdf, x_eik, p = data
-
-    smodel = Lux.StatefulLuxLayer(model, ps, st)
-
-    # SDF regression (truncated L1 via clamping)
-    d̂ = smodel((x_sdf, p))                      # 1×Nsdf
-    τ = obj.trunc
-    d̂c = clamp.(d̂, -τ, τ)
-    dc  = clamp.(d_sdf, -τ, τ)
-    sdf_loss = mean(abs, d̂c .- dc)
-
-    # Eikonal: ||∇_x f|| ≈ 1
-    # Gradient wrt x of sum(f(x)) gives 3×Neik
-    g = Enzyme.gradient(Enzyme.Reverse,
-                        sum ∘ (x -> smodel((x, p))),
-                        x_eik)[1]
-
-    # Norm per point
-    # dims=1 => (1×Neik)
-    epsv = eps(eltype(g))
-    grad_norm = sqrt.(sum(abs2, g; dims=1) .+ epsv)
-    eik_loss = mean(abs2, grad_norm .- one(eltype(grad_norm)))
-
-    loss = sdf_loss + obj.λ_eik * eik_loss
-    return loss, smodel.st, (; sdf_loss, eik_loss)
-end
-
-
-# --------------------------
-# Training helper (skeleton)
-# --------------------------
-
-"""
-Train for `nsteps` iterations.
-
-You must provide `sample_batch()` which returns:
-    x_sdf::Matrix{Float32} (3×Nsdf),
-    d_sdf::Matrix{Float32} (1×Nsdf),
-    x_eik::Matrix{Float32} (3×Neik),
-    p::Matrix{Float32}     (4×1)
-
-Important for Reactant compilation:
-- Keep Nsdf and Neik constant (static shapes), otherwise XLA will recompile or fail.
-"""
-function train!(
-    model,
-    train_state::Lux.Training.TrainState,
-    sample_batch::Function;
-    nsteps::Int = 10_000,
-    log_every::Int = 100,
-    trunc::Float32 = 0.1f0,
-    λ_eik::Float32 = 0.1f0,
-    device = reactant_device(; force=true),
+function (loss::SDFEikonalLoss)(
+    model::ConditionalSDF, params::NamedTuple, states::NamedTuple, data::NTuple{4}
 )
-    obj = SDFEikonalObjective(trunc, λ_eik)
+    λ = loss.weight_eik
+    (x_sdf, sdf, x_eik, p) = data
+    n_eik = size(x_eik, 2)
 
-    for step in 1:nsteps
-        # Sample on CPU (your code), then move to Reactant device
-        data_cpu = sample_batch()
-        data = data_cpu |> device
+    # SDF L₁ regression pass
+    (sdf_hat, states_out) = Lux.apply(model, (x_sdf, p), params, states)
+    loss_sdf = mean(abs.(sdf_hat .- sdf))
 
-        # One compiled training step (AutoEnzyme + Reactant)
-        _, loss, stats, train_state = Lux.Training.single_train_step!(
-            Lux.AutoEnzyme(),
-            obj,
-            data,
-            train_state;
-            return_gradients = Val(false),
-        )
+    # Eikonal regularization term via Vector-Jacobian Product (VJP) AD
+    # freeze states as we don't want to update it during eikonal regularization pass
+    states_eik = Lux.testmode(states_out)
 
-        if (step % log_every == 0) || (step == 1)
-            @printf("step %6d | loss %.6e | sdf %.6e | eik %.6e\n",
-                    step, loss, stats.sdf_loss, stats.eik_loss)
-        end
+    # f(x) must return only the primal output (no state threading here)
+    f_x = function (x)
+        (y, _) = Lux.apply(model, (x, p), params, states_eik)   # ignore returned state
+        return y
     end
+    # u must have the same structure/shape/type as the output of f(x_eik), which is (1 × n_eik)
+    # allocate u on the same device as the model outputs
+    u = similar(sdf_hat, 1, n_eik)
+    uno = one(eltype(u))
+    u .= uno
 
-    return train_state
+    # VJP: v = u ⋅ (∂f/∂x)  -> has same shape as x_eik (3 × n_eik)
+    ∇ₓf = Lux.vector_jacobian_product(f_x, AutoEnzyme(), x_eik, u)   # 3 × n_eik
+    norm∇ₓf² = sum(abs2, ∇ₓf; dims=1)           # ||∇ₓf||²             1 × n_eik
+    loss_eik = mean(abs2.(norm∇ₓf² .- 1.0f0))   # (||∇ₓf||² - 1)²
+
+    Σloss = loss_sdf + λ * loss_eik
+    stats = (; loss_sdf, loss_eik)
+    output = (Σloss, states_out, stats)
+    return output
 end
 
 
-# --------------------------
-# Convenience: create TrainState on Reactant device
-# --------------------------
+# 1. canonicalize each mesh
+# 2. compute SDF for canonicalized mesh
+# 3. clamp SDFs to [-δ, δ]
+# 4. save it with JLD2.jl
 
-"""
-Initialize model parameters/states and construct a TrainState on a Reactant device.
-"""
-function init_train_state(model;
-    rng = Random.default_rng(),
-    lr::Float32 = 1e-4f0,
-    device = reactant_device(; force=true),
-)
-    ps, st = Lux.setup(rng, model)
-    ps = ps |> device
-    st = st |> device
-
-    opt = Optimisers.Adam(lr)
-    return Lux.Training.TrainState(model, ps, st, opt)
-end
-
-
-end # module
+# for epoch in epochs
+#     for mesh in meshes
+#         sample 500K points from SDF(mesh) as:
+#           - 40% near surface uniformly
+#           - 20% on the surface uniformly
+#           - 40% globally uniformly
+#     end
+# end
