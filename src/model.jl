@@ -66,7 +66,11 @@ function LuxCore.initialstates(::AbstractRNG, ::LinearXP)
     return (;)
 end
 
-function (layer::LinearXP)(input::NTuple{2}, params::NamedTuple, states::NamedTuple)
+function (layer::LinearXP)(
+    input::Tuple{AbstractArray{Float32}, AbstractArray{Float32}},
+    params::NamedTuple,
+    states::NamedTuple
+)
     (x, p) = input
     y = params.Wx * x .+ params.Wp * p
     return (y, states)
@@ -101,7 +105,11 @@ function LuxCore.initialstates(::AbstractRNG, ::LinearHXP)
     return (;)
 end
 
-function (layer::LinearHXP)(input::NTuple{3}, params::NamedTuple, states::NamedTuple)
+function (layer::LinearHXP)(
+    input::Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}},
+    params::NamedTuple,
+    states::NamedTuple
+)
     (h, x_enc, p) = input
     y = params.Wh * h .+ params.Wx * x_enc .+ params.Wp * p
     return (y, states)
@@ -159,7 +167,7 @@ Build a standard 8 layer FiLM SDF network.
 """
 function ConditionalSDF(;
     activation = swish,
-    num_fourier::Int = 64,
+    num_fourier::Int = 128,
     fourier_scale::Float32 = 10.0f0,
     scale_film::Float32 = 0.1f0,
     dim_p::Int = 4,
@@ -214,7 +222,11 @@ function ConditionalSDF(;
     return film_sdf
 end
 
-function (model::ConditionalSDF)(input::NTuple{2}, params::NamedTuple, states::NamedTuple)
+function (model::ConditionalSDF)(
+    input::Tuple{AbstractArray{Float32}, AbstractArray{Float32}},
+    params::NamedTuple,
+    states::NamedTuple
+)
     activation = model.activation
     scale_film = model.scale_film
     (x, p) = input   # x: 3×N, p: 4×1
@@ -297,21 +309,24 @@ Loss function callable for Lux.Training.single_train_step!
 
 Expected data tuple: (x_sdf, d_sdf, x_eik, p)
 - x_sdf: 3 × n_sdf  points with ground-truth SDF values
-- d_sdf: 1 × n_sdf
+- d_sdf: 1 × n_sdf  clamped ground-truth SDF values
 - x_eik: 3 × n_eik  points for eikonal term (no GT needed)
 - p:     4 × 1      shape parameters for the object
 """
 function (loss::SDFEikonalLoss)(
-    model::ConditionalSDF, params::NamedTuple, states::NamedTuple, data::NTuple{4}
+    model::ConditionalSDF,
+    params::NamedTuple,
+    states::NamedTuple,
+    data::Tuple{AbstractArray{Float32}, AbstractArray{Float32}, AbstractArray{Float32}, AbstractArray{Float32}}
 )
     δ = loss.trunc
     λ = loss.weight_eik
-    (x_sdf, sdf, x_eik, p) = data
+    (x_sdf, sdf_clamped, x_eik, p) = data
     n_eik = size(x_eik, 2)
 
     # SDF L₁ regression pass
     (sdf_hat, states_out) = Lux.apply(model, (x_sdf, p), params, states)
-    loss_sdf = mean(abs.(clamp.(sdf_hat, -δ, δ) .- clamp.(sdf, -δ, δ)))
+    loss_sdf = mean(abs.(clamp.(sdf_hat, -δ, δ) .- sdf_clamped))
 
     # Eikonal regularization term via Vector-Jacobian Product (VJP) AD
     # freeze states as we don't want to update it during eikonal regularization pass
@@ -324,12 +339,15 @@ function (loss::SDFEikonalLoss)(
     end
     # u must have the same structure/shape/type as the output of f(x_eik), which is (1 × n_eik)
     # allocate u on the same device as the model outputs
-    u = ones(gpu_device(sdf_hat), 1, n_eik)
+    u = similar(sdf_hat, 1, n_eik)
+    uno = one(eltype(u))
+    fill!(u, uno)
 
     # VJP: v = u ⋅ (∂f/∂x)  -> has same shape as x_eik (3 × n_eik)
     ∇ₓf = Lux.vector_jacobian_product(f_x, AutoEnzyme(), x_eik, u)   # 3 × n_eik
     norm∇ₓf² = sum(abs2, ∇ₓf; dims=1)           #  ‖∇ₓf‖²              1 × n_eik
-    loss_eik = mean(abs.(norm∇ₓf² .- 1.0f0))    # |‖∇ₓf‖² - 1|
+    ε = 1.0f-8
+    loss_eik = mean(abs2.(sqrt.(norm∇ₓf² .+ ε) .- 1.0f0))    # (√(‖∇ₓf‖² + ε) - 1)²
 
     Σloss = loss_sdf + λ * loss_eik
     stats = (; loss_sdf, loss_eik)
@@ -345,8 +363,18 @@ end
 # for epoch in epochs
 #     for mesh in meshes
 #         sample 500K points from SDF(mesh) as:
-#           - 40% near surface uniformly
+#           - 50% band near surface uniformly
+#               - 20% very close to surface uniformly
+#               - 30% above the inner band but below the outer band uniformly
 #           - 20% on the surface uniformly
-#           - 40% globally uniformly
+#           - 30% globally uniformly
 #     end
 # end
+
+
+struct Data
+    sdf::Array{Float32, 3}
+    vertices
+    triangles
+    weights::Vector{Float32}   # probability mass of each triangle face proportional to its area
+end
