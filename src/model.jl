@@ -139,7 +139,6 @@ struct ConditionalSDF{A,PE,FiLM,L1,L2,L3,L4,L5,L6,L7,L8,Out} <: LuxCore.Abstract
     dim_hidden::Int
     num_hidden::Int
     scale_film::Float32
-    scale_output::Float32
     activation::A
 
     pos_encoder::PE
@@ -163,7 +162,6 @@ function ConditionalSDF(;
     num_fourier::Int = 64,
     fourier_scale::Float32 = 10.0f0,
     scale_film::Float32 = 0.1f0,
-    scale_output::Float32 = 0.1f0,
     dim_p::Int = 4,
     dim_hidden::Int = 256,
     dim_film::Int = 128
@@ -200,7 +198,6 @@ function ConditionalSDF(;
         dim_hidden,
         num_hidden,
         scale_film,
-        scale_output,
         activation,
         pos_encoder,
         film,
@@ -220,7 +217,6 @@ end
 function (model::ConditionalSDF)(input::NTuple{2}, params::NamedTuple, states::NamedTuple)
     activation = model.activation
     scale_film = model.scale_film
-    scale_output = model.scale_output
     (x, p) = input   # x: 3×N, p: 4×1
 
     # positional encoding
@@ -272,7 +268,6 @@ function (model::ConditionalSDF)(input::NTuple{2}, params::NamedTuple, states::N
 
     # output
     (sdf, state_out) = model.out(x_out, params.out, states.out)
-    sdf_clamped = @. scale_output * tanh(sdf)
 
     states_out = (;
         pos_encoder = state_enc,
@@ -287,12 +282,13 @@ function (model::ConditionalSDF)(input::NTuple{2}, params::NamedTuple, states::N
         layer_8 = state_8,
         out = state_out
     )
-    return (sdf_clamped, states_out)
+    return (sdf, states_out)
 end
 
 #######################   Loss: Truncated L₁ SDF + Eikonal Regularization   #######################
 
 struct SDFEikonalLoss
+    trunc::Float32        # truncation distance (e.g. 0.05..0.2 in normalized units)
     weight_eik::Float32   # weight for eikonal regularization term
 end
 
@@ -308,13 +304,14 @@ Expected data tuple: (x_sdf, d_sdf, x_eik, p)
 function (loss::SDFEikonalLoss)(
     model::ConditionalSDF, params::NamedTuple, states::NamedTuple, data::NTuple{4}
 )
+    δ = loss.trunc
     λ = loss.weight_eik
     (x_sdf, sdf, x_eik, p) = data
     n_eik = size(x_eik, 2)
 
     # SDF L₁ regression pass
     (sdf_hat, states_out) = Lux.apply(model, (x_sdf, p), params, states)
-    loss_sdf = mean(abs.(sdf_hat .- sdf))
+    loss_sdf = mean(abs.(clamp.(sdf_hat, -δ, δ) .- clamp.(sdf, -δ, δ)))
 
     # Eikonal regularization term via Vector-Jacobian Product (VJP) AD
     # freeze states as we don't want to update it during eikonal regularization pass
@@ -327,8 +324,7 @@ function (loss::SDFEikonalLoss)(
     end
     # u must have the same structure/shape/type as the output of f(x_eik), which is (1 × n_eik)
     # allocate u on the same device as the model outputs
-    u = one(eltype(sdf_hat)) .* Reactant.ones(Float32, 1, n_eik)
-    # u = ones(gpu_device(sdf_hat), 1, n_eik)
+    u = ones(gpu_device(sdf_hat), 1, n_eik)
 
     # VJP: v = u ⋅ (∂f/∂x)  -> has same shape as x_eik (3 × n_eik)
     ∇ₓf = Lux.vector_jacobian_product(f_x, AutoEnzyme(), x_eik, u)   # 3 × n_eik
@@ -340,7 +336,6 @@ function (loss::SDFEikonalLoss)(
     output = (Σloss, states_out, stats)
     return output
 end
-
 
 # 1. canonicalize each mesh
 # 2. compute SDF for canonicalized mesh
