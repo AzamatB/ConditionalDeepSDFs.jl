@@ -58,8 +58,7 @@ function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearXP)
     dim_out = layer.dim_out
     return (;
         Wx = glorot_uniform(rng, dim_out, layer.dim_x_in),
-        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in),
-        b  = zeros(Float32, dim_out, 1)
+        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
     )
 end
 
@@ -69,7 +68,7 @@ end
 
 function (layer::LinearXP)(input::NTuple{2}, params::NamedTuple, states::NamedTuple)
     (x, p) = input
-    y = params.Wx * x .+ params.Wp * p .+ params.b
+    y = params.Wx * x .+ params.Wp * p
     return (y, states)
 end
 
@@ -94,8 +93,7 @@ function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearHXP)
     return (;
         Wh = glorot_uniform(rng, dim_out, layer.dim_h_in),
         Wx = glorot_uniform(rng, dim_out, layer.dim_x_in),
-        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in),
-        b  = zeros(Float32, dim_out, 1)
+        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
     )
 end
 
@@ -105,7 +103,7 @@ end
 
 function (layer::LinearHXP)(input::NTuple{3}, params::NamedTuple, states::NamedTuple)
     (h, x_enc, p) = input
-    y = params.Wh * h .+ params.Wx * x_enc .+ params.Wp * p .+ params.b
+    y = params.Wh * h .+ params.Wx * x_enc .+ params.Wp * p
     return (y, states)
 end
 
@@ -187,15 +185,15 @@ function ConditionalSDF(;
     # layer_1 consumes (x_enc, p) without explicitly tiling p
     layer_1 = LinearXP(dim_x_enc, dim_p, dim_hidden)
     # middle layers are standard dense (identity activation, as we apply activation ourselves after FiLM)
-    layer_2 = Dense(dim_hidden => dim_hidden)
-    layer_3 = Dense(dim_hidden => dim_hidden)
-    layer_4 = Dense(dim_hidden => dim_hidden)
+    layer_2 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
+    layer_3 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
+    layer_4 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
     # skip layer mixes (h, x_enc, p) again
     layer_5 = LinearHXP(dim_hidden, dim_x_enc, dim_p, dim_hidden)
     # final layers
-    layer_6 = Dense(dim_hidden => dim_hidden)
-    layer_7 = Dense(dim_hidden => dim_hidden)
-    layer_8 = Dense(dim_hidden => dim_hidden)
+    layer_6 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
+    layer_7 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
+    layer_8 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
 
     out = Dense(dim_hidden => 1)
     film_sdf = ConditionalSDF(
@@ -329,14 +327,13 @@ function (loss::SDFEikonalLoss)(
     end
     # u must have the same structure/shape/type as the output of f(x_eik), which is (1 × n_eik)
     # allocate u on the same device as the model outputs
-    u = similar(sdf_hat, 1, n_eik)
-    uno = one(eltype(u))
-    u .= uno
+    u = one(eltype(sdf_hat)) .* Reactant.ones(Float32, 1, n_eik)
+    # u = ones(gpu_device(sdf_hat), 1, n_eik)
 
     # VJP: v = u ⋅ (∂f/∂x)  -> has same shape as x_eik (3 × n_eik)
     ∇ₓf = Lux.vector_jacobian_product(f_x, AutoEnzyme(), x_eik, u)   # 3 × n_eik
-    norm∇ₓf² = sum(abs2, ∇ₓf; dims=1)           # ||∇ₓf||²             1 × n_eik
-    loss_eik = mean(abs2.(norm∇ₓf² .- 1.0f0))   # (||∇ₓf||² - 1)²
+    norm∇ₓf² = sum(abs2, ∇ₓf; dims=1)           #  ‖∇ₓf‖²              1 × n_eik
+    loss_eik = mean(abs.(norm∇ₓf² .- 1.0f0))    # |‖∇ₓf‖² - 1|
 
     Σloss = loss_sdf + λ * loss_eik
     stats = (; loss_sdf, loss_eik)
