@@ -297,6 +297,7 @@ end
 struct SDFEikonalLoss
     weight_eik::Float32   # weight for eikonal regularization term
 end
+
 """
 Loss function callable for Lux.Training.single_train_step!
 
