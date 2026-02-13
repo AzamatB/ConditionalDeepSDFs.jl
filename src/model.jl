@@ -352,19 +352,3 @@ function (loss::SDFEikonalLoss)(
     output = (Σloss, states_out, stats)
     return output
 end
-
-# 1. canonicalize each mesh
-# 2. compute SDF for canonicalized mesh
-# 3. clamp SDFs to [-δ, δ]
-# 4. save it with JLD2.jl
-
-# for epoch in epochs
-#     for mesh in meshes
-#         sample 500K points from SDF(mesh) as:
-#           - 50% band near surface uniformly
-#               - 20% very close to surface uniformly
-#               - 30% above the inner band but below the outer band uniformly
-#           - 20% on the surface uniformly
-#           - 30% globally uniformly
-#     end
-# end
