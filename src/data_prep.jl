@@ -1,0 +1,293 @@
+using Distributions
+using GeometryBasics
+using LinearAlgebra
+using Random
+
+########################################   MeshSDFSampler   ########################################
+
+"""
+Area-weighted surface sampler.
+"""
+struct MeshSDFSampler
+    vertices::Vector{Point3f}
+    triangles::Vector{GLTriangleFace}
+    # area-weighted categorical distribution over triangle faces
+    distribution::Categorical{Float32,Vector{Float32}}
+    sdf::Array{Float32,3}
+    resolution::Int
+    # sdf grid mapping
+    bbox_min::Point3f
+    bbox_max::Point3f
+    # shape parameters
+    parameters::Point4f
+end
+
+function MeshSDFSampler(mesh::Mesh, parameters::Point4f; resolution::Int=256)
+    mesh = canonicalize(mesh)
+    vertices = coordinates(mesh)
+    triangles = faces(mesh)
+    sdf = construct_sdf(mesh, resolution)
+    distribution = construct_triangle_distribution(vertices, triangles)
+    (bbox_min, bbox_max) = compute_bounding_box(vertices)
+    mesh_sampler = MeshSDFSampler(
+        vertices, triangles, distribution, sdf, resolution, bbox_min, bbox_max, parameters
+    )
+    return mesh_sampler
+end
+
+function construct_triangle_distribution(
+    vertices::Vector{Point3f}, triangles::Vector{GLTriangleFace}
+)
+    num_faces = length(triangles)
+    weights = Vector{Float32}(undef, num_faces)
+
+    @inbounds for index in eachindex(triangles)
+        (i, j, k) = triangles[index]
+        vertex_a = vertices[i]
+        edge_1 = vertices[j] - vertex_a
+        edge_2 = vertices[k] - vertex_a
+        double_area = norm(edge_1 × edge_2)
+        weights[index] = double_area
+    end
+
+    Σweights = sum(weights)
+    @assert (Σweights > 0.0f0) "Mesh has zero total surface area"
+    weights ./= Σweights
+    return Categorical(weights)
+end
+
+function compute_bounding_box(vertices::Vector{Point3f})
+    @assert !isempty(vertices)
+    vertex = first(vertices)
+    x_min = x_max = vertex[1]
+    y_min = y_max = vertex[2]
+    z_min = z_max = vertex[3]
+
+    @inbounds for vertex in vertices
+        (x, y, z) = vertex
+        x_min = min(x_min, x)
+        x_max = max(x_max, x)
+        y_min = min(y_min, y)
+        y_max = max(y_max, y)
+        z_min = min(z_min, z)
+        z_max = max(z_max, z)
+    end
+
+    bbox_min = Point3f(x_min, y_min, z_min)
+    bbox_max = Point3f(x_max, y_max, z_max)
+    return (bbox_min, bbox_max)
+end
+
+########################################   Sampling APIs   ########################################
+
+@inline function sample_mesh_surface(
+    vertices::Vector{Point3f},
+    triangles::Vector{GLTriangleFace},
+    cat_dist::Categorical{Float32,Vector{Float32}},
+    rng::AbstractRNG
+)
+    # sample a triangle face
+    index = rand(rng, cat_dist)
+    @inbounds begin
+        (i, j, k) = triangles[index]
+        vertex_a = vertices[i]
+        vertex_b = vertices[j]
+        vertex_c = vertices[k]
+    end
+    u = √(rand(rng, Float32))
+    v = rand(rng, Float32)
+
+    w_a = 1.0f0 - u
+    w_b = u * (1.0f0 - v)
+    w_c = u * v
+    point = w_a * vertex_a + w_b * vertex_b + w_c * vertex_c
+    return point
+end
+
+@inline function sample_mesh_surface!(
+    points::AbstractMatrix{Float32},
+    vertices::Vector{Point3f},
+    triangles::Vector{GLTriangleFace},
+    cat_dist::Categorical{Float32,Vector{Float32}},
+    rng::AbstractRNG
+)
+    @assert size(points, 1) == 3
+    @inbounds for j in axes(points, 2)
+        (x, y, z) = sample_mesh_surface(vertices, triangles, cat_dist, rng)
+        points[1, j] = x
+        points[2, j] = y
+        points[3, j] = z
+    end
+    return points
+end
+
+@inline function sample_near_mesh_surface!(
+    points::AbstractMatrix{Float32},
+    vertices::Vector{Point3f},
+    triangles::Vector{GLTriangleFace},
+    cat_dist::Categorical{Float32,Vector{Float32}},
+    σ::Float32,
+    rng::AbstractRNG
+)
+    @assert size(points, 1) == 3
+    @inbounds for j in axes(points, 2)
+        (x, y, z) = sample_mesh_surface(vertices, triangles, cat_dist, rng)
+        points[1, j] = perturb(x, σ, rng)
+        points[2, j] = perturb(y, σ, rng)
+        points[3, j] = perturb(z, σ, rng)
+    end
+    return points
+end
+
+# add Gaussian noise to the x, while keeping it inside [-1, 1]
+@inline function perturb(x::Float32, σ::Float32, rng::AbstractRNG)
+    while true
+        x̃ = x + σ * randn(rng, Float32)
+        (abs(x̃) > 1.0f0) || return x̃
+    end
+end
+
+# populate `points` with samples uniformly distributed in [-1, 1]
+@inline function sample_globally!(points::AbstractMatrix{Float32}, rng::AbstractRNG)
+    @assert size(points, 1) == 3
+    rand!(rng, points)                   # U[0,1)
+    @. points = 2.0f0 * points - 1.0f0   # U[-1,1)
+    return points
+end
+
+@inbounds function sample_sdf_points(
+    mesh_sampler::MeshSDFSampler,
+    num_samples::Int=262_144,
+    ratio_eikonal::Float32=0.3f0,
+    rng::AbstractRNG=Random.default_rng();
+    clamp_voxel_threshold::Int=16,
+    eikonal_voxel_threshold::Int=2,
+    splits::NamedTuple{(:surface, :band, :volume),NTuple{3,Float32}}=(; surface=0.2f0, band=0.7f0, volume=0.1f0),
+    splits_band::NTuple{N,Float32}=(0.35f0, 0.3f0, 0.2f0, 0.15f0),
+    voxel_σs::NTuple{N,Int}=(1, 4, 8, 12)
+) where {N}
+    (box_min, box_max) = (-1.0f0, 1.0f0)
+    Δ = box_max - box_min
+    voxel_size = Δ / (mesh_sampler.resolution - 1)
+    τ = voxel_size * eikonal_voxel_threshold
+    clamp_radius = voxel_size * clamp_voxel_threshold
+    σs = voxel_size .* voxel_σs
+
+    # split points into 3 groups:
+    # (1) on the mesh surface, (2) in the band around the mesh surface, (3) globally in the volume
+    (slice_surface, slice_band, slice_volume) = partition_slice(1:num_samples, splits)
+    subslices_band = partition_slice(slice_band, splits_band)
+    slice_off_surface = first(slice_band):num_samples
+    num_eikonal = floor(Int, num_samples * ratio_eikonal)
+
+    points = Matrix{Float32}(undef, 3, num_samples)
+    points_surface = @view points[:, slice_surface]
+    points_off_surface = @view points[:, slice_off_surface]
+    points_volume = @view points[:, slice_volume]
+
+    vertices = mesh_sampler.vertices
+    triangles = mesh_sampler.triangles
+    cat_dist = mesh_sampler.distribution
+    sdf = mesh_sampler.sdf
+
+    sample_mesh_surface!(points_surface, vertices, triangles, cat_dist, rng)
+    sample_globally!(points_volume, rng)
+    for i in 1:N
+        σ = σs[i]
+        slice = subslices_band[i]
+        points_band = @view points[:, slice]
+        sample_near_mesh_surface!(points_band, vertices, triangles, cat_dist, σ, rng)
+    end
+
+    # compute corresponding signed distances via trilinear interpolation
+    (n_x, n_y, n_z) = size(sdf) .- 1
+    δ_x = Δ / n_x
+    δ_y = Δ / n_y
+    δ_z = Δ / n_z
+    neg_clamp_radius = -clamp_radius
+    signed_dists = Vector{Float32}(undef, num_samples)
+    signed_dists[slice_surface] .= 0.0f0
+    Threads.@threads for j in slice_off_surface
+        signed_dist = trilerp_sdf(
+            sdf, points[1, j], points[2, j], points[3, j], δ_x, δ_y, δ_z, n_x, n_y, n_z
+        )
+        signed_dists[j] = clamp(signed_dist, neg_clamp_radius, clamp_radius)
+    end
+
+    # select the subset of eikonal points; skip points on the surface without even checking them
+    signed_dists_off_surface = @view signed_dists[slice_off_surface]
+    indices_eikonal = findall(sd -> abs(sd) > τ, signed_dists_off_surface)
+    take_random_subset!(indices_eikonal, num_eikonal, rng)
+    points_eikonal = points_off_surface[:, indices_eikonal]
+    signed_dists_mat = reshape(signed_dists, 1, num_samples)
+    return (points, signed_dists_mat, points_eikonal)
+end
+
+"""
+Trilinear interpolation of `sdf` on a grid spanning [-1, 1] (node-centered).
+"""
+@inbounds function trilerp_sdf(
+    sdf::DenseArray{Float32,3},
+    x::Float32, y::Float32, z::Float32,
+    δ_x::Float32, δ_y::Float32, δ_z::Float32,
+    n_x::Int, n_y::Int, n_z::Int
+)
+    f_x = (x + 1.0f0) / δ_x + 1.0f0
+    f_y = (y + 1.0f0) / δ_y + 1.0f0
+    f_z = (z + 1.0f0) / δ_z + 1.0f0
+
+    i = clamp(floor(Int, f_x), 1, n_x)
+    j = clamp(floor(Int, f_y), 1, n_y)
+    k = clamp(floor(Int, f_z), 1, n_z)
+
+    t_x = f_x - Float32(i)
+    t_y = f_y - Float32(j)
+    t_z = f_z - Float32(k)
+
+    v_000 = sdf[i, j, k]
+    v_100 = sdf[i+1, j, k]
+    v_010 = sdf[i, j+1, k]
+    v_110 = sdf[i+1, j+1, k]
+    v_001 = sdf[i, j, k+1]
+    v_101 = sdf[i+1, j, k+1]
+    v_011 = sdf[i, j+1, k+1]
+    v_111 = sdf[i+1, j+1, k+1]
+
+    v_00 = (1.0f0 - t_x) * v_000 + t_x * v_100
+    v_10 = (1.0f0 - t_x) * v_010 + t_x * v_110
+    v_01 = (1.0f0 - t_x) * v_001 + t_x * v_101
+    v_11 = (1.0f0 - t_x) * v_011 + t_x * v_111
+    v_0 = (1.0f0 - t_y) * v_00 + t_y * v_10
+    v_1 = (1.0f0 - t_y) * v_01 + t_y * v_11
+    v = (1.0f0 - t_z) * v_0 + t_z * v_1
+    return v::Float32
+end
+
+function partition_slice(
+    slice::AbstractUnitRange{Int},
+    splits::Union{NamedTuple{<:Any,NTuple{N,Float32}},NTuple{N,Float32}}
+) where {N}
+    @assert isone(sum(splits))
+    @assert all(>(0.0f0), splits)
+    n = length(slice)
+    Σsplits = cumsum(Tuple(splits))
+    endpoints = round.(Int, Σsplits .* n)
+    # new tuple with last = n
+    endpoints = Base.setindex(endpoints, n, N)
+    starts = ntuple(i -> i == 1 ? 1 : endpoints[i-1] + 1, Val(N))
+    fn = (s, e) -> slice[s:e]
+    partition = fn.(starts, endpoints)
+    return partition
+end
+
+# partial Fisher–Yates shuffle
+@inline function take_random_subset!(indices::Vector{Int}, k::Int, rng::AbstractRNG)
+    n = length(indices)
+    (k < n) || return indices
+    @inbounds for i in 1:k
+        j = rand(rng, i:n)
+        (indices[i], indices[j]) = (indices[j], indices[i])
+    end
+    resize!(indices, k)
+    return indices
+end

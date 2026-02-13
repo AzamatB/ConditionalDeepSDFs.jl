@@ -56,10 +56,9 @@ end
 
 function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearXP)
     dim_out = layer.dim_out
-    return (;
-        Wx = glorot_uniform(rng, dim_out, layer.dim_x_in),
-        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
-    )
+    Wx = glorot_uniform(rng, dim_out, layer.dim_x_in)
+    Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
+    return (; Wx, Wp)
 end
 
 function LuxCore.initialstates(::AbstractRNG, ::LinearXP)
@@ -67,7 +66,7 @@ function LuxCore.initialstates(::AbstractRNG, ::LinearXP)
 end
 
 function (layer::LinearXP)(
-    input::Tuple{AbstractArray{Float32}, AbstractArray{Float32}},
+    input::Tuple{AbstractArray{Float32},AbstractArray{Float32}},
     params::NamedTuple,
     states::NamedTuple
 )
@@ -94,11 +93,10 @@ end
 
 function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearHXP)
     dim_out = layer.dim_out
-    return (;
-        Wh = glorot_uniform(rng, dim_out, layer.dim_h_in),
-        Wx = glorot_uniform(rng, dim_out, layer.dim_x_in),
-        Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
-    )
+    Wh = glorot_uniform(rng, dim_out, layer.dim_h_in)
+    Wx = glorot_uniform(rng, dim_out, layer.dim_x_in)
+    Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
+    return (; Wh, Wx, Wp)
 end
 
 function LuxCore.initialstates(::AbstractRNG, ::LinearHXP)
@@ -166,13 +164,13 @@ end
 Build a standard 8 layer FiLM SDF network.
 """
 function ConditionalSDF(;
-    activation = swish,
-    num_fourier::Int = 128,
-    fourier_scale::Float32 = 10.0f0,
-    scale_film::Float32 = 0.1f0,
-    dim_p::Int = 4,
-    dim_hidden::Int = 256,
-    dim_film::Int = 128
+    activation=swish,
+    num_fourier::Int=128,
+    fourier_scale::Float32=10.0f0,
+    scale_film::Float32=0.1f0,
+    dim_p::Int=4,
+    dim_hidden::Int=512,
+    dim_film::Int=128
 )
     # Fourier feature output dimension
     num_hidden = 8
@@ -223,7 +221,7 @@ function ConditionalSDF(;
 end
 
 function (model::ConditionalSDF)(
-    input::Tuple{AbstractArray{Float32}, AbstractArray{Float32}},
+    input::Tuple{AbstractArray{Float32},AbstractArray{Float32}},
     params::NamedTuple,
     states::NamedTuple
 )
@@ -282,17 +280,17 @@ function (model::ConditionalSDF)(
     (sdf, state_out) = model.out(x_out, params.out, states.out)
 
     states_out = (;
-        pos_encoder = state_enc,
-        film = state_film,
-        layer_1 = state_1,
-        layer_2 = state_2,
-        layer_3 = state_3,
-        layer_4 = state_4,
-        layer_5 = state_5,
-        layer_6 = state_6,
-        layer_7 = state_7,
-        layer_8 = state_8,
-        out = state_out
+        pos_encoder=state_enc,
+        film=state_film,
+        layer_1=state_1,
+        layer_2=state_2,
+        layer_3=state_3,
+        layer_4=state_4,
+        layer_5=state_5,
+        layer_6=state_6,
+        layer_7=state_7,
+        layer_8=state_8,
+        out=state_out
     )
     return (sdf, states_out)
 end
@@ -307,17 +305,17 @@ end
 """
 Loss function callable for Lux.Training.single_train_step!
 
-Expected data tuple: (x_sdf, d_sdf, x_eik, p)
-- x_sdf: 3 × n_sdf  points with ground-truth SDF values
-- d_sdf: 1 × n_sdf  clamped ground-truth SDF values
-- x_eik: 3 × n_eik  points for eikonal term (no GT needed)
-- p:     4 × 1      shape parameters for the object
+Expected data tuple: (x_sdf, sdf_clamped, x_eik, p)
+- x_sdf:        3 × n_sdf  points with ground-truth SDF values
+- sdf_clamped:  1 × n_sdf  clamped ground-truth SDF values
+- x_eik:        3 × n_eik  points for eikonal term (no GT needed)
+- p:            4 × 1      shape parameters for the object
 """
 function (loss::SDFEikonalLoss)(
     model::ConditionalSDF,
     params::NamedTuple,
     states::NamedTuple,
-    data::Tuple{AbstractArray{Float32}, AbstractArray{Float32}, AbstractArray{Float32}, AbstractArray{Float32}}
+    data::Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}}
 )
     δ = loss.trunc
     λ = loss.weight_eik
@@ -370,11 +368,3 @@ end
 #           - 30% globally uniformly
 #     end
 # end
-
-
-struct Data
-    sdf::Array{Float32, 3}
-    vertices
-    triangles
-    weights::Vector{Float32}   # probability mass of each triangle face proportional to its area
-end

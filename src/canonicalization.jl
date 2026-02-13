@@ -446,11 +446,11 @@ function align_and_rescale(vertices::Vector{Point3f})
     vertices_mat_rotated = rotation' * vertices_mat
     # 3×N Matrix -> Vector{Point3f}
     vertices_rotated = reinterpret(reshape, Point3f, vertices_mat_rotated)
-    # step 4: scale to unit sphere
+    # step 4: scale to fit the sphere of radius 0.9
     distances² = sum(abs2, vertices_mat_rotated; dims=1)
     radius_max = √(maximum(distances²))
     is_zero = iszero(radius_max)
-    scale = 1.0f0 / (radius_max + is_zero)
+    scale = 0.9f0 / (radius_max + is_zero)
 
     vertices_normalized = scale * vertices_rotated
     return vertices_normalized::Vector{Point3f}
