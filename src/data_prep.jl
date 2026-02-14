@@ -2,6 +2,7 @@ using Distributions
 using GeometryBasics
 using LinearAlgebra
 using Random
+using Lux
 
 ########################################   MeshSDFSampler   ########################################
 
@@ -304,7 +305,7 @@ end
 """
 Trilinear interpolation of `sdf` on a grid spanning [-1, 1] (node-centered).
 """
-@inbounds function trilerp_sdf(
+function trilerp_sdf(
     sdf::DenseArray{Float32,3},
     x::Float32, y::Float32, z::Float32,
     δ_x::Float32, δ_y::Float32, δ_z::Float32,
@@ -322,14 +323,16 @@ Trilinear interpolation of `sdf` on a grid spanning [-1, 1] (node-centered).
     t_y = f_y - Float32(j)
     t_z = f_z - Float32(k)
 
-    v_000 = sdf[i, j, k]
-    v_100 = sdf[i+1, j, k]
-    v_010 = sdf[i, j+1, k]
-    v_110 = sdf[i+1, j+1, k]
-    v_001 = sdf[i, j, k+1]
-    v_101 = sdf[i+1, j, k+1]
-    v_011 = sdf[i, j+1, k+1]
-    v_111 = sdf[i+1, j+1, k+1]
+    @inbounds begin
+        v_000 = sdf[i, j, k]
+        v_100 = sdf[i+1, j, k]
+        v_010 = sdf[i, j+1, k]
+        v_110 = sdf[i+1, j+1, k]
+        v_001 = sdf[i, j, k+1]
+        v_101 = sdf[i+1, j, k+1]
+        v_011 = sdf[i, j+1, k+1]
+        v_111 = sdf[i+1, j+1, k+1]
+    end
 
     v_00 = (1.0f0 - t_x) * v_000 + t_x * v_100
     v_10 = (1.0f0 - t_x) * v_010 + t_x * v_110
