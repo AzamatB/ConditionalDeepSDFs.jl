@@ -361,7 +361,7 @@ function evaluate_dataset_loss(
     params::NamedTuple,
     states::NamedTuple,
     mesh_samplers::Vector{MeshSampler},
-    sampling_params::SamplingParameters{N},
+    sampling_params::SamplingParameters
 )
     δ = sampling_params.threshold_clamp
     loss = 0.0f0

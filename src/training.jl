@@ -78,9 +78,11 @@ function train_model(
 
     # precompile model for validation evaluation
     evaluate_dataset_loss_compiled = @compile evaluate_dataset_loss(
-        model, params, states, mesh_samplers_val
+        model, params, states, mesh_samplers_val, sampling_params
     )
-    loss_val_min = evaluate_dataset_loss_compiled(model, params, states, mesh_samplers_val)
+    loss_val_min = evaluate_dataset_loss_compiled(
+        model, params, states, mesh_samplers_val, sampling_params
+    )
     @printf "Validation loss before training:  %4.6f\n" loss_val_min
 
     @info "Training..."
@@ -98,7 +100,7 @@ function train_model(
 
         # evaluate the model on validation set
         loss_val = evaluate_dataset_loss_compiled(
-            model, train_state.parameters, train_state.states, mesh_samplers_val
+            model, train_state.parameters, train_state.states, mesh_samplers_val, sampling_params
         )
         @printf "Epoch [%3d]: Validation loss  %4.6f\n" epoch loss_val
         if loss_val < loss_val_min

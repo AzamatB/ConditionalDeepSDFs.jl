@@ -939,5 +939,5 @@ function construct_sdf(
     @cuda threads = blk2 blocks = grd2 finalize_kernel!(
         sdf, d2_grid, parity, origin, step_val, n32, dist_fallback
     )
-    return sdf
+    return Array(sdf)::Array{Float32,3}
 end
