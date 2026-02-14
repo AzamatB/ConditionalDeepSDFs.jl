@@ -58,7 +58,8 @@ function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearXP)
     dim_out = layer.dim_out
     Wx = glorot_uniform(rng, dim_out, layer.dim_x_in)
     Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
-    return (; Wx, Wp)
+    b = zeros(Float32, layer.dim_out)
+    return (; Wx, Wp, b)
 end
 
 function LuxCore.initialstates(::AbstractRNG, ::LinearXP)
@@ -71,7 +72,7 @@ function (layer::LinearXP)(
     states::NamedTuple
 )
     (x, p) = input
-    y = params.Wx * x .+ params.Wp * p
+    y = params.Wx * x .+ params.Wp * p .+ params.b
     return (y, states)
 end
 
@@ -96,7 +97,8 @@ function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearHXP)
     Wh = glorot_uniform(rng, dim_out, layer.dim_h_in)
     Wx = glorot_uniform(rng, dim_out, layer.dim_x_in)
     Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
-    return (; Wh, Wx, Wp)
+    b = zeros(Float32, layer.dim_out)
+    return (; Wh, Wx, Wp, b)
 end
 
 function LuxCore.initialstates(::AbstractRNG, ::LinearHXP)
@@ -109,15 +111,17 @@ function (layer::LinearHXP)(
     states::NamedTuple
 )
     (h, x_enc, p) = input
-    y = params.Wh * h .+ params.Wx * x_enc .+ params.Wp * p
+    y = params.Wh * h .+ params.Wx * x_enc .+ params.Wp * p .+ params.b
     return (y, states)
 end
 
 ###################   FiLM-conditioned SDF Network (8 layers, skip at layer 5)   ###################
 
-struct FiLM{N} end
+struct FiLMBlock{N} end
 
-function (film::FiLM{N})(h, params::AbstractArray{Float32,3}, scale::Float32, activation) where {N}
+function (film_block::FiLMBlock{N})(
+    h, params::AbstractArray{Float32,3}, scale::Float32, activation
+) where {N}
     # FiLM params has shape (dim_hidden, 2, num_hidden)
     γ_raw = params[:, 1:1, N]   # dim_hidden × 1
     β_raw = params[:, 2:2, N]   # dim_hidden × 1
@@ -189,15 +193,15 @@ function ConditionalSDF(;
     # layer_1 consumes (x_enc, p) without explicitly tiling p
     layer_1 = LinearXP(dim_x_enc, dim_p, dim_hidden)
     # middle layers are standard dense (identity activation, as we apply activation ourselves after FiLM)
-    layer_2 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
-    layer_3 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
-    layer_4 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
+    layer_2 = Dense(dim_hidden => dim_hidden)
+    layer_3 = Dense(dim_hidden => dim_hidden)
+    layer_4 = Dense(dim_hidden => dim_hidden)
     # skip layer mixes (h, x_enc, p) again
     layer_5 = LinearHXP(dim_hidden, dim_x_enc, dim_p, dim_hidden)
     # final layers
-    layer_6 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
-    layer_7 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
-    layer_8 = Dense(dim_hidden => dim_hidden; use_bias=Lux.False())
+    layer_6 = Dense(dim_hidden => dim_hidden)
+    layer_7 = Dense(dim_hidden => dim_hidden)
+    layer_8 = Dense(dim_hidden => dim_hidden)
 
     out = Dense(dim_hidden => 1)
     film_sdf = ConditionalSDF(
@@ -237,42 +241,42 @@ function (model::ConditionalSDF)(
     params_film = reshape(out_film, model.dim_hidden, 2, model.num_hidden)
 
     # layer 1: (x_enc, p)
-    film_1 = FiLM{1}()
+    film_1 = FiLMBlock{1}()
     (h_1, state_1) = model.layer_1((x_enc, p), params.layer_1, states.layer_1)
     x_2 = film_1(h_1, params_film, scale_film, activation)
 
     # layer 2
-    film_2 = FiLM{2}()
+    film_2 = FiLMBlock{2}()
     (h_2, state_2) = model.layer_2(x_2, params.layer_2, states.layer_2)
     x_3 = film_2(h_2, params_film, scale_film, activation)
 
     # layer 3
-    film_3 = FiLM{3}()
+    film_3 = FiLMBlock{3}()
     (h_3, state_3) = model.layer_3(x_3, params.layer_3, states.layer_3)
     x_4 = film_3(h_3, params_film, scale_film, activation)
 
     # layer 4
-    film_4 = FiLM{4}()
+    film_4 = FiLMBlock{4}()
     (h_4, state_4) = model.layer_4(x_4, params.layer_4, states.layer_4)
     x_5 = film_4(h_4, params_film, scale_film, activation)
 
     # skip layer 5: (h, x_enc, p)
-    film_5 = FiLM{5}()
+    film_5 = FiLMBlock{5}()
     (h_5, state_5) = model.layer_5((x_5, x_enc, p), params.layer_5, states.layer_5)
     x_6 = film_5(h_5, params_film, scale_film, activation)
 
     # layer 6
-    film_6 = FiLM{6}()
+    film_6 = FiLMBlock{6}()
     (h_6, state_6) = model.layer_6(x_6, params.layer_6, states.layer_6)
     x_7 = film_6(h_6, params_film, scale_film, activation)
 
     # layer 7
-    film_7 = FiLM{7}()
+    film_7 = FiLMBlock{7}()
     (h_7, state_7) = model.layer_7(x_7, params.layer_7, states.layer_7)
     x_8 = film_7(h_7, params_film, scale_film, activation)
 
     # layer 8
-    film_8 = FiLM{8}()
+    film_8 = FiLMBlock{8}()
     (h_8, state_8) = model.layer_8(x_8, params.layer_8, states.layer_8)
     x_out = film_8(h_8, params_film, scale_film, activation)
 
@@ -349,6 +353,26 @@ function (loss::SDFEikonalLoss)(
 
     Σloss = loss_sdf + λ * loss_eik
     stats = (; loss_sdf, loss_eik)
-    output = (Σloss, states_out, stats)
-    return output
+    return (Σloss, states_out, stats)
+end
+
+function evaluate_dataset_loss(
+    model::ConditionalSDF,
+    params::NamedTuple,
+    states::NamedTuple,
+    mesh_samplers::Vector{MeshSampler},
+    sampling_params::SamplingParameters{N},
+)
+    δ = sampling_params.threshold_clamp
+    loss = 0.0f0
+    states_val = Lux.testmode(states)
+    for mesh_sampler in mesh_samplers
+        (xs, sdf_clamped, p) = sample_sdf_points(mesh_sampler, sampling_params)
+        (sdf_hat, _) = model((xs, p), params, states_val)
+        # SDF L₁ regression pass
+        loss_sdf = mean(abs.(clamp.(sdf_hat, -δ, δ) .- sdf_clamped))
+        loss += loss_sdf
+    end
+    loss /= length(mesh_samplers)
+    return loss
 end
