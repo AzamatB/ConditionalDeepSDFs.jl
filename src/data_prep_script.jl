@@ -89,4 +89,4 @@ for (i, (_, (mesh, params))) in enumerate(mesh_dict_2)
     mesh_samplers[offset+i] = MeshSDFSampler(mesh, params)
 end
 
-@save save_path mesh_samplers
+jldsave(save_path; mesh_samplers)
