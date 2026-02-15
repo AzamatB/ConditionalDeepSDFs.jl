@@ -14,10 +14,10 @@ struct MeshSDFSampler
     bbox_min::Point3f
     bbox_max::Point3f
     # shape parameters
-    parameters::Point4f
+    parameters::Vector{Float32}
 end
 
-function MeshSDFSampler(mesh::Mesh, parameters::Point4f; resolution::Int=256)
+function MeshSDFSampler(mesh::Mesh, parameters::Vector{Float32}; resolution::Int=256)
     mesh = canonicalize(mesh)
     vertices = coordinates(mesh)
     triangles = faces(mesh)

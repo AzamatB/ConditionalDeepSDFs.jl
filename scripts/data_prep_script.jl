@@ -46,7 +46,7 @@ function read_data_batch(
     num_meshes = length(folders)
     (num_rows == num_meshes) || @warn "Number of rows in CSV file does not match number of meshes"
 
-    mesh_dict = SortedDict{Int,Tuple{MeshType,Point4f}}(Forward)
+    mesh_dict = SortedDict{Int,Tuple{MeshType,Vector{Float32}}}(Forward)
     sizehint!(mesh_dict, num_meshes)
 
     for folder in folders
@@ -56,10 +56,9 @@ function read_data_batch(
 
         index = id + 1
         row = csv_data[index]
-        tuple_row = Tuple(row)
-        id_csv = extract_id(tuple_row[1])
+        id_csv = extract_id(row[1])
         @assert id == id_csv "ID mismatch: $id != $id_csv"
-        params = Point4f(tuple_row[2:end])
+        params = Float32[row[2], row[3], row[4], row[5]]
         mesh_dict[id] = (mesh, params)
     end
     return mesh_dict
