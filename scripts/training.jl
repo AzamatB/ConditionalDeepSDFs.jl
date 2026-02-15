@@ -5,6 +5,7 @@ Pkg.activate(@__DIR__)
 using Reactant
 using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
     evaluate_dataset_loss, sample_sdf_and_eikonal_points, sample_sdf_points_batch
+using GeometryBasics
 using JLD2
 using Lux
 using Optimisers
@@ -48,14 +49,15 @@ end
 function train_model(
     rng::AbstractRNG,
     dataset_path::String;
-    model_save_dir="trained_model",
+    model_save_dir::String="trained_model",
     weight_eikonal::Float32=0.1f0,
     # set training hyperparameters
     num_epochs::Integer,
     learning_rate::Float32=1f-3,
     weight_decay::Float32=1f-4
 )
-    sampling_params = SamplingParameters(;
+    sampling_params = SamplingParameters(
+        rng;
         num_samples=262_144,
         grid_resolution=256,
         ratio_eikonal=0.3f0,
