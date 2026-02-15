@@ -65,6 +65,8 @@ function read_data_batch(
     return mesh_dict
 end
 
+save_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
+
 # batch 1
 csv_path = normpath(joinpath(@__DIR__, "..", "data/batch_1/coldplate_variants_batch_1.csv"))
 mesh_dir = normpath(joinpath(@__DIR__, "..", "data/batch_1/coldplate_41_variants_stl"))
@@ -79,7 +81,6 @@ mesh_file = "Body_6.stl"
 folder_pattern = r"^coldplate_inst\d*$"i
 mesh_dict_2 = read_data_batch(csv_path, mesh_dir, mesh_file, folder_pattern; delim=' ', ignorerepeated=true)
 
-save_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 offset = length(mesh_dict_1)
 len = offset + length(mesh_dict_2)
 mesh_samplers = Vector{MeshSDFSampler}(undef, len)
@@ -92,5 +93,7 @@ end
 for (i, (_, (mesh, params))) in enumerate(mesh_dict_2)
     mesh_samplers[offset+i] = MeshSDFSampler(mesh, params)
 end
+
+all(index -> isassigned(mesh_samplers, index), eachindex(mesh_samplers)) || error("Not all mesh samplers have been constructed.")
 
 jldsave(save_path; mesh_samplers)
