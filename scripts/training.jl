@@ -35,7 +35,7 @@ end
 
 function train_model(
     rng::AbstractRNG,
-    dataset_dir::String;
+    dataset_path::String;
     model_save_dir="trained_model",
     weight_eikonal::Float32=0.1f0,
     # set training hyperparameters
@@ -70,7 +70,7 @@ function train_model(
     states = device(st)
 
     # load dataset into CPU memory
-    (mesh_samplers_train, mesh_samplers_val, _) = load_datasets(dataset_dir)
+    (mesh_samplers_train, mesh_samplers_val, _) = load_datasets(dataset_path)
     num_meshes_train = length(mesh_samplers_train)
 
     # instantiate optimiser
@@ -125,7 +125,8 @@ end
 ####################################################################################################
 
 const num_epochs = 300
-const dataset_dir = normpath(joinpath(@__DIR__, "..", "datasets/ShapeNet-Car"))
+
+const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 const model_save_dir = normpath(joinpath(@__DIR__, "trained_model"))
 
-@time (model, params, states) = train_model(rng, dataset_dir; num_epochs, model_save_dir)
+(model, params, states) = train_model(rng, dataset_path; num_epochs, model_save_dir)
