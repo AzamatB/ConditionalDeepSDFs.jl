@@ -81,7 +81,6 @@ end
 ########################################   Sampling APIs   ########################################
 
 struct SamplingParameters{N}
-    device::ReactantDevice{Missing,Missing,Missing,Missing,Union{}}
     rng::TaskLocalRNG
     num_samples::Int
     num_eikonal::Int
@@ -95,7 +94,8 @@ struct SamplingParameters{N}
     σs::NTuple{N,Float32}
 end
 
-function SamplingParameters(;
+function SamplingParameters(
+    rng::TaskLocalRNG;
     num_samples::Int=262_144,
     grid_resolution::Int=256,
     ratio_eikonal::Float32=0.3f0,
@@ -106,8 +106,6 @@ function SamplingParameters(;
     voxel_σs::NTuple{N,Int}=(1, 4, 8, 12)
 ) where {N}
     (box_min, box_max) = (-1.0f0, 1.0f0)
-    device = reactant_device(; force=true)
-    rng = Random.default_rng()
     num_eikonal = round(Int, num_samples * ratio_eikonal)
 
     Δ = box_max - box_min
@@ -119,7 +117,6 @@ function SamplingParameters(;
     (slice_surface, slice_band, slice_volume) = partition_slice(1:num_samples, splits)
     subslices_band = partition_slice(slice_band, splits_band)
     return SamplingParameters{N}(
-        device,
         rng,
         num_samples,
         num_eikonal,
@@ -238,7 +235,6 @@ end
 function sample_sdf_and_eikonal_points(
     sampler::MeshSDFSampler, params::SamplingParameters{N}
 ) where {N}
-    device = params.device
     rng = params.rng
     num_eikonal = params.num_eikonal
     threshold_eikonal = params.threshold_eikonal
@@ -252,14 +248,13 @@ function sample_sdf_and_eikonal_points(
     take_random_subset!(indices_eikonal, num_eikonal, rng)
     points_eikonal = points_off_surface[:, indices_eikonal]
     signed_dists_mat = reshape(signed_dists, 1, length(signed_dists))
-    return (points, signed_dists_mat, points_eikonal, sampler.parameters) |> device
+    return (points, signed_dists_mat, points_eikonal, sampler.parameters)
 end
 
 function sample_sdf_points(sampler::MeshSDFSampler, params::SamplingParameters{N}) where {N}
-    device = params.device
     (points, signed_dists) = sample_sdf_points_kernel(sampler, params)
     signed_dists_mat = reshape(signed_dists, 1, length(signed_dists))
-    return (points, signed_dists_mat, sampler.parameters) |> device
+    return (points, signed_dists_mat, sampler.parameters)
 end
 
 function sample_sdf_points_kernel(sampler::MeshSDFSampler, params::SamplingParameters{N}) where {N}
