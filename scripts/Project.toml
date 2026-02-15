@@ -1,5 +1,6 @@
 [deps]
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+ConditionalDeepSDFs = "fe778f04-226f-461d-823c-279f32d444e5"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
@@ -10,3 +11,6 @@ Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+
+[sources]
+ConditionalDeepSDFs = {path = ".."}

@@ -1,4 +1,8 @@
+using Pkg
+Pkg.activate(@__DIR__)
+
 using Base.Order: Forward
+using ConditionalDeepSDFs: MeshSDFSampler
 using CSV
 using DataStructures
 using FileIO

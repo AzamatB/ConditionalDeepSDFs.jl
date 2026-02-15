@@ -1,5 +1,10 @@
 # main script to train the ConditionalSDF model
+using Pkg
+Pkg.activate(@__DIR__)
+
 using Reactant
+using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
+    evaluate_dataset_loss, load_datasets, sample_sdf_and_eikonal_points
 using JLD2
 using Lux
 using Optimisers
@@ -117,7 +122,7 @@ function train_model(
     return output
 end
 
-############################################################################################
+####################################################################################################
 
 const num_epochs = 300
 const dataset_dir = normpath(joinpath(@__DIR__, "..", "datasets/ShapeNet-Car"))
