@@ -29,7 +29,7 @@ function save_checkpoint(train_state::Training.TrainState, save_dir::String, epo
     rm(save_dir; recursive=true, force=true)
     mkpath(save_dir)
     # save the current model parameters
-    save_object(model_path; trained_model)
+    save_object(model_path, trained_model)
     return model_path
 end
 

@@ -96,4 +96,4 @@ end
 
 all(index -> isassigned(mesh_samplers, index), eachindex(mesh_samplers)) || error("Not all mesh samplers have been constructed.")
 
-save_object(save_path; mesh_samplers)
+save_object(save_path, mesh_samplers)
