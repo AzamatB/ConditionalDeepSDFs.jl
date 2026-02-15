@@ -1,9 +1,3 @@
-using Distributions
-using GeometryBasics
-using LinearAlgebra
-using Random
-using Lux
-
 ########################################   MeshSDFSampler   ########################################
 
 """

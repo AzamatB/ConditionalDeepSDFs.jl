@@ -1,5 +1,5 @@
-# name = "ConditionalDeepSDFs"
-# uuid = "fe778f04-226f-461d-823c-279f32d444e5"
+name = "ConditionalDeepSDFs"
+uuid = "fe778f04-226f-461d-823c-279f32d444e5"
 version = "0.1.0"
 authors = ["Azamat Berdyshev <aberdysh@gmail.com>"]
 

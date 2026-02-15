@@ -1,6 +1,3 @@
-using GeometryBasics
-using LinearAlgebra
-
 function canonicalize(mesh::Mesh{3,Float32,GLTriangleFace})
     isempty(coordinates(mesh)) && return mesh
     # weld vertices that are within distance ε (single-linkage via union-find)

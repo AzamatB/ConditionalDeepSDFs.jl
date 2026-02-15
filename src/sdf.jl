@@ -31,11 +31,6 @@ Implementation highlights (vs. the original atomic-splat version):
   recompute point–triangle distance.
 """
 
-using CUDA
-using GeometryBasics
-using GLMakie: Figure, LScene, Screen, mesh!
-using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
-
 # constants
 const NO_TRIANGLE = Int32(0)   # 1-based triangle indices; 0 = unassigned
 
