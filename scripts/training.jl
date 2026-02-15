@@ -86,8 +86,9 @@ function train_model(
     states = device(st)
 
     # load dataset into CPU memory
-    (mesh_samplers_train, mesh_samplers_val, _) = load_mesh_samplers(dataset_path)
+    @time (mesh_samplers_train, mesh_samplers_val, _) = load_mesh_samplers(dataset_path)
     num_meshes_train = length(mesh_samplers_train)
+    @info "Number of meshes in training set: $num_meshes_train"
 
     # instantiate optimiser
     optimiser = AdamW(eta=learning_rate, lambda=weight_decay)
