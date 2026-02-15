@@ -47,9 +47,15 @@ function save_checkpoint(train_state::Training.TrainState, save_dir::String, epo
     return model_path
 end
 
+function load_checkpoint(model_path::String)
+    trained_model = load_object(model_path)
+    return (; trained_model.model, trained_model.params, trained_model.states)
+end
+
 function train_model(
     rng::AbstractRNG,
     dataset_path::String;
+    model_path::Union{String,Nothing}=nothing,
     model_save_dir::String="trained_model",
     weight_eikonal::Float32=0.1f0,
     # set training hyperparameters
@@ -70,20 +76,24 @@ function train_model(
     )
     threshold_clamp = sampling_params.threshold_clamp
 
-    model = ConditionalSDF(;
-        num_fourier=128,
-        fourier_scale=10.0f0,
-        scale_film=0.1f0,
-        dim_p=4,
-        dim_hidden=512,
-        dim_film=128
-    )
+    # initialize model instance together with its parameters and states
+    if isnothing(model_path)
+        model = ConditionalSDF(;
+            num_fourier=128,
+            fourier_scale=10.0f0,
+            scale_film=0.1f0,
+            dim_p=4,
+            dim_hidden=512,
+            dim_film=128
+        )
+        # setup model parameters and states
+        (ps, st) = Lux.setup(rng, model)
+    else # warm start training from a pretrained model
+        (model, ps, st) = load_checkpoint(model_path)
+    end
     display(model)
-
-    # setup model parameters and states
-    (ps, st) = Lux.setup(rng, model)
     params = device(ps)
-    states = device(st)
+    states = device(Lux.trainmode(st))
 
     # load dataset into CPU memory
     @time (mesh_samplers_train, mesh_samplers_val, _) = load_mesh_samplers(dataset_path, rng)
@@ -143,7 +153,8 @@ end
 
 const num_epochs = 500
 
+model_path = nothing
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 const model_save_dir = normpath(joinpath(@__DIR__, "trained_model"))
 
-(model, params, states) = train_model(rng, dataset_path; num_epochs, model_save_dir)
+(model, params, states) = train_model(rng, dataset_path; model_path, num_epochs, model_save_dir)
