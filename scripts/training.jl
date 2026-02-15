@@ -4,7 +4,7 @@ Pkg.activate(@__DIR__)
 
 using Reactant
 using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
-    evaluate_dataset_loss, load_datasets, sample_sdf_and_eikonal_points
+    evaluate_dataset_loss, partition_slice, sample_sdf_and_eikonal_points
 using JLD2
 using Lux
 using Optimisers
@@ -18,6 +18,22 @@ const cpu = cpu_device()                       # move results back to host for i
 # set random seed for reproducibility
 const rng = Random.default_rng()
 Random.seed!(rng, 42)
+
+function load_mesh_samplers(
+    dataset_path::String;
+    splits::NamedTuple{(:train, :val, :test),NTuple{3,Float32}}=(; train=0.9f0, val=0.05f0, test=0.05f0)
+)
+    @assert sum(splits) == 1.0
+    @assert all(>(0.0f0), splits)
+    mesh_samplers = load_object(dataset_path)
+    (train_slice, val_slice, test_slice) = partition_slice(eachindex(mesh_samplers), splits)
+
+    mesh_samplers_train = mesh_samplers
+    mesh_samplers_val = mesh_samplers[val_slice]
+    mesh_samplers_test = mesh_samplers[test_slice]
+    resize!(mesh_samplers_train, length(train_slice))
+    return (mesh_samplers_train, mesh_samplers_val, mesh_samplers_test)
+end
 
 function save_checkpoint(train_state::Training.TrainState, save_dir::String, epoch::Int)
     model = train_state.model
@@ -70,7 +86,7 @@ function train_model(
     states = device(st)
 
     # load dataset into CPU memory
-    (mesh_samplers_train, mesh_samplers_val, _) = load_datasets(dataset_path)
+    (mesh_samplers_train, mesh_samplers_val, _) = load_mesh_samplers(dataset_path)
     num_meshes_train = length(mesh_samplers_train)
 
     # instantiate optimiser
