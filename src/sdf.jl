@@ -51,9 +51,9 @@ function construct_mesh(
     sdf::Array{Float32,3}, method::M=MarchingTetrahedra{Float32,Float32}()
 ) where {M<:Union{MarchingCubes{Float32},MarchingTetrahedra{Float32,Float32}}}
     (vertices_t, faces_t) = isosurface(sdf, method)
-    vertices = reinterpret(Point3f, vertices_t)
-    faces = reinterpret(TriangleFace{Int}, faces_t)
-    mesh = Mesh(vertices, faces)
+    vertices = Point3f.(vertices_t)
+    fcs = GLTriangleFace.(faces_t)
+    mesh = Mesh(vertices, fcs)
     return mesh::Mesh{3,Float32,TriangleFace{Int}}
 end
 
@@ -739,7 +739,7 @@ function preprocess_geometry(
     parity_edge_flags = sizehint!(UInt8[], num_faces)
 
     @inbounds for face in fcs
-        # works for TriangleFace / GLTriangleFace; we only need integer indices
+        # works for both TriangleFace and GLTriangleFace; we only need integer indices
         (a, b, c) = GeometryBasics.value.(face)
         A = Float64.(vertices[a])
         ab = Float64.(vertices[b]) .- A
