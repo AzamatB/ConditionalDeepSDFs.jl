@@ -43,7 +43,7 @@ function train_model(
     learning_rate::Float32=1f-3,
     weight_decay::Float32=1f-4
 )
-    sampling_params = SamplingParameters(
+    sampling_params = SamplingParameters(;
         num_samples=262_144,
         grid_resolution=256,
         ratio_eikonal=0.3f0,

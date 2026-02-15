@@ -106,7 +106,7 @@ struct SamplingParameters{N}
     σs::NTuple{N,Float32}
 end
 
-function SamplingParameters(
+function SamplingParameters(;
     num_samples::Int=262_144,
     grid_resolution::Int=256,
     ratio_eikonal::Float32=0.3f0,
