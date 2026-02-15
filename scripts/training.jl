@@ -4,7 +4,7 @@ Pkg.activate(@__DIR__)
 
 using Reactant
 using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
-    evaluate_dataset_loss, partition_slice, sample_sdf_and_eikonal_points
+    evaluate_dataset_loss, sample_sdf_and_eikonal_points, sample_sdf_points_batch
 using JLD2
 using Lux
 using Optimisers
@@ -19,19 +19,15 @@ const cpu = cpu_device()                       # move results back to host for i
 const rng = Random.default_rng()
 Random.seed!(rng, 42)
 
-function load_mesh_samplers(
-    dataset_path::String;
-    splits::NamedTuple{(:train, :val, :test),NTuple{3,Float32}}=(; train=0.9f0, val=0.05f0, test=0.05f0)
-)
-    @assert sum(splits) == 1.0
-    @assert all(>(0.0f0), splits)
+function load_mesh_samplers(dataset_path::String; num::Val{N}=Val(8)) where {N}
     mesh_samplers = load_object(dataset_path)
-    (train_slice, val_slice, test_slice) = partition_slice(eachindex(mesh_samplers), splits)
-
+    n = length(mesh_samplers)
+    m = n - N
+    k = m - N
     mesh_samplers_train = mesh_samplers
-    mesh_samplers_val = mesh_samplers[val_slice]
-    mesh_samplers_test = mesh_samplers[test_slice]
-    resize!(mesh_samplers_train, length(train_slice))
+    mesh_samplers_val = ntuple(i -> mesh_samplers[k+i], num)
+    mesh_samplers_test = ntuple(i -> mesh_samplers[m+i], num)
+    resize!(mesh_samplers_train, k)
     return (mesh_samplers_train, mesh_samplers_val, mesh_samplers_test)
 end
 
@@ -69,6 +65,7 @@ function train_model(
         splits_band=(0.35f0, 0.3f0, 0.2f0, 0.15f0),
         voxel_σs=(1, 4, 8, 12)
     )
+    threshold_clamp = sampling_params.threshold_clamp
 
     model = ConditionalSDF(;
         num_fourier=128,
@@ -94,25 +91,24 @@ function train_model(
     optimiser = AdamW(eta=learning_rate, lambda=weight_decay)
     # instantiate training state
     train_state = Training.TrainState(model, params, states, optimiser)
-    loss_func = SDFEikonalLoss(sampling_params.threshold_clamp, weight_eikonal)
+    loss_func = SDFEikonalLoss(threshold_clamp, weight_eikonal)
     ad_engine = AutoEnzyme()
 
     # precompile model for validation evaluation
+    samples_batch = sample_sdf_points_batch(mesh_samplers_val, sampling_params) |> device
     evaluate_dataset_loss_compiled = @compile evaluate_dataset_loss(
-        model, params, states, mesh_samplers_val, sampling_params
+        model, params, states, samples_batch, threshold_clamp
     )
-    loss_val_min = evaluate_dataset_loss_compiled(
-        model, params, states, mesh_samplers_val, sampling_params
-    )
+    loss_val_min = evaluate_dataset_loss_compiled(model, params, states, samples_batch, threshold_clamp)
     @printf "Validation loss before training:  %4.6f\n" loss_val_min
 
     @info "Training..."
     for epoch in 1:num_epochs
         loss_train = 0.0f0
         for sampler in mesh_samplers_train
-            data = sample_sdf_and_eikonal_points(sampler, sampling_params)
+            samples = sample_sdf_and_eikonal_points(sampler, sampling_params) |> device
             _, loss, _, train_state = Training.single_train_step!(
-                ad_engine, loss_func, data, train_state
+                ad_engine, loss_func, samples, train_state
             )
             loss_train += loss
         end
@@ -120,8 +116,9 @@ function train_model(
         @printf "Epoch [%3d]: Training Loss  %4.6f\n" epoch loss_train
 
         # evaluate the model on validation set
+        samples_batch = sample_sdf_points_batch(mesh_samplers_val, sampling_params) |> device
         loss_val = evaluate_dataset_loss_compiled(
-            model, train_state.parameters, train_state.states, mesh_samplers_val, sampling_params
+            model, train_state.parameters, train_state.states, samples_batch, threshold_clamp
         )
         @printf "Epoch [%3d]: Validation loss  %4.6f\n" epoch loss_val
         if loss_val < loss_val_min

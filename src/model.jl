@@ -300,7 +300,7 @@ end
 """
 Loss function callable for Lux.Training.single_train_step!
 
-Expected data tuple: (x_sdf, sdf_clamped, x_eik, p)
+Expected samples tuple: (x_sdf, sdf_clamped, x_eik, p)
 - x_sdf:        3 × n_sdf  points with ground-truth SDF values
 - sdf_clamped:  1 × n_sdf  clamped ground-truth SDF values
 - x_eik:        3 × n_eik  points for eikonal term (no GT needed)
@@ -310,11 +310,11 @@ function (loss::SDFEikonalLoss)(
     model::ConditionalSDF,
     params::NamedTuple,
     states::NamedTuple,
-    data::Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}}
+    samples::Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}}
 )
     δ = loss.trunc
     λ = loss.weight_eik
-    (x_sdf, sdf_clamped, x_eik, p) = data
+    (x_sdf, sdf_clamped, x_eik, p) = samples
     n_eik = size(x_eik, 2)
 
     # SDF L₁ regression pass
@@ -351,19 +351,25 @@ function evaluate_dataset_loss(
     model::ConditionalSDF,
     params::NamedTuple,
     states::NamedTuple,
-    mesh_samplers::Vector{MeshSDFSampler},
-    sampling_params::SamplingParameters
-)
-    δ = sampling_params.threshold_clamp
+    samples_batch::NTuple{N,Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}}},
+    δ::Float32
+) where {N}
     loss = 0.0f0
     states_val = Lux.testmode(states)
-    for mesh_sampler in mesh_samplers
-        (xs, sdf_clamped, p) = sample_sdf_points(mesh_sampler, sampling_params)
+    for samples in samples_batch
+        (xs, sdf_clamped, p) = samples
         (sdf_hat, _) = model((xs, p), params, states_val)
         # SDF L₁ regression pass
         loss_sdf = mean(abs.(clamp.(sdf_hat, -δ, δ) .- sdf_clamped))
         loss += loss_sdf
     end
-    loss /= length(mesh_samplers)
+    loss /= N
     return loss
+end
+
+function sample_sdf_points_batch(
+    mesh_samplers::NTuple{N,MeshSDFSampler}, sampling_params::SamplingParameters
+) where {N}
+    samples_batch = sample_sdf_points.(mesh_samplers, sampling_params)
+    return samples_batch::NTuple{N}
 end

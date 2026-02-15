@@ -11,12 +11,12 @@ using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
 
 include("sdf.jl")
 
-using Distributions
+using AliasTables
 using Random
-using Lux
 
 include("sampling.jl")
 
+using Lux
 using LuxCore
 using NNlib
 using Statistics
