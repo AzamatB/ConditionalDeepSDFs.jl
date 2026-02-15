@@ -1,12 +1,3 @@
-using Lux
-using LuxCore
-using NNlib
-using Optimisers
-using Printf
-using Random
-using Reactant
-using Statistics
-
 ##############   Fourier Feature Positional Encoding (state holds random matrix B)   ##############
 
 """
@@ -360,7 +351,7 @@ function evaluate_dataset_loss(
     model::ConditionalSDF,
     params::NamedTuple,
     states::NamedTuple,
-    mesh_samplers::Vector{MeshSampler},
+    mesh_samplers::Vector{MeshSDFSampler},
     sampling_params::SamplingParameters
 )
     δ = sampling_params.threshold_clamp

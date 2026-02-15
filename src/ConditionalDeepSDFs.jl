@@ -19,9 +19,6 @@ include("sampling.jl")
 
 using LuxCore
 using NNlib
-using Optimisers
-using Printf
-using Reactant
 using Statistics
 
 include("model.jl")

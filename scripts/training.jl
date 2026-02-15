@@ -1,7 +1,6 @@
 # main script to train the ConditionalSDF model
 using Reactant
 using JLD2
-using LinearAlgebra
 using Lux
 using Optimisers
 using Printf
