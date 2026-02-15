@@ -58,10 +58,8 @@ function LuxCore.initialstates(::AbstractRNG, ::LinearXP)
 end
 
 function (layer::LinearXP)(
-    input::Tuple{AbstractArray{Float32},AbstractArray{Float32}},
-    params::NamedTuple,
-    states::NamedTuple
-)
+    input::Tuple{AbstractArray{T},AbstractArray{T}}, params::NamedTuple, states::NamedTuple
+) where {T<:Number}
     (x, p) = input
     y = params.Wx * x .+ params.Wp * p .+ params.b
     return (y, states)
@@ -97,10 +95,10 @@ function LuxCore.initialstates(::AbstractRNG, ::LinearHXP)
 end
 
 function (layer::LinearHXP)(
-    input::Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}},
+    input::Tuple{AbstractArray{T},AbstractArray{T},AbstractArray{T}},
     params::NamedTuple,
     states::NamedTuple
-)
+) where {T<:Number}
     (h, x_enc, p) = input
     y = params.Wh * h .+ params.Wx * x_enc .+ params.Wp * p .+ params.b
     return (y, states)
@@ -111,8 +109,8 @@ end
 struct FiLMBlock{N} end
 
 function (film_block::FiLMBlock{N})(
-    h, params::AbstractArray{Float32,3}, scale::Float32, activation
-) where {N}
+    h, params::AbstractArray{T,3}, scale::Float32, activation
+) where {T<:Number,N}
     # FiLM params has shape (dim_hidden, 2, num_hidden)
     γ_raw = params[:, 1:1, N]   # dim_hidden × 1
     β_raw = params[:, 2:2, N]   # dim_hidden × 1
@@ -216,10 +214,8 @@ function ConditionalSDF(;
 end
 
 function (model::ConditionalSDF)(
-    input::Tuple{AbstractArray{Float32},AbstractArray{Float32}},
-    params::NamedTuple,
-    states::NamedTuple
-)
+    input::Tuple{AbstractArray{T},AbstractArray{T}}, params::NamedTuple, states::NamedTuple
+) where {T<:Number}
     activation = model.activation
     scale_film = model.scale_film
     (x, p) = input   # x: 3×N, p: 4×1
@@ -310,8 +306,8 @@ function (loss::SDFEikonalLoss)(
     model::ConditionalSDF,
     params::NamedTuple,
     states::NamedTuple,
-    samples::Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}}
-)
+    samples::Tuple{AbstractArray{T},AbstractArray{T},AbstractArray{T},AbstractArray{T}}
+) where {T<:Number}
     δ = loss.trunc
     λ = loss.weight_eik
     (x_sdf, sdf_clamped, x_eik, p) = samples
@@ -351,9 +347,9 @@ function evaluate_dataset_loss(
     model::ConditionalSDF,
     params::NamedTuple,
     states::NamedTuple,
-    samples_batch::NTuple{N,Tuple{AbstractArray{Float32},AbstractArray{Float32},AbstractArray{Float32}}},
+    samples_batch::NTuple{N,Tuple{AbstractArray{T},AbstractArray{T},AbstractArray{T}}},
     δ::Float32
-) where {N}
+) where {N,T<:Number}
     loss = 0.0f0
     states_val = Lux.testmode(states)
     for samples in samples_batch

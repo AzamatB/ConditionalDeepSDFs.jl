@@ -1,7 +1,7 @@
 name = "ConditionalDeepSDFs"
 uuid = "fe778f04-226f-461d-823c-279f32d444e5"
-version = "0.1.0"
 authors = ["Azamat Berdyshev <aberdysh@gmail.com>"]
+version = "0.1.0"
 
 [deps]
 AliasTables = "66dad0bd-aa9a-41b7-9441-69ab47430ed8"

@@ -58,9 +58,9 @@ function train_model(
 )
     sampling_params = SamplingParameters(
         rng;
-        num_samples=262_144,
+        num_samples=524_288,
         grid_resolution=256,
-        ratio_eikonal=0.3f0,
+        ratio_eikonal=0.2f0,
         clamp_voxel_threshold=16,
         eikonal_voxel_threshold=2,
         splits=(; surface=0.2f0, band=0.7f0, volume=0.1f0),
