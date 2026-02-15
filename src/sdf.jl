@@ -44,7 +44,7 @@ function construct_mesh(
 ) where {M<:Union{MarchingCubes{Float32},MarchingTetrahedra{Float32,Float32}}}
     sdf_cpu = Array(sdf)
     mesh = construct_mesh(sdf_cpu, method)
-    return mesh::Mesh{3,Float32,TriangleFace{Int}}
+    return mesh::Mesh{3,Float32,GLTriangleFace}
 end
 
 function construct_mesh(
@@ -54,7 +54,7 @@ function construct_mesh(
     vertices = Point3f.(vertices_t)
     fcs = GLTriangleFace.(faces_t)
     mesh = Mesh(vertices, fcs)
-    return mesh::Mesh{3,Float32,TriangleFace{Int}}
+    return mesh::Mesh{3,Float32,GLTriangleFace}
 end
 
 function visualize(mesh::Mesh{3,Float32})
