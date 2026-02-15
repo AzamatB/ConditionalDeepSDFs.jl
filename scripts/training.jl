@@ -20,8 +20,9 @@ const cpu = cpu_device()                       # move results back to host for i
 const rng = Random.default_rng()
 Random.seed!(rng, 42)
 
-function load_mesh_samplers(dataset_path::String; num::Val{N}=Val(8)) where {N}
+function load_mesh_samplers(dataset_path::String, rng::AbstractRNG; num::Val{N}=Val(8)) where {N}
     mesh_samplers = load_object(dataset_path)
+    shuffle!(rng, mesh_samplers)
     n = length(mesh_samplers)
     m = n - N
     k = m - N
@@ -85,7 +86,7 @@ function train_model(
     states = device(st)
 
     # load dataset into CPU memory
-    @time (mesh_samplers_train, mesh_samplers_val, _) = load_mesh_samplers(dataset_path)
+    @time (mesh_samplers_train, mesh_samplers_val, _) = load_mesh_samplers(dataset_path, rng)
     num_meshes_train = length(mesh_samplers_train)
     @info "Number of meshes in training set: $num_meshes_train"
 
