@@ -96,9 +96,9 @@ end
 
 function SamplingParameters(
     rng::TaskLocalRNG;
-    num_samples::Int=524_288,
+    num_samples::Int=340_000,
     grid_resolution::Int=256,
-    ratio_eikonal::Float32=0.2f0,
+    ratio_eikonal::Float32=0.3f0,
     clamp_voxel_threshold::Int=16,
     eikonal_voxel_threshold::Int=2,
     splits::NamedTuple{(:surface, :band, :volume),NTuple{3,Float32}}=(; surface=0.2f0, band=0.7f0, volume=0.1f0),

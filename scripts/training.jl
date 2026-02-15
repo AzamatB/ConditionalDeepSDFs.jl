@@ -58,9 +58,9 @@ function train_model(
 )
     sampling_params = SamplingParameters(
         rng;
-        num_samples=524_288,
+        num_samples=340_000,
         grid_resolution=256,
-        ratio_eikonal=0.2f0,
+        ratio_eikonal=0.3f0,
         clamp_voxel_threshold=16,
         eikonal_voxel_threshold=2,
         splits=(; surface=0.2f0, band=0.7f0, volume=0.1f0),
@@ -140,7 +140,7 @@ end
 
 ####################################################################################################
 
-const num_epochs = 300
+const num_epochs = 500
 
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 const model_save_dir = normpath(joinpath(@__DIR__, "trained_model"))
