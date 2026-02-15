@@ -1,3 +1,19 @@
+function load_datasets(
+    dataset_path::String;
+    splits::NamedTuple{(:train, :val, :test),NTuple{3,Float32}}=(; train=0.9f0, val=0.05f0, test=0.05f0)
+)
+    @assert sum(splits) == 1.0
+    @assert all(>(0.0f0), splits)
+    mesh_samplers = load_object(dataset_path)
+    (train_slice, val_slice, test_slice) = partition_slice(eachindex(mesh_samplers), splits)
+
+    dataset_test = mesh_samplers[test_slice]
+    dataset_val = mesh_samplers[val_slice]
+    dataset_train = mesh_samplers
+    resize!(dataset_train, length(train_slice))
+    return (dataset_train, dataset_val, dataset_test)
+end
+
 ########################################   MeshSDFSampler   ########################################
 
 """
