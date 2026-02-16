@@ -23,4 +23,6 @@ using Statistics
 
 include("model.jl")
 
+include("lazy_grids.jl")
+
 end

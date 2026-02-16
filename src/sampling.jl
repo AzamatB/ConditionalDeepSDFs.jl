@@ -240,24 +240,17 @@ function sample_sdf_and_eikonal_points(
     threshold_eikonal = params.threshold_eikonal
     slice_off_surface = first(params.slice_band):params.num_samples
 
-    (points, signed_dists) = sample_sdf_points_kernel(sampler, params)
+    (points, signed_dists, mesh_params) = sample_sdf_points(sampler, params)
     points_off_surface = @view points[:, slice_off_surface]
     # select the subset of eikonal points; skip points on the surface without even checking them
     signed_dists_off_surface = @view signed_dists[slice_off_surface]
     indices_eikonal = findall(sd -> abs(sd) > threshold_eikonal, signed_dists_off_surface)
     take_random_subset!(indices_eikonal, num_eikonal, rng)
     points_eikonal = points_off_surface[:, indices_eikonal]
-    signed_dists_mat = reshape(signed_dists, 1, length(signed_dists))
-    return (points, signed_dists_mat, points_eikonal, sampler.parameters)
+    return (points, signed_dists, points_eikonal, mesh_params)
 end
 
 function sample_sdf_points(sampler::MeshSDFSampler, params::SamplingParameters{N}) where {N}
-    (points, signed_dists) = sample_sdf_points_kernel(sampler, params)
-    signed_dists_mat = reshape(signed_dists, 1, length(signed_dists))
-    return (points, signed_dists_mat, sampler.parameters)
-end
-
-function sample_sdf_points_kernel(sampler::MeshSDFSampler, params::SamplingParameters{N}) where {N}
     rng = params.rng
     num_samples = params.num_samples
     voxel_size = params.voxel_size
@@ -302,7 +295,7 @@ function sample_sdf_points_kernel(sampler::MeshSDFSampler, params::SamplingParam
             signed_dists[j] = clamp(signed_dist, neg_threshold_clamp, threshold_clamp)
         end
     end
-    return (points, signed_dists)
+    return (points, signed_dists, sampler.parameters)
 end
 
 """

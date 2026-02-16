@@ -268,7 +268,8 @@ function (model::ConditionalSDF)(
     x_out = film_8(h_8, params_film, scale_film, activation)
 
     # output
-    (sdf, state_out) = model.out(x_out, params.out, states.out)
+    (signed_dists, state_out) = model.out(x_out, params.out, states.out)
+    signed_dists_vec = vec(signed_dists)
 
     states_out = (;
         pos_encoder=state_enc,
@@ -283,7 +284,7 @@ function (model::ConditionalSDF)(
         layer_8=state_8,
         out=state_out
     )
-    return (sdf, states_out)
+    return (signed_dists_vec, states_out)
 end
 
 #######################   Loss: Truncated L₁ SDF + Eikonal Regularization   #######################
