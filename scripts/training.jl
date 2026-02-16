@@ -21,9 +21,11 @@ const cpu = cpu_device()                       # move results back to host for i
 const rng = Random.default_rng()
 Random.seed!(rng, 42)
 
-function load_mesh_samplers(dataset_path::String, rng::AbstractRNG; num::Val{N}=Val(8)) where {N}
+function load_mesh_samplers(
+    dataset_path::String, rng::AbstractRNG; do_shuffle::Bool=false, num::Val{N}=Val(8)
+) where {N}
     mesh_samplers = load_object(dataset_path)
-    shuffle!(rng, mesh_samplers)
+    do_shuffle && shuffle!(rng, mesh_samplers)
     n = length(mesh_samplers)
     m = n - N
     k = m - N
