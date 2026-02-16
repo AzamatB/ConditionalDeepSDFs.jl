@@ -33,6 +33,10 @@ function load_mesh_samplers(
     mesh_samplers_val = ntuple(i -> mesh_samplers[k+i], num)
     mesh_samplers_test = ntuple(i -> mesh_samplers[m+i], num)
     resize!(mesh_samplers_train, k)
+
+    (base, ext) = splitext(dataset_path)
+    dataset_path_test = base * "_test.jld2"
+    save_object(dataset_path_test, mesh_samplers_test)
     return (mesh_samplers_train, mesh_samplers_val, mesh_samplers_test)
 end
 
