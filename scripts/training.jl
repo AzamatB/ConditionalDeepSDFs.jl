@@ -3,6 +3,7 @@ using Pkg
 Pkg.activate(@__DIR__)
 
 using Reactant
+using ConditionalDeepSDFs
 using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
     sample_sdf_and_eikonal_points, sample_sdf_points_batch
 using GeometryBasics
