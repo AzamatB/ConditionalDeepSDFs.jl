@@ -157,9 +157,9 @@ end
 
 ####################################################################################################
 
-const num_epochs = 800
+const num_epochs = 700
 
-model_path = nothing
+const model_path = normpath(joinpath(@__DIR__, "..", "trained_model/model_epoch_304.jld2"))
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 const model_save_dir = normpath(joinpath(@__DIR__, "..", "trained_model"))
 
