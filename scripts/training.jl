@@ -160,6 +160,6 @@ const num_epochs = 500
 
 model_path = nothing
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
-const model_save_dir = normpath(joinpath(@__DIR__, "trained_model"))
+const model_save_dir = normpath(joinpath(@__DIR__, "..", "trained_model"))
 
 (model, params, states) = train_model(rng, dataset_path; model_path, num_epochs, model_save_dir)
