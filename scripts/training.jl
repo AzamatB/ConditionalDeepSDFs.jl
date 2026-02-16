@@ -38,7 +38,7 @@ function save_checkpoint(train_state::Training.TrainState, save_dir::String, epo
     params = train_state.parameters |> cpu
     states = Lux.testmode(train_state.states) |> cpu
     trained_model = (; model, params, states)
-    model_path = joinpath(save_dir, "model_epoch_$(epoch).jld2")
+    model_path = joinpath(save_dir, "trained_model_epoch_$(epoch).jld2")
     # delete previously saved model parameters
     rm(save_dir; recursive=true, force=true)
     mkpath(save_dir)
@@ -56,7 +56,7 @@ function train_model(
     rng::AbstractRNG,
     dataset_path::String;
     model_path::Union{String,Nothing}=nothing,
-    model_save_dir::String="trained_model",
+    model_save_dir::String=normpath(joinpath(@__DIR__, "..", "trained_model")),
     weight_eikonal::Float32=0.1f0,
     # set training hyperparameters
     num_epochs::Integer,
