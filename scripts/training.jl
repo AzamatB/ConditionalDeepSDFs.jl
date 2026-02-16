@@ -63,7 +63,7 @@ function train_model(
     rng::AbstractRNG,
     dataset_path::String;
     model_path::Union{String,Nothing}=nothing,
-    model_save_dir::String=normpath(joinpath(@__DIR__, "..", "trained_model")),
+    model_save_dir::String=normpath(joinpath(@__DIR__, "..", "trained_models")),
     weight_eikonal::Float32=0.1f0,
     # set training hyperparameters
     num_epochs::Integer,
@@ -165,9 +165,9 @@ end
 
 const num_epochs = 700
 
-# model_path = nothing
-model_path = normpath(joinpath(@__DIR__, "..", "trained_model/trained_model_epoch_11.jld2"))
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
-const model_save_dir = normpath(joinpath(@__DIR__, "..", "trained_model"))
+const model_save_dir = normpath(joinpath(@__DIR__, "..", "trained_models"))
+# model_path = nothing
+model_path = joinpath(model_save_dir, "trained_model_epoch_11.jld2")
 
 (model, params, states) = train_model(rng, dataset_path; model_path, num_epochs, model_save_dir)
