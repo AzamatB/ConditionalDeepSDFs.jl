@@ -12,7 +12,7 @@ const device = reactant_device(; force=true)   # error if no functional Reactant
 const cpu = cpu_device()                       # move results back to host for inspection
 
 # load the trained model
-model_path = normpath(joinpath(@__DIR__, "..", "trained_model/model_epoch_304.jld2"))
+model_path = normpath(joinpath(@__DIR__, "..", "trained_model/trained_model_epoch_11.jld2"))
 trained_model = load_object(model_path)
 model = trained_model.model
 params = device(trained_model.params)
