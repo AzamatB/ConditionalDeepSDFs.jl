@@ -39,10 +39,9 @@ mesh_params = device(mesh_sampler.parameters)
 sdf_flat = Array{Float32}(undef, n^3)
 for idx in eachindex(grid_slabs)
     points = device(slab_points(grid_slabs, idx))
-    (signed_dists, _) = model_compiled((points, mesh_params), params, states)
-    signed_dists_cpu = cpu(signed_dists)
     indices = point_indices(grid_slabs, idx)
-    sdf_flat[indices] .= signed_dists_cpu
+    (signed_dists, _) = model_compiled((points, mesh_params), params, states)
+    copyto!(view(sdf_flat, indices), cpu(signed_dists))
 end
 # reshape into a signed distance field over the grid
 sdf = reshape(sdf_flat, n, n, n)
