@@ -783,7 +783,7 @@ end
 """
 Compute the signed distance field on a uniform [-1,1]³ grid.
 
-Returns a `CuArray{Float32,3}` of size `(n,n,n)`.
+Returns a `Array{Float32,3}` of size `(n,n,n)`.
 
 Keyword arguments (good defaults for 256³):
 • `band=5`

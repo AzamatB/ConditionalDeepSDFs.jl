@@ -1,3 +1,35 @@
+struct MeshParamsNorm{M<:AbstractVector,S<:AbstractVector} <: Lux.AbstractLuxLayer
+    μ::M
+    σ::S
+end
+
+function MeshParamsNorm(μ::AbstractVector, σ::AbstractVector)
+    # avoid division by zero for constant parameters
+    ε = eps(Float32)
+    uno = one(eltype(σ))
+    func = s -> ifelse(s < ε, uno, s)
+    σ = func.(σ)
+    MeshParamsNorm(μ, σ)
+end
+
+function Lux.initialparameters(::AbstractRNG, ::MeshParamsNorm)
+    return (;)  # No parameters to initialize
+end
+
+function Lux.initialstates(::AbstractRNG, layer::MeshParamsNorm)
+    return (μ=layer.μ, σ=layer.σ)
+end
+
+function (::MeshParamsNorm)(
+    x::AbstractArray{T}, params::NamedTuple, states::NamedTuple
+) where {T<:Number}
+    # x: (dim, batch) or just (dim,)
+    μ = states.μ
+    σ = states.σ
+    y = @. (x - μ) / σ
+    return y, states
+end
+
 ##############   Fourier Feature Positional Encoding (state holds random matrix B)   ##############
 
 """
@@ -20,7 +52,9 @@ function LuxCore.initialstates(rng::AbstractRNG, layer::FourierFeatures)
     return (; B)
 end
 
-function (layer::FourierFeatures)(x::AbstractMatrix, params::NamedTuple, states::NamedTuple)
+function (layer::FourierFeatures)(
+    x::AbstractMatrix{T}, params::NamedTuple, states::NamedTuple
+) where {T<:Number}
     # x is 3×N
     B = states.B
     two_pi = 2.0f0 * π
@@ -132,14 +166,15 @@ Condition FiLM SDF network:
 - skip connection after 4th hidden layer (layer 5 mixes h + x_enc + p via LinearHXP)
 - output: sdf values (1×N)
 """
-struct ConditionalSDF{A,PE,FiLM,L1,L2,L3,L4,L5,L6,L7,L8,Out} <: LuxCore.AbstractLuxContainerLayer{
-    (:pos_encoder, :film, :layer_1, :layer_2, :layer_3, :layer_4, :layer_5, :layer_6, :layer_7, :layer_8, :out)
+struct ConditionalSDF{A,MPN,PE,FiLM,L1,L2,L3,L4,L5,L6,L7,L8,Out} <: LuxCore.AbstractLuxContainerLayer{
+    (:mesh_params_norm, :pos_encoder, :film, :layer_1, :layer_2, :layer_3, :layer_4, :layer_5, :layer_6, :layer_7, :layer_8, :out)
 }
     dim_hidden::Int
     num_hidden::Int
     scale_film::Float32
     activation::A
 
+    mesh_params_norm::MPN
     pos_encoder::PE
     film::FiLM
     layer_1::L1
@@ -156,7 +191,9 @@ end
 """
 Build a standard 8 layer FiLM SDF network.
 """
-function ConditionalSDF(;
+function ConditionalSDF(
+    μ::AbstractVector{T},
+    σ::AbstractVector{T};
     activation=swish,
     num_fourier::Int=128,
     fourier_scale::Float32=10.0f0,
@@ -164,7 +201,8 @@ function ConditionalSDF(;
     dim_p::Int=4,
     dim_hidden::Int=512,
     dim_film::Int=128
-)
+) where {T<:Number}
+    mesh_params_norm = MeshParamsNorm(μ, σ)
     # Fourier feature output dimension
     num_hidden = 8
     dim_x_enc = 3 + 2 * num_fourier
@@ -198,6 +236,7 @@ function ConditionalSDF(;
         num_hidden,
         scale_film,
         activation,
+        mesh_params_norm,
         pos_encoder,
         film,
         layer_1,
@@ -218,7 +257,10 @@ function (model::ConditionalSDF)(
 ) where {T<:Number}
     activation = model.activation
     scale_film = model.scale_film
-    (x, p) = input   # x: 3×N, p: 4×1
+    (x, p_raw) = input   # x: 3×N, p: 4
+
+    # normalize mesh shape parameters
+    (p, state_norm) = model.mesh_params_norm(p_raw, params.mesh_params_norm, states.mesh_params_norm)
 
     # positional encoding
     (x_enc, state_enc) = model.pos_encoder(x, params.pos_encoder, states.pos_encoder)
@@ -272,6 +314,7 @@ function (model::ConditionalSDF)(
     signed_dists_vec = vec(signed_dists)
 
     states_out = (;
+        mesh_params_norm=state_norm,
         pos_encoder=state_enc,
         film=state_film,
         layer_1=state_1,
@@ -329,7 +372,7 @@ function (loss::SDFEikonalLoss)(
     end
     # u must have the same structure/shape/type as the output of f(x_eik), which is (1 × n_eik)
     # allocate u on the same device as the model outputs
-    u = similar(sdf_hat, 1, n_eik)
+    u = similar(sdf_hat, n_eik)
     uno = one(eltype(u))
     fill!(u, uno)
 

@@ -78,6 +78,26 @@ function Broadcast.broadcastable(mesh_sampler::MeshSDFSampler)
     return Ref(mesh_sampler)
 end
 
+function mean_and_std_parameters(mesh_samplers::AbstractVector{MeshSDFSampler})
+    num_meshes = length(mesh_samplers)
+    dim = length(first(mesh_samplers).parameters)
+    μ = zeros(Float32, dim)
+
+    for mesh_sampler in mesh_samplers
+        parameters = mesh_sampler.parameters
+        μ .+= parameters
+    end
+    μ ./= num_meshes
+
+    σ = zeros(Float32, dim)
+    for mesh_sampler in mesh_samplers
+        parameters = mesh_sampler.parameters
+        @. σ += (parameters - μ)^2
+    end
+    @. σ = sqrt(σ / (num_meshes - 1))
+    return (μ, σ)
+end
+
 ########################################   Sampling APIs   ########################################
 
 struct SamplingParameters{N}
@@ -96,9 +116,9 @@ end
 
 function SamplingParameters(
     rng::TaskLocalRNG;
-    num_samples::Int=340_000,
+    num_samples::Int=262_144,
     grid_resolution::Int=256,
-    ratio_eikonal::Float32=0.3f0,
+    ratio_eikonal::Float32=0.25f0,
     clamp_voxel_threshold::Int=16,
     eikonal_voxel_threshold::Int=2,
     splits::NamedTuple{(:surface, :band, :volume),NTuple{3,Float32}}=(; surface=0.2f0, band=0.7f0, volume=0.1f0),

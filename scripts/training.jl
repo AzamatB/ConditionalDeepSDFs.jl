@@ -5,7 +5,7 @@ Pkg.activate(@__DIR__)
 using Reactant
 using ConditionalDeepSDFs
 using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
-    sample_sdf_and_eikonal_points, sample_sdf_points_batch
+    mean_and_std_parameters, sample_sdf_and_eikonal_points, sample_sdf_points_batch
 using GeometryBasics
 using JLD2
 using Lux
@@ -22,13 +22,17 @@ const rng = Random.default_rng()
 Random.seed!(rng, 42)
 
 function load_mesh_samplers!(
-    dataset_path::String, rng::AbstractRNG; do_shuffle::Bool=false, num::Val{N}=Val(8)
+    dataset_path::String, rng::AbstractRNG; do_shuffle::Bool=true, num::Val{N}=Val(8)
 ) where {N}
     mesh_samplers = load_object(dataset_path)
     do_shuffle && shuffle!(rng, mesh_samplers)
     n = length(mesh_samplers)
     m = n - N
     k = m - N
+
+    mesh_samplers_tv = @view mesh_samplers[1:m]
+    (μ, σ) = mean_and_std_parameters(mesh_samplers_tv)
+
     mesh_samplers_train = mesh_samplers
     mesh_samplers_val = ntuple(i -> mesh_samplers[k+i], num)
     mesh_samplers_test = ntuple(i -> mesh_samplers[m+i], num)
@@ -37,7 +41,7 @@ function load_mesh_samplers!(
     (base, ext) = splitext(dataset_path)
     dataset_path_test = base * "_test.jld2"
     save_object(dataset_path_test, mesh_samplers_test)
-    return (mesh_samplers_train, mesh_samplers_val, mesh_samplers_test)
+    return (mesh_samplers_train, mesh_samplers_val, mesh_samplers_test, μ, σ)
 end
 
 function save_checkpoint(train_state::Training.TrainState, save_dir::String, epoch::Int)
@@ -72,9 +76,9 @@ function train_model(
 )
     sampling_params = SamplingParameters(
         rng;
-        num_samples=340_000,
+        num_samples=262_144,
         grid_resolution=256,
-        ratio_eikonal=0.3f0,
+        ratio_eikonal=0.25f0,
         clamp_voxel_threshold=16,
         eikonal_voxel_threshold=2,
         splits=(; surface=0.2f0, band=0.7f0, volume=0.1f0),
@@ -83,9 +87,16 @@ function train_model(
     )
     threshold_clamp = sampling_params.threshold_clamp
 
+    # load dataset into CPU memory
+    @time (mesh_samplers_train, mesh_samplers_val, _, μ, σ) = load_mesh_samplers!(dataset_path, rng)
+    num_meshes_train = length(mesh_samplers_train)
+    @info "Number of meshes in training set: $num_meshes_train"
+
     # initialize model instance together with its parameters and states
     if isnothing(model_path)
-        model = ConditionalSDF(;
+        model = ConditionalSDF(
+            μ,
+            σ;
             num_fourier=128,
             fourier_scale=10.0f0,
             scale_film=0.1f0,
@@ -101,11 +112,6 @@ function train_model(
     display(model)
     params = device(ps)
     states = device(Lux.trainmode(st))
-
-    # load dataset into CPU memory
-    @time (mesh_samplers_train, mesh_samplers_val, _) = load_mesh_samplers!(dataset_path, rng)
-    num_meshes_train = length(mesh_samplers_train)
-    @info "Number of meshes in training set: $num_meshes_train"
 
     # instantiate optimiser
     optimiser = AdamW(eta=learning_rate, lambda=weight_decay)
@@ -167,7 +173,7 @@ const num_epochs = 700
 
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 const model_save_dir = normpath(joinpath(@__DIR__, "..", "trained_models"))
-# model_path = nothing
-model_path = joinpath(model_save_dir, "trained_model_epoch_11.jld2")
+model_path = nothing
+# model_path = joinpath(model_save_dir, "trained_model_epoch_11.jld2")
 
 (model, params, states) = train_model(rng, dataset_path; model_path, num_epochs, model_save_dir)
