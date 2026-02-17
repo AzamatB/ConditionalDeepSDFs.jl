@@ -1,22 +1,22 @@
 struct MeshParamsNorm{M<:AbstractVector,S<:AbstractVector} <: Lux.AbstractLuxLayer
     μ::M
     σ::S
+
+    function MeshParamsNorm(μ::M, σ::S) where {M<:AbstractVector,S<:AbstractVector}
+        # avoid division by zero for constant parameters
+        ε = eps(Float32)
+        uno = one(eltype(σ))
+        func = s -> ifelse(s < ε, uno, s)
+        σ = func.(σ)
+        return new{M,S}(μ, σ)
+    end
 end
 
-function MeshParamsNorm(μ::AbstractVector, σ::AbstractVector)
-    # avoid division by zero for constant parameters
-    ε = eps(Float32)
-    uno = one(eltype(σ))
-    func = s -> ifelse(s < ε, uno, s)
-    σ = func.(σ)
-    MeshParamsNorm(μ, σ)
-end
-
-function Lux.initialparameters(::AbstractRNG, ::MeshParamsNorm)
+function Lux.initialparameters(rng::AbstractRNG, layer::MeshParamsNorm)
     return (;)  # No parameters to initialize
 end
 
-function Lux.initialstates(::AbstractRNG, layer::MeshParamsNorm)
+function Lux.initialstates(rng::AbstractRNG, layer::MeshParamsNorm)
     return (μ=layer.μ, σ=layer.σ)
 end
 
@@ -42,7 +42,7 @@ struct FourierFeatures{T} <: LuxCore.AbstractLuxLayer
     scale::T            # frequency scale
 end
 
-function LuxCore.initialparameters(rng::AbstractRNG, ::FourierFeatures)
+function LuxCore.initialparameters(rng::AbstractRNG, layer::FourierFeatures)
     return (;)
 end
 
