@@ -81,6 +81,7 @@ end
 
 Indexable iterator over contiguous k-slabs of a `LazyUnitCubeGrid`. Each element is a
 `(3, n, n, slab_size)` `Array{Float32,4}`. `slab_size` must evenly divide grid resolution `grid.n`.
+Note: it allocates and reuses a buffer to avoid reallocating memory for each slab.
 """
 struct GridSlabs
     grid::LazyUnitCubeGrid

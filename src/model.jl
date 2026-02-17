@@ -145,18 +145,16 @@ end
 struct FiLMBlock{N} end
 
 function (film_block::FiLMBlock{N})(
-    h, params::AbstractArray{T,3}, scale::Float32, activation
+    h::AbstractMatrix{T}, params::AbstractArray{T,3}, scale::Float32, activation
 ) where {T<:Number,N}
     # FiLM params has shape (dim_hidden, 2, num_hidden)
-    γ_raw = params[:, 1:1, N]   # dim_hidden × 1
-    β_raw = params[:, 2:2, N]   # dim_hidden × 1
+    γ_raw = params[:, 1, N]   # dim_hidden
+    β_raw = params[:, 2, N]   # dim_hidden
 
-    # "near-identity" initialization: gamma = 1 + scale*γ_raw, beta = scale*β_raw
+    # "near-identity" initialization: γ = 1 + scale * γ_raw; β = scale * β_raw
     γ = 1.0f0 .+ scale .* γ_raw
     β = scale .* β_raw
-
-    y = h .* γ .+ β
-    out = activation.(y)
+    out = @. activation(h * γ + β)
     return out
 end
 
