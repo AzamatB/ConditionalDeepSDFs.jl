@@ -1,14 +1,14 @@
-struct MeshParamsNorm{M<:AbstractVector,S<:AbstractVector} <: Lux.AbstractLuxLayer
-    μ::M
-    σ::S
+struct MeshParamsNorm <: Lux.AbstractLuxLayer
+    μ::Point4f
+    σ::Point4f
 
-    function MeshParamsNorm(μ::M, σ::S) where {M<:AbstractVector,S<:AbstractVector}
+    function MeshParamsNorm(μ::AbstractVector{Float32}, σ::AbstractVector{Float32})
         # avoid division by zero for constant parameters
         ε = eps(Float32)
         uno = one(eltype(σ))
-        func = s -> ifelse(s < ε, uno, s)
-        σ = func.(σ)
-        return new{M,S}(μ, σ)
+        correct = s -> ifelse(s < ε, uno, s)
+        σ_corrected = correct.(Point4f(σ))
+        return new(Point4f(μ), σ_corrected)
     end
 end
 
@@ -17,7 +17,9 @@ function Lux.initialparameters(rng::AbstractRNG, layer::MeshParamsNorm)
 end
 
 function Lux.initialstates(rng::AbstractRNG, layer::MeshParamsNorm)
-    return (; layer.μ, layer.σ)
+    μ = Vector{Float32}(layer.μ)
+    σ = Vector{Float32}(layer.σ)
+    return (; μ, σ)
 end
 
 function (::MeshParamsNorm)(
@@ -27,7 +29,7 @@ function (::MeshParamsNorm)(
     μ = states.μ
     σ = states.σ
     y = @. (x - μ) / σ
-    return y, states
+    return (y, states)
 end
 
 ##############   Fourier Feature Positional Encoding (state holds random matrix B)   ##############
@@ -192,8 +194,8 @@ end
 Build a standard 8 layer FiLM SDF network.
 """
 function ConditionalSDF(
-    μ::AbstractVector{T},
-    σ::AbstractVector{T};
+    μ::AbstractVector{Float32},
+    σ::AbstractVector{Float32};
     activation=swish,
     num_fourier::Int=128,
     fourier_scale::Float32=10.0f0,
@@ -201,7 +203,7 @@ function ConditionalSDF(
     dim_p::Int=4,
     dim_hidden::Int=512,
     dim_film::Int=128
-) where {T<:Number}
+)
     mesh_params_norm = MeshParamsNorm(μ, σ)
     # Fourier feature output dimension
     num_hidden = 8
