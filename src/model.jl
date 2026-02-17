@@ -333,18 +333,18 @@ end
 #######################   Loss: Truncated L₁ SDF + Eikonal Regularization   #######################
 
 struct SDFEikonalLoss
-    trunc::Float32        # truncation distance (e.g. 0.05..0.2 in normalized units)
-    weight_eik::Float32   # weight for eikonal regularization term
+    threshold_clamp::Float32   # truncation distance (e.g. 0.05..0.2 in normalized units)
+    weight_eik::Float32        # weight for eikonal regularization term
 end
 
 """
 Loss function callable for Lux.Training.single_train_step!
 
-Expected samples tuple: (x_sdf, sdf_clamped, x_eik, p)
-- x_sdf:        3 × n_sdf  points with ground-truth SDF values
-- sdf_clamped:  1 × n_sdf  clamped ground-truth SDF values
-- x_eik:        3 × n_eik  points for eikonal term (no GT needed)
-- p:            4 × 1      shape parameters for the object
+Expected samples tuple: (x_sdf, sdf_gt, x_eik, p)
+- x_sdf:   3 × n_sdf  points with ground-truth SDF values
+- sdf_gt:  1 × n_sdf  ground-truth SDF values
+- x_eik:   3 × n_eik  points for eikonal term (no GT needed)
+- p:       4 × 1      shape parameters for the object
 """
 function (loss::SDFEikonalLoss)(
     model::ConditionalSDF,
@@ -352,14 +352,14 @@ function (loss::SDFEikonalLoss)(
     states::NamedTuple,
     samples::Tuple{AbstractArray{T},AbstractArray{T},AbstractArray{T},AbstractArray{T}}
 ) where {T<:Number}
-    δ = loss.trunc
+    δ = loss.threshold_clamp
     λ = loss.weight_eik
-    (x_sdf, sdf_clamped, x_eik, p) = samples
+    (x_sdf, sdf_gt, x_eik, p) = samples
     n_eik = size(x_eik, 2)
 
     # SDF L₁ regression pass
     (sdf_hat, states_out) = Lux.apply(model, (x_sdf, p), params, states)
-    loss_sdf = mean(abs.(clamp.(sdf_hat, -δ, δ) .- sdf_clamped))
+    loss_sdf = clamped_distance_l₁(sdf_gt, sdf_hat, δ)
 
     # Eikonal regularization term via Vector-Jacobian Product (VJP) AD
     # freeze states as we don't want to update it during eikonal regularization pass
@@ -378,13 +378,21 @@ function (loss::SDFEikonalLoss)(
 
     # VJP: v = u ⋅ (∂f/∂x)  -> has same shape as x_eik (3 × n_eik)
     ∇ₓf = Lux.vector_jacobian_product(f_x, AutoEnzyme(), x_eik, u)   # 3 × n_eik
-    norm∇ₓf² = sum(abs2, ∇ₓf; dims=1)           #  ‖∇ₓf‖²              1 × n_eik
+    norm∇ₓf² = sum(abs2, ∇ₓf; dims=1)             # ‖∇ₓf‖²             1 × n_eik
     ε = 1.0f-8
-    loss_eik = mean(abs2.(sqrt.(norm∇ₓf² .+ ε) .- 1.0f0))    # (√(‖∇ₓf‖² + ε) - 1)²
+    Δ_eik = @. abs2(sqrt(norm∇ₓf² + ε) - 1.0f0)   # (√(‖∇ₓf‖² + ε) - 1)²
+    loss_eik = mean(Δ_eik)
 
     Σloss = loss_sdf + λ * loss_eik
     stats = (; loss_sdf, loss_eik)
     return (Σloss, states_out, stats)
+end
+
+function clamped_distance_l₁(y::AbstractArray{T}, ŷ::AbstractArray{T}, δ::Float32) where {T<:Number}
+    δ_neg = -δ
+    Δ_sdf = @. abs(clamp(y, δ_neg, δ) - clamp(ŷ, δ_neg, δ))
+    dist = mean(Δ_sdf)
+    return dist
 end
 
 function evaluate_dataset_loss(
@@ -397,19 +405,12 @@ function evaluate_dataset_loss(
     loss = 0.0f0
     states_val = Lux.testmode(states)
     for samples in samples_batch
-        (xs, sdf_clamped, p) = samples
+        (xs, sdf_gt, p) = samples
         (sdf_hat, _) = model((xs, p), params, states_val)
         # SDF L₁ regression pass
-        loss_sdf = mean(abs.(clamp.(sdf_hat, -δ, δ) .- sdf_clamped))
+        loss_sdf = clamped_distance_l₁(sdf_gt, sdf_hat, δ)
         loss += loss_sdf
     end
     loss /= N
     return loss
-end
-
-function sample_sdf_points_batch(
-    mesh_samplers::NTuple{N,MeshSDFSampler}, sampling_params::SamplingParameters
-) where {N}
-    samples_batch = sample_sdf_points.(mesh_samplers, sampling_params)
-    return samples_batch::NTuple{N}
 end

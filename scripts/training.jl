@@ -5,7 +5,7 @@ Pkg.activate(@__DIR__)
 using Reactant
 using ConditionalDeepSDFs
 using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
-    mean_and_std_parameters, sample_sdf_and_eikonal_points, sample_sdf_points_batch
+    mean_and_std_parameters, sample_sdf_and_eikonal_points
 using GeometryBasics
 using JLD2
 using Lux
@@ -121,7 +121,7 @@ function train_model(
     ad_engine = AutoEnzyme()
 
     # precompile model for validation evaluation
-    samples_batch = sample_sdf_points_batch(mesh_samplers_val, sampling_params) |> device
+    samples_batch = device(sample_sdf_points.(mesh_samplers_val, sampling_params))
     evaluate_dataset_loss_compiled = @compile ConditionalDeepSDFs.evaluate_dataset_loss(
         model, params, states, samples_batch, threshold_clamp
     )
@@ -147,7 +147,7 @@ function train_model(
         @printf "Epoch [%3d]: Training Loss  %4.6f\n" epoch loss_train
 
         # evaluate the model on validation set
-        samples_batch = sample_sdf_points_batch(mesh_samplers_val, sampling_params) |> device
+        samples_batch = device(sample_sdf_points.(mesh_samplers_val, sampling_params))
         loss_val = evaluate_dataset_loss(
             model, train_state.parameters, train_state.states, samples_batch, threshold_clamp
         )

@@ -274,7 +274,6 @@ function sample_sdf_points(sampler::MeshSDFSampler, params::SamplingParameters{N
     rng = params.rng
     num_samples = params.num_samples
     voxel_size = params.voxel_size
-    threshold_clamp = params.threshold_clamp
     slice_surface = params.slice_surface
     slice_band = params.slice_band
     slice_volume = params.slice_volume
@@ -303,16 +302,14 @@ function sample_sdf_points(sampler::MeshSDFSampler, params::SamplingParameters{N
 
         # compute corresponding signed distances via trilinear interpolation
         (n_x, n_y, n_z) = size(sdf) .- 1
-        neg_threshold_clamp = -threshold_clamp
         signed_dists = Vector{Float32}(undef, num_samples)
         signed_dists[slice_surface] .= 0.0f0
         Threads.@threads for j in slice_off_surface
-            signed_dist = trilerp_sdf(
+            signed_dists[j] = trilerp_sdf(
                 sdf, points[1, j], points[2, j], points[3, j],
                 voxel_size, voxel_size, voxel_size,
                 n_x, n_y, n_z
             )
-            signed_dists[j] = clamp(signed_dist, neg_threshold_clamp, threshold_clamp)
         end
     end
     return (points, signed_dists, sampler.parameters)
