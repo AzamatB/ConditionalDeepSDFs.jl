@@ -98,7 +98,7 @@ function train_model(
             μ,
             σ;
             num_fourier=256,
-            fourier_scale=20.0f0,
+            fourier_scale=32.0f0,
             scale_film=0.4f0,
             dim_p=4,
             dim_hidden=1024,

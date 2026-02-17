@@ -190,6 +190,10 @@ struct ConditionalSDF{A,MPN,PE,FiLM,L1,L2,L3,L4,L5,L6,L7,L8,Out} <: LuxCore.Abst
     out::Out
 end
 
+function init_bias(rng::AbstractRNG, len::Int)
+    return fill(0.5f0, len)
+end
+
 """
 Build a standard 8 layer FiLM SDF network.
 """
@@ -198,8 +202,8 @@ function ConditionalSDF(
     σ::AbstractVector{Float32};
     activation=swish,
     num_fourier::Int=256,
-    fourier_scale::Float32=20.0f0,
-    scale_film::Float32=0.1f0,
+    fourier_scale::Float32=32.0f0,
+    scale_film::Float32=0.4f0,
     dim_p::Int=4,
     dim_hidden::Int=1024,
     dim_film::Int=2048
@@ -232,7 +236,7 @@ function ConditionalSDF(
     layer_7 = Dense(dim_hidden => dim_hidden)
     layer_8 = Dense(dim_hidden => dim_hidden)
 
-    out = Dense(dim_hidden => 1)
+    out = Dense(dim_hidden => 1; init_bias)
     film_sdf = ConditionalSDF(
         dim_hidden,
         num_hidden,
