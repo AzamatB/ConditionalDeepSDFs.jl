@@ -97,12 +97,12 @@ function train_model(
         model = ConditionalSDF(
             μ,
             σ;
-            num_fourier=128,
-            fourier_scale=10.0f0,
-            scale_film=0.1f0,
+            num_fourier=256,
+            fourier_scale=20.0f0,
+            scale_film=0.4f0,
             dim_p=4,
-            dim_hidden=512,
-            dim_film=128
+            dim_hidden=1024,
+            dim_film=2048
         )
         # setup model parameters and states
         (ps, st) = Lux.setup(rng, model)

@@ -197,12 +197,12 @@ function ConditionalSDF(
     μ::AbstractVector{Float32},
     σ::AbstractVector{Float32};
     activation=swish,
-    num_fourier::Int=128,
-    fourier_scale::Float32=10.0f0,
+    num_fourier::Int=256,
+    fourier_scale::Float32=20.0f0,
     scale_film::Float32=0.1f0,
     dim_p::Int=4,
-    dim_hidden::Int=512,
-    dim_film::Int=128
+    dim_hidden::Int=1024,
+    dim_film::Int=2048
 )
     mesh_params_norm = MeshParamsNorm(μ, σ)
     # Fourier feature output dimension
