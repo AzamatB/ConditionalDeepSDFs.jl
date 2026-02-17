@@ -17,7 +17,7 @@ function Lux.initialparameters(rng::AbstractRNG, layer::MeshParamsNorm)
 end
 
 function Lux.initialstates(rng::AbstractRNG, layer::MeshParamsNorm)
-    return (μ=layer.μ, σ=layer.σ)
+    return (; layer.μ, layer.σ)
 end
 
 function (::MeshParamsNorm)(
