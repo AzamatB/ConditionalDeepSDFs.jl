@@ -12,8 +12,10 @@ Reactant.set_default_backend("gpu")            # "gpu" = CUDA backend (via XLA/P
 const device = reactant_device(; force=true)   # error if no functional Reactant GPU device
 const cpu = cpu_device()                       # move results back to host for inspection
 
+model_path = normpath(joinpath(@__DIR__, "..", "trained_models/trained_model_epoch_458.jld2"))
+dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers_test.jld2"))
+
 # load the trained model
-model_path = normpath(joinpath(@__DIR__, "..", "trained_models/trained_model_epoch_11.jld2"))
 trained_model = load_object(model_path)
 model = trained_model.model
 params = device(trained_model.params)
@@ -21,10 +23,9 @@ states = device(Lux.testmode(trained_model.states))
 display(model)
 
 # load the mesh samplers
-dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers_test.jld2"))
 mesh_samplers = load_object(dataset_path)
-
 slab_size = 8   # or 4
+
 # compile the model
 mesh_sampler = first(mesh_samplers)
 n = mesh_sampler.resolution
