@@ -116,7 +116,7 @@ end
 
 function SamplingParameters(
     rng::TaskLocalRNG;
-    num_samples::Int=262_144,
+    num_samples::Int=131_072,
     grid_resolution::Int=256,
     ratio_eikonal::Float32=0.25f0,
     clamp_voxel_threshold::Int=16,

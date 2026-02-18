@@ -76,7 +76,7 @@ function train_model(
 )
     sampling_params = SamplingParameters(
         rng;
-        num_samples=262_144,
+        num_samples=131_072,
         grid_resolution=256,
         ratio_eikonal=0.25f0,
         clamp_voxel_threshold=16,
@@ -98,11 +98,11 @@ function train_model(
             μ,
             σ;
             num_fourier=256,
-            fourier_scale=32.0f0,
-            scale_film=0.4f0,
+            fourier_scale=24.0f0,
+            scale_film=0.2f0,
             dim_p=4,
             dim_hidden=1024,
-            dim_film=2048
+            dim_film=1024
         )
         # setup model parameters and states
         (ps, st) = Lux.setup(rng, model)
