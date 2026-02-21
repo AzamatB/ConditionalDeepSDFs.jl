@@ -104,10 +104,10 @@ function train_model(
             σ;
             num_fourier=256,
             fourier_scale=24.0f0,
-            scale_film=0.2f0,
+            scale_film=0.1f0,
             dim_p=4,
-            dim_hidden=1024,
-            dim_film=1024
+            dim_hidden=512,
+            dim_film=256
         )
         # setup model parameters and states
         (ps, st) = Lux.setup(rng, model)
