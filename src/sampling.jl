@@ -1,37 +1,35 @@
-########################################   MeshSDFSampler   ########################################
+#########################################   MeshSampler   #########################################
 
 """
 Area-weighted surface sampler.
 """
-struct MeshSDFSampler
-    vertices::Vector{Point3f}
-    triangles::Vector{GLTriangleFace}
-    # area-weighted categorical distribution over triangle faces stored as an alias table for O(1) sampling
-    distribution::AliasTable{UInt32,Int}
-    sdf::Array{Float32,3}
-    resolution::Int
-    # sdf grid mapping
-    bbox_min::Point3f
-    bbox_max::Point3f
+struct MeshSampler
     # shape parameters
     parameters::Vector{Float32}
+    vertices::Vector{Point3f}
+    triangles::Vector{NTuple{3,Int32}}
+    # area-weighted categorical distribution over triangle faces stored as an alias table for O(1) sampling
+    distribution::AliasTable{UInt32,Int}
+    sdm::SignedDistanceMesh{Float32,Float64}
+    bbox_min::Point3f
+    bbox_max::Point3f
 end
 
-function MeshSDFSampler(mesh::Mesh, parameters::Vector{Float32}; resolution::Int=256)
+function MeshSampler(mesh::Mesh, parameters::Vector{Float32})
     mesh = canonicalize(mesh)
     vertices = coordinates(mesh)
-    triangles = faces(mesh)
-    sdf = construct_sdf(mesh, resolution)
+    triangles = NTuple{3,Int32}.(faces(mesh))
     distribution = construct_triangle_distribution(vertices, triangles)
+    sdm = preprocess_mesh(vertices, triangles, Float64)
     (bbox_min, bbox_max) = compute_bounding_box(vertices)
-    mesh_sampler = MeshSDFSampler(
-        vertices, triangles, distribution, sdf, resolution, bbox_min, bbox_max, parameters
+    mesh_sampler = MeshSampler(
+        parameters, vertices, triangles, distribution, sdm, bbox_min, bbox_max
     )
     return mesh_sampler
 end
 
 function construct_triangle_distribution(
-    vertices::Vector{Point3f}, triangles::Vector{GLTriangleFace}
+    vertices::Vector{Point3f}, triangles::Vector{NTuple{3,Int32}}
 )
     num_faces = length(triangles)
     weights = Vector{Float32}(undef, num_faces)
@@ -74,11 +72,11 @@ function compute_bounding_box(vertices::Vector{Point3f})
     return (bbox_min, bbox_max)
 end
 
-function Broadcast.broadcastable(mesh_sampler::MeshSDFSampler)
+function Broadcast.broadcastable(mesh_sampler::MeshSampler)
     return Ref(mesh_sampler)
 end
 
-function mean_and_std_parameters(mesh_samplers::AbstractVector{MeshSDFSampler})
+function mean_and_std_parameters(mesh_samplers::AbstractVector{MeshSampler})
     num_meshes = length(mesh_samplers)
     dim = length(first(mesh_samplers).parameters)
     μ = zeros(Float32, dim)
@@ -208,14 +206,14 @@ end
 
 @inline function sample_mesh_surface(
     vertices::Vector{Point3f},
-    triangles::Vector{GLTriangleFace},
+    triangles::Vector{NTuple{3,Int32}},
     cat_distr::AliasTable{UInt32,Int},
     rng::AbstractRNG
 )
     # sample a triangle face
-    index = sample(rng, cat_distr)
+    tri_index = sample(rng, cat_distr)
     @inbounds begin
-        (i, j, k) = triangles[index]
+        (i, j, k) = triangles[tri_index]
         vertex_a = vertices[i]
         vertex_b = vertices[j]
         vertex_c = vertices[k]
@@ -227,19 +225,19 @@ end
     w_b = u * (1.0f0 - v)
     w_c = u * v
     point = w_a * vertex_a + w_b * vertex_b + w_c * vertex_c
-    return point
+    return (point, tri_index)
 end
 
 @inline function sample_mesh_surface!(
     points::AbstractMatrix{Float32},
     vertices::Vector{Point3f},
-    triangles::Vector{GLTriangleFace},
+    triangles::Vector{NTuple{3,Int32}},
     cat_distr::AliasTable{UInt32,Int},
     rng::AbstractRNG
 )
     @assert size(points, 1) == 3
     @inbounds for j in axes(points, 2)
-        (x, y, z) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
+        ((x, y, z), _) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
         points[1, j] = x
         points[2, j] = y
         points[3, j] = z
@@ -249,27 +247,42 @@ end
 
 @inline function sample_near_mesh_surface!(
     points::AbstractMatrix{Float32},
+    upper_bounds²::AbstractVector{Float32},
+    hint_faces::AbstractVector{Int32},
     vertices::Vector{Point3f},
-    triangles::Vector{GLTriangleFace},
+    triangles::Vector{NTuple{3,Int32}},
     cat_distr::AliasTable{UInt32,Int},
     σ::Float32,
     rng::AbstractRNG
 )
     @assert size(points, 1) == 3
     @inbounds for j in axes(points, 2)
-        (x, y, z) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
-        points[1, j] = perturb(x, σ, rng)
-        points[2, j] = perturb(y, σ, rng)
-        points[3, j] = perturb(z, σ, rng)
+        (point, tri_index) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
+        ((x, y, z), dist²) = perturb(point, σ, rng)
+        points[1, j] = x
+        points[2, j] = y
+        points[3, j] = z
+        upper_bounds²[j] = dist²
+        hint_faces[j] = tri_index
     end
     return points
 end
 
 # add Gaussian noise to the x, while keeping it inside [-1, 1]
+@inline function perturb(point::Point3f, σ::Float32, rng::AbstractRNG)
+    (x, δ_x) = perturb(point[1], σ, rng)
+    (y, δ_y) = perturb(point[2], σ, rng)
+    (z, δ_z) = perturb(point[3], σ, rng)
+    point_new = (x, y, z)
+    dist² = δ_x * δ_x + δ_y * δ_y + δ_z * δ_z
+    return (point_new, dist²)
+end
+
 @inline function perturb(x::Float32, σ::Float32, rng::AbstractRNG)
     while true
-        x̃ = x + σ * randn(rng, Float32)
-        (abs(x̃) > 1.0f0) || return x̃
+        δ = σ * randn(rng, Float32)
+        x̃ = x + δ
+        (abs(x̃) > 1.0f0) || return (x̃, δ)
     end
 end
 
@@ -282,7 +295,7 @@ end
 end
 
 function sample_sdf_and_eikonal_points!(
-    buffer::EikonalSamplingBuffer, sampler::MeshSDFSampler, params::SamplingParameters{N}
+    buffer::EikonalSamplingBuffer, sampler::MeshSampler, params::SamplingParameters{N}
 ) where {N}
     rng = params.rng
     num_eikonal = params.num_eikonal
@@ -312,28 +325,29 @@ function sample_sdf_and_eikonal_points!(
 end
 
 function sample_sdf_points!(
-    buffer::SDFSamplingBuffer, sampler::MeshSDFSampler, params::SamplingParameters{N}
+    buffer::SDFSamplingBuffer, sampler::MeshSampler, params::SamplingParameters{N}
 ) where {N}
     rng = params.rng
-    num_samples = params.num_samples
-    voxel_size = params.voxel_size
     slice_surface = params.slice_surface
     slice_band = params.slice_band
     slice_volume = params.slice_volume
-    slice_off_surface = first(slice_band):num_samples
     subslices_band = params.subslices_band
     σs = params.σs
 
     vertices = sampler.vertices
     triangles = sampler.triangles
     cat_distr = sampler.distribution
-    sdf = sampler.sdf
+    sdm = sampler.sdm
 
     points = buffer.points
     signed_dists = buffer.signed_dists
+    upper_bounds² = Vector{Float32}(undef, length(slice_band))
+    hint_faces = Vector{Int32}(undef, length(slice_band))
+    shift = length(slice_surface)
 
     @inbounds begin
         points_surface = @view points[:, slice_surface]
+        points_band = @view points[:, slice_band]
         points_volume = @view points[:, slice_volume]
 
         sample_mesh_surface!(points_surface, vertices, triangles, cat_distr, rng)
@@ -341,20 +355,20 @@ function sample_sdf_points!(
         for i in 1:N
             σ = σs[i]
             slice = subslices_band[i]
-            points_band = @view points[:, slice]
-            sample_near_mesh_surface!(points_band, vertices, triangles, cat_distr, σ, rng)
+            slice_shifted = slice .- shift
+            pts = @view points[:, slice]
+            ubs² = @view upper_bounds²[slice_shifted]
+            hfs = @view hint_faces[slice_shifted]
+            sample_near_mesh_surface!(pts, ubs², hfs, vertices, triangles, cat_distr, σ, rng)
         end
 
         # compute corresponding signed distances via trilinear interpolation
-        (n_x, n_y, n_z) = size(sdf) .- 1
         signed_dists[slice_surface] .= 0.0f0
-        @batch for j in slice_off_surface
-            signed_dists[j] = trilerp_sdf(
-                sdf, points[1, j], points[2, j], points[3, j],
-                voxel_size, voxel_size, voxel_size,
-                n_x, n_y, n_z
-            )
-        end
+        signed_dists_band = @view signed_dists[slice_band]
+        signed_dists_volume = @view signed_dists[slice_volume]
+
+        compute_signed_distance!(signed_dists_volume, sdm, points_volume)
+        compute_signed_distance!(signed_dists_band, sdm, points_band, upper_bounds², hint_faces)
     end
     return (points, signed_dists, sampler.parameters)
 end
