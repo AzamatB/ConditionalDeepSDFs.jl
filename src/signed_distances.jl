@@ -495,25 +495,13 @@ end
 ######################################   Single-Point Query   ######################################
 
 function signed_distance_point(
-    sdm::SignedDistanceMesh{Tg,Ts},
-    point::Point3{Tg},
-    upper_bound²::Tg,
-    hint_face::Int32,
-    stack::Vector{NodeDist{Tg}}
+    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, hint_face::Int32, stack::Vector{NodeDist{Tg}}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
-    dist²_best = upper_bound²
-    Δ_best = zero(Point3{Tg})
-    feat_best = UInt8(0)
-    tri_best = hint_face
     # tighten initial bound using the provided triangle hint (packed index).
     # this is especially effective for near-surface samples.
+    tri_best = hint_face
     @inbounds triangle = sdm.tri_geometries[tri_best]
-    (dist²_hint, Δ_hint, feat_hint) = closest_diff_triangle(point, triangle)
-    if dist²_hint <= dist²_best
-        dist²_best = dist²_hint
-        Δ_best = Δ_hint
-        feat_best = feat_hint
-    end
+    (dist²_best, Δ_best, feat_best) = closest_diff_triangle(point, triangle)
     (dist²_best <= 0) && return zero(Tg)
 
     signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stack)
@@ -615,18 +603,15 @@ end
 ##########################################   Public API   ##########################################
 
 """
-    compute_signed_distance!(out, sdm, points_mat, [upper_bounds², hint_faces])
+    compute_signed_distance!(out, sdm, points_mat, [hint_faces])
 
 In-place batch signed distance query. Writes results into `out`.
 - `out`:            length-n vector to store the output signed distances.
 - `sdm`:            a [`SignedDistanceMesh`] built once via `preprocess_mesh`.
 - `points_mat`:     `3 × n` matrix of query points (Float32 recommended).
-- `upper_bounds²`:  length-n vector of unsigned distance upper bounds per point.
-                    Pass `Inf` for any point without a known bound.
-- `hint_faces`:     length-n vector of *original* face indices (1-based,
-                    matching the input `faces`) for each point.
-                    This uses a single exact triangle check to tighten the upper bound before
-                    BVH traversal, which can substantially speed up near-surface queries.
+- `hint_faces`:     length-n vector of *original* face indices (1-based, matching the input `faces`)
+                    for each point. This uses a single exact triangle check to tighten the upper
+                    bound before BVH traversal, which can substantially speed up near-surface queries.
 
 Positive = outside, negative = inside.
 
@@ -638,11 +623,10 @@ function compute_signed_distance!(
     out::AbstractVector{Tg},
     sdm::SignedDistanceMesh{Tg,Ts},
     points::StridedMatrix{Tg},
-    upper_bounds²::Vector{Tg},
     hint_faces::Vector{Int32}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
     num_points = size(points, 2)
-    @assert length(out) == length(upper_bounds²) == length(hint_faces) == num_points
+    @assert length(out) == length(hint_faces) == num_points
     @assert size(points, 1) == 3 "points matrix must be 3×n"
 
     face_to_packed = sdm.face_to_packed
@@ -660,9 +644,7 @@ function compute_signed_distance!(
             idx_face = hint_faces[idx]
             @inbounds idx_face_packed = face_to_packed[idx_face]
             @inbounds point = Point3{Tg}(points[1, idx], points[2, idx], points[3, idx])
-            @inbounds out[idx] = signed_distance_point(
-                sdm, point, upper_bounds²[idx], idx_face_packed, stack
-            )
+            @inbounds out[idx] = signed_distance_point(sdm, point, idx_face_packed, stack)
         end
     end
     return out

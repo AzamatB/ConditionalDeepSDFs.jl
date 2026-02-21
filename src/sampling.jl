@@ -225,7 +225,7 @@ end
     w_b = u * (1.0f0 - v)
     w_c = u * v
     point = w_a * vertex_a + w_b * vertex_b + w_c * vertex_c
-    return (point, tri_index)
+    return (point[1], point[2], point[3], tri_index)
 end
 
 @inline function sample_mesh_surface!(
@@ -237,7 +237,7 @@ end
 )
     @assert size(points, 1) == 3
     @inbounds for j in axes(points, 2)
-        ((x, y, z), _) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
+        (x, y, z, _) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
         points[1, j] = x
         points[2, j] = y
         points[3, j] = z
@@ -247,7 +247,6 @@ end
 
 @inline function sample_near_mesh_surface!(
     points::AbstractMatrix{Float32},
-    upper_bounds²::AbstractVector{Float32},
     hint_faces::AbstractVector{Int32},
     vertices::Vector{Point3f},
     triangles::Vector{NTuple{3,Int32}},
@@ -257,32 +256,19 @@ end
 )
     @assert size(points, 1) == 3
     @inbounds for j in axes(points, 2)
-        (point, tri_index) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
-        ((x, y, z), dist²) = perturb(point, σ, rng)
-        points[1, j] = x
-        points[2, j] = y
-        points[3, j] = z
-        upper_bounds²[j] = dist²
+        (x, y, z, tri_index) = sample_mesh_surface(vertices, triangles, cat_distr, rng)
+        points[1, j] = perturb(x, σ, rng)
+        points[2, j] = perturb(y, σ, rng)
+        points[3, j] = perturb(z, σ, rng)
         hint_faces[j] = tri_index
     end
-    return points
-end
-
-# add Gaussian noise to the x, while keeping it inside [-1, 1]
-@inline function perturb(point::Point3f, σ::Float32, rng::AbstractRNG)
-    (x, δ_x) = perturb(point[1], σ, rng)
-    (y, δ_y) = perturb(point[2], σ, rng)
-    (z, δ_z) = perturb(point[3], σ, rng)
-    point_new = (x, y, z)
-    dist² = δ_x * δ_x + δ_y * δ_y + δ_z * δ_z
-    return (point_new, dist²)
+    return nothing
 end
 
 @inline function perturb(x::Float32, σ::Float32, rng::AbstractRNG)
     while true
-        δ = σ * randn(rng, Float32)
-        x̃ = x + δ
-        (abs(x̃) > 1.0f0) || return (x̃, δ)
+        x̃ = x + σ * randn(rng, Float32)
+        (abs(x̃) > 1.0f0) || return x̃::Float32
     end
 end
 
@@ -341,7 +327,6 @@ function sample_sdf_points!(
 
     points = buffer.points
     signed_dists = buffer.signed_dists
-    upper_bounds² = Vector{Float32}(undef, length(slice_band))
     hint_faces = Vector{Int32}(undef, length(slice_band))
     shift = length(slice_surface)
 
@@ -356,10 +341,9 @@ function sample_sdf_points!(
             σ = σs[i]
             slice = subslices_band[i]
             slice_shifted = slice .- shift
-            pts = @view points[:, slice]
-            ubs² = @view upper_bounds²[slice_shifted]
-            hfs = @view hint_faces[slice_shifted]
-            sample_near_mesh_surface!(pts, ubs², hfs, vertices, triangles, cat_distr, σ, rng)
+            points_slice = @view points[:, slice]
+            hint_faces_slice = @view hint_faces[slice_shifted]
+            sample_near_mesh_surface!(points_slice, hint_faces_slice, vertices, triangles, cat_distr, σ, rng)
         end
 
         # compute corresponding signed distances via trilinear interpolation
@@ -368,7 +352,7 @@ function sample_sdf_points!(
         signed_dists_volume = @view signed_dists[slice_volume]
 
         compute_signed_distance!(signed_dists_volume, sdm, points_volume)
-        compute_signed_distance!(signed_dists_band, sdm, points_band, upper_bounds², hint_faces)
+        compute_signed_distance!(signed_dists_band, sdm, points_band, hint_faces)
     end
     return (points, signed_dists, sampler.parameters)
 end
