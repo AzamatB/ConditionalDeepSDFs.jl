@@ -300,11 +300,13 @@ function sample_sdf_and_eikonal_points!(
 
     # gather eikonal points into pre-allocated buffer
     num_eikonal = length(indices_eikonal)
-    points_eikonal = reshape(view(buffer.points_eikonal, 1:(3*num_eikonal)), 3, num_eikonal)
-    @inbounds for (col, idx) in enumerate(indices_eikonal)
-        points_eikonal[1, col] = points_off_surface[1, idx]
-        points_eikonal[2, col] = points_off_surface[2, idx]
-        points_eikonal[3, col] = points_off_surface[3, idx]
+    memory = buffer.points_eikonal
+    resize!(memory, 3 * num_eikonal)
+    points_eikonal = reshape(memory, 3, num_eikonal)
+    @inbounds for (col_dst, col_src) in enumerate(indices_eikonal)
+        points_eikonal[1, col_dst] = points_off_surface[1, col_src]
+        points_eikonal[2, col_dst] = points_off_surface[2, col_src]
+        points_eikonal[3, col_dst] = points_off_surface[3, col_src]
     end
     return (points, signed_dists, points_eikonal, mesh_params)
 end
