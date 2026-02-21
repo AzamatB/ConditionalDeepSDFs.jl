@@ -172,6 +172,35 @@ function partition_slice(
     return partition
 end
 
+#######################################   Sampling Buffers   #######################################
+
+struct SDFSamplingBuffer
+    points::Matrix{Float32}
+    signed_dists::Vector{Float32}
+end
+
+function SDFSamplingBuffer(params::SamplingParameters)
+    points = Matrix{Float32}(undef, 3, params.num_samples)
+    signed_dists = Vector{Float32}(undef, params.num_samples)
+    return SDFSamplingBuffer(points, signed_dists)
+end
+
+struct EikonalSamplingBuffer
+    sdf_buffer::SDFSamplingBuffer
+    indices_eikonal::Vector{Int}
+    points_eikonal::Vector{Float32}
+end
+
+function EikonalSamplingBuffer(params::SamplingParameters)
+    sdf_buffer = SDFSamplingBuffer(params)
+    num_off_surface = params.num_samples - last(params.slice_surface)
+    indices_eikonal = Vector{Int}(undef, num_off_surface)
+    points_eikonal = Vector{Float32}(undef, 3 * params.num_eikonal)
+    return EikonalSamplingBuffer(sdf_buffer, indices_eikonal, points_eikonal)
+end
+
+######################################   Sampling Functions   ######################################
+
 @inline function sample(rng::AbstractRNG, cat_distr::AliasTable{T,Int}) where {T}
     seed = rand(rng, T)
     return AliasTables.sample(seed, cat_distr)
@@ -252,25 +281,37 @@ end
     return points
 end
 
-function sample_sdf_and_eikonal_points(
-    sampler::MeshSDFSampler, params::SamplingParameters{N}
+function sample_sdf_and_eikonal_points!(
+    buffer::EikonalSamplingBuffer, sampler::MeshSDFSampler, params::SamplingParameters{N}
 ) where {N}
     rng = params.rng
     num_eikonal = params.num_eikonal
     threshold_eikonal = params.threshold_eikonal
     slice_off_surface = first(params.slice_band):params.num_samples
 
-    (points, signed_dists, mesh_params) = sample_sdf_points(sampler, params)
+    (points, signed_dists, mesh_params) = sample_sdf_points!(sampler, params, buffer.sdf_buffer)
     points_off_surface = @view points[:, slice_off_surface]
-    # select the subset of eikonal points; skip points on the surface without even checking them
     signed_dists_off_surface = @view signed_dists[slice_off_surface]
-    indices_eikonal = findall(sd -> abs(sd) > threshold_eikonal, signed_dists_off_surface)
+
+    # find eikonal candidate indices (into the off-surface view) without allocating
+    indices_eikonal = buffer.indices_eikonal
+    find_eikonal_indices!(indices_eikonal, signed_dists_off_surface, threshold_eikonal)
     take_random_subset!(indices_eikonal, num_eikonal, rng)
-    points_eikonal = points_off_surface[:, indices_eikonal]
+
+    # gather eikonal points into pre-allocated buffer
+    num_eikonal = length(indices_eikonal)
+    points_eikonal = reshape(@view buffer.points_eikonal[1:3*num_eikonal], 3, num_eikonal)
+    @inbounds for (col, idx) in enumerate(indices_eikonal)
+        points_eikonal[1, col] = points_off_surface[1, idx]
+        points_eikonal[2, col] = points_off_surface[2, idx]
+        points_eikonal[3, col] = points_off_surface[3, idx]
+    end
     return (points, signed_dists, points_eikonal, mesh_params)
 end
 
-function sample_sdf_points(sampler::MeshSDFSampler, params::SamplingParameters{N}) where {N}
+function sample_sdf_points!(
+    buffer::SDFSamplingBuffer, sampler::MeshSDFSampler, params::SamplingParameters{N}
+) where {N}
     rng = params.rng
     num_samples = params.num_samples
     voxel_size = params.voxel_size
@@ -286,8 +327,10 @@ function sample_sdf_points(sampler::MeshSDFSampler, params::SamplingParameters{N
     cat_distr = sampler.distribution
     sdf = sampler.sdf
 
+    points = buffer.points
+    signed_dists = buffer.signed_dists
+
     @inbounds begin
-        points = Matrix{Float32}(undef, 3, num_samples)
         points_surface = @view points[:, slice_surface]
         points_volume = @view points[:, slice_volume]
 
@@ -302,9 +345,8 @@ function sample_sdf_points(sampler::MeshSDFSampler, params::SamplingParameters{N
 
         # compute corresponding signed distances via trilinear interpolation
         (n_x, n_y, n_z) = size(sdf) .- 1
-        signed_dists = Vector{Float32}(undef, num_samples)
         signed_dists[slice_surface] .= 0.0f0
-        Threads.@threads for j in slice_off_surface
+        @batch for j in slice_off_surface
             signed_dists[j] = trilerp_sdf(
                 sdf, points[1, j], points[2, j], points[3, j],
                 voxel_size, voxel_size, voxel_size,
@@ -357,14 +399,36 @@ function trilerp_sdf(
     return v::Float32
 end
 
-# partial Fisher–Yates shuffle
-@inline function take_random_subset!(indices::Vector{Int}, k::Int, rng::AbstractRNG)
+###########################################   Helpers   ###########################################
+
+"""
+Scan `signed_dists` for entries exceeding `threshold` in absolute value,
+writing their indices into `indices` in-place. Replaces `findall` to avoid allocation.
+"""
+@inline function find_eikonal_indices!(
+    indices::Vector{Int}, signed_dists::AbstractVector{Float32}, threshold::Float32
+)
+    count = 0
+    @inbounds for j in eachindex(signed_dists)
+        if abs(signed_dists[j]) > threshold
+            count += 1
+            indices[count] = j
+        end
+    end
+    subindices = @view indices[1:count]
+    return subindices
+end
+
+# partial Fisher–Yates shuffle on a view — returns @view indices[1:k]
+@inline function take_random_subset!(
+    indices::T, k::Int, rng::AbstractRNG
+) where {T<:SubArray{Int,1,Vector{Int}}}
     n = length(indices)
-    (k < n) || return indices
+    (k < n) || return indices::T
     @inbounds for i in 1:k
         j = rand(rng, i:n)
         (indices[i], indices[j]) = (indices[j], indices[i])
     end
-    resize!(indices, k)
-    return indices
+    subindices = @view indices[1:k]
+    return subindices::T
 end
