@@ -504,16 +504,15 @@ function signed_distance_point(
     dist²_best = upper_bound²
     Δ_best = zero(Point3{Tg})
     feat_best = UInt8(0)
-    tri_best = Int32(0)
+    tri_best = hint_face
     # tighten initial bound using the provided triangle hint (packed index).
     # this is especially effective for near-surface samples.
-    @inbounds triangle = sdm.tri_geometries[hint_face]
+    @inbounds triangle = sdm.tri_geometries[tri_best]
     (dist²_hint, Δ_hint, feat_hint) = closest_diff_triangle(point, triangle)
-    if dist²_hint < dist²_best
+    if dist²_hint <= dist²_best
         dist²_best = dist²_hint
         Δ_best = Δ_hint
         feat_best = feat_hint
-        tri_best = hint_face
     end
     (dist²_best <= 0) && return zero(Tg)
 
@@ -585,7 +584,7 @@ function signed_distance_point_kernel(
             leaf_end = leaf_start + leaf_size - Int32(1)
             for idx in leaf_start:leaf_end
                 (dist², Δ, feat) = closest_diff_triangle(point, tri_geometries[idx])
-                if dist² < dist²_best
+                if dist² <= dist²_best
                     dist²_best = dist²
                     Δ_best = Δ
                     feat_best = feat
