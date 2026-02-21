@@ -289,14 +289,14 @@ function sample_sdf_and_eikonal_points!(
     threshold_eikonal = params.threshold_eikonal
     slice_off_surface = first(params.slice_band):params.num_samples
 
-    (points, signed_dists, mesh_params) = sample_sdf_points!(sampler, params, buffer.sdf_buffer)
+    (points, signed_dists, mesh_params) = sample_sdf_points!(buffer.sdf_buffer, sampler, params)
     points_off_surface = @view points[:, slice_off_surface]
     signed_dists_off_surface = @view signed_dists[slice_off_surface]
 
     # find eikonal candidate indices (into the off-surface view) without allocating
-    indices_eikonal = buffer.indices_eikonal
-    find_eikonal_indices!(indices_eikonal, signed_dists_off_surface, threshold_eikonal)
-    take_random_subset!(indices_eikonal, num_eikonal, rng)
+    indices = buffer.indices_eikonal
+    candidates = find_eikonal_indices!(indices, signed_dists_off_surface, threshold_eikonal)
+    indices_eikonal = take_random_subset(candidates, num_eikonal, rng)
 
     # gather eikonal points into pre-allocated buffer
     num_eikonal = length(indices_eikonal)
