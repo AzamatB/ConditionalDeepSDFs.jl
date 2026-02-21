@@ -296,11 +296,11 @@ function sample_sdf_and_eikonal_points!(
     # find eikonal candidate indices (into the off-surface view) without allocating
     indices = buffer.indices_eikonal
     candidates = find_eikonal_indices!(indices, signed_dists_off_surface, threshold_eikonal)
-    indices_eikonal = take_random_subset(candidates, num_eikonal, rng)
+    indices_eikonal = take_random_subset!(candidates, num_eikonal, rng)
 
     # gather eikonal points into pre-allocated buffer
     num_eikonal = length(indices_eikonal)
-    points_eikonal = reshape(@view buffer.points_eikonal[1:3*num_eikonal], 3, num_eikonal)
+    points_eikonal = reshape(view(buffer.points_eikonal, 1:(3*num_eikonal)), 3, num_eikonal)
     @inbounds for (col, idx) in enumerate(indices_eikonal)
         points_eikonal[1, col] = points_off_surface[1, idx]
         points_eikonal[2, col] = points_off_surface[2, idx]

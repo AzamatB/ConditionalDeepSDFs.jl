@@ -12,6 +12,7 @@ using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
 include("sdf.jl")
 
 using AliasTables
+using Polyester
 using Random
 
 include("sampling.jl")
