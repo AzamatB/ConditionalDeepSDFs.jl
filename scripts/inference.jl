@@ -2,7 +2,7 @@ using Pkg
 Pkg.activate(@__DIR__)
 
 using ConditionalDeepSDFs
-using ConditionalDeepSDFs: ConditionalSDF, GridSlabs, LazyUnitCubeGrid, MeshSDFSampler,
+using ConditionalDeepSDFs: ConditionalSDF, GridSlabs, LazyUnitCubeGrid, MeshSampler,
     construct_mesh, point_indices, slab_points, visualize
 using Reactant
 using JLD2

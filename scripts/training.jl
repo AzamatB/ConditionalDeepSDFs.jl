@@ -4,7 +4,7 @@ Pkg.activate(@__DIR__)
 
 using Reactant
 using ConditionalDeepSDFs
-using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters,
+using ConditionalDeepSDFs: ConditionalSDF, MeshSampler, SamplingParameters,
     SDFSamplingBuffer, EikonalSamplingBuffer, SDFEikonalLoss,
     mean_and_std_parameters, sample_sdf_points!, sample_sdf_and_eikonal_points!
 using GeometryBasics

@@ -5,14 +5,13 @@ using LinearAlgebra
 
 include("canonicalization.jl")
 
-using CUDA
+using Base.Threads
 using GLMakie: Figure, LScene, Screen, mesh!
 using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
 
-include("sdf.jl")
+include("signed_distances.jl")
 
 using AliasTables
-using Polyester
 using Random
 
 include("sampling.jl")

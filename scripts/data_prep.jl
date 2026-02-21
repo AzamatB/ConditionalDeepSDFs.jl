@@ -2,7 +2,7 @@ using Pkg
 Pkg.activate(@__DIR__)
 
 using Base.Order: Forward
-using ConditionalDeepSDFs: MeshSDFSampler
+using ConditionalDeepSDFs: MeshSampler
 using CSV
 using DataStructures
 using FileIO
@@ -82,15 +82,15 @@ mesh_dict_2 = read_data_batch(csv_path, mesh_dir, mesh_file, folder_pattern; del
 
 offset = length(mesh_dict_1)
 len = offset + length(mesh_dict_2)
-mesh_samplers = Vector{MeshSDFSampler}(undef, len)
+mesh_samplers = Vector{MeshSampler}(undef, len)
 
 # batch 1
 for (i, (_, (mesh, params))) in enumerate(mesh_dict_1)
-    mesh_samplers[i] = MeshSDFSampler(mesh, params)
+    mesh_samplers[i] = MeshSampler(mesh, params)
 end
 # batch 2
 for (i, (_, (mesh, params))) in enumerate(mesh_dict_2)
-    mesh_samplers[offset+i] = MeshSDFSampler(mesh, params)
+    mesh_samplers[offset+i] = MeshSampler(mesh, params)
 end
 
 all(index -> isassigned(mesh_samplers, index), eachindex(mesh_samplers)) || error("Not all mesh samplers have been constructed.")
