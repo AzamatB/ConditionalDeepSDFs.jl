@@ -4,8 +4,9 @@ Pkg.activate(@__DIR__)
 
 using Reactant
 using ConditionalDeepSDFs
-using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters, SDFEikonalLoss,
-    mean_and_std_parameters, sample_sdf_points, sample_sdf_and_eikonal_points
+using ConditionalDeepSDFs: ConditionalSDF, MeshSDFSampler, SamplingParameters,
+    SDFSamplingBuffer, EikonalSamplingBuffer, SDFEikonalLoss,
+    mean_and_std_parameters, sample_sdf_points!, sample_sdf_and_eikonal_points!
 using GeometryBasics
 using JLD2
 using Lux
@@ -87,6 +88,10 @@ function train_model(
     )
     threshold_clamp = sampling_params.threshold_clamp
 
+    # pre-allocate sampling buffers (reused across all iterations)
+    eikonal_buffer = EikonalSamplingBuffer(sampling_params)
+    sdf_buffer = SDFSamplingBuffer(sampling_params)
+
     # load dataset into CPU memory
     @time (mesh_samplers_train, mesh_samplers_val, _, μ, σ) = load_mesh_samplers!(dataset_path, rng)
     num_meshes_train = length(mesh_samplers_train)
@@ -121,7 +126,10 @@ function train_model(
     ad_engine = AutoEnzyme()
 
     # precompile model for validation evaluation
-    samples_batch = device(sample_sdf_points.(mesh_samplers_val, sampling_params))
+    # each sample_sdf_points! call overwrites sdf_buffer, so send to device before next call
+    samples_batch = map(mesh_samplers_val) do sampler
+        sample_sdf_points!(sdf_buffer, sampler, sampling_params) |> device
+    end
     evaluate_dataset_loss_compiled = @compile ConditionalDeepSDFs.evaluate_dataset_loss(
         model, params, states, samples_batch, threshold_clamp
     )
@@ -137,7 +145,7 @@ function train_model(
     for epoch in 1:num_epochs
         loss_train = 0.0f0
         for sampler in mesh_samplers_train
-            samples = sample_sdf_and_eikonal_points(sampler, sampling_params) |> device
+            samples = sample_sdf_and_eikonal_points!(eikonal_buffer, sampler, sampling_params) |> device
             _, loss, _, train_state = Training.single_train_step!(
                 ad_engine, loss_func, samples, train_state
             )
@@ -147,7 +155,9 @@ function train_model(
         @printf "Epoch [%3d]: Training Loss  %4.6f\n" epoch loss_train
 
         # evaluate the model on validation set
-        samples_batch = device(sample_sdf_points.(mesh_samplers_val, sampling_params))
+        samples_batch = map(mesh_samplers_val) do sampler
+            sample_sdf_points!(sdf_buffer, sampler, sampling_params) |> device
+        end
         loss_val = evaluate_dataset_loss(
             model, train_state.parameters, train_state.states, samples_batch, threshold_clamp
         )
