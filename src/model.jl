@@ -83,9 +83,15 @@ end
 
 function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearXP)
     dim_out = layer.dim_out
-    Wx = glorot_uniform(rng, dim_out, layer.dim_x_in)
-    Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
-    b = zeros(Float32, layer.dim_out)
+    # calculate unified dimensions to match standard concatenated Dense layer
+    dim_x_in = layer.dim_x_in
+    dim_in = dim_x_in + layer.dim_p_in
+    W = glorot_uniform(rng, dim_out, dim_in)
+
+    Wx = W[:, begin:dim_x_in]
+    Wp = W[:, (dim_x_in+1):end]
+
+    b = zeros(Float32, dim_out)
     return (; Wx, Wp, b)
 end
 
@@ -119,10 +125,18 @@ end
 
 function LuxCore.initialparameters(rng::AbstractRNG, layer::LinearHXP)
     dim_out = layer.dim_out
-    Wh = glorot_uniform(rng, dim_out, layer.dim_h_in)
-    Wx = glorot_uniform(rng, dim_out, layer.dim_x_in)
-    Wp = glorot_uniform(rng, dim_out, layer.dim_p_in)
-    b = zeros(Float32, layer.dim_out)
+    # calculate unified dimensions to match standard concatenated Dense layer
+    dim_h_in = layer.dim_h_in
+    dim_x_in = layer.dim_x_in
+    dim_hx_in = dim_h_in + dim_x_in
+    dim_in = dim_hx_in + layer.dim_p_in
+    W = glorot_uniform(rng, dim_out, dim_in)
+
+    Wh = W[:, begin:dim_h_in]
+    Wx = W[:, (dim_h_in+1):dim_hx_in]
+    Wp = W[:, (dim_hx_in+1):end]
+
+    b = zeros(Float32, dim_out)
     return (; Wh, Wx, Wp, b)
 end
 
