@@ -572,7 +572,7 @@ function signed_distance_point_kernel(
             leaf_end = leaf_start + leaf_size - Int32(1)
             for idx in leaf_start:leaf_end
                 (dist², Δ, feat) = closest_diff_triangle(point, tri_geometries[idx])
-                if dist² <= dist²_best
+                if dist² < dist²_best
                     dist²_best = dist²
                     Δ_best = Δ
                     feat_best = feat
@@ -582,7 +582,7 @@ function signed_distance_point_kernel(
         end
     end
 
-    iszero(tri_best) && return Tg(NaN)
+    iszero(tri_best) && error("No triangle found for point $point")
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
