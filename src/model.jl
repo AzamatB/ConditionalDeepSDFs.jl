@@ -198,10 +198,10 @@ function ConditionalSDF(
     num_fourier::Int=256,
     fourier_scale::Float32=24.0f0,
     scale_film::Float32=0.2f0,
-    dim_p::Int=4,
     dim_hidden::Int=1024,
     dim_film::Int=1024
 )
+    dim_p = 4
     mesh_params_norm = MeshParamsNorm(μ, σ)
     # Fourier feature output dimension
     num_hidden = 8
@@ -342,9 +342,9 @@ Loss function callable for Lux.Training.single_train_step!
 
 Expected samples tuple: (x_sdf, sdf_gt, x_eik, p)
 - x_sdf:   3 × n_sdf  points with ground-truth SDF values
-- sdf_gt:  1 × n_sdf  ground-truth SDF values
+- sdf_gt:  n_sdf      ground-truth SDF values
 - x_eik:   3 × n_eik  points for eikonal term (no GT needed)
-- p:       4 × 1      shape parameters for the object
+- p:       4          shape parameters for the object
 """
 function (loss::SDFEikonalLoss)(
     model::ConditionalSDF,
