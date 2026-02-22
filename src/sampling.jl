@@ -175,12 +175,14 @@ end
 struct SDFSamplingBuffer
     points::Matrix{Float32}
     signed_dists::Vector{Float32}
+    hint_faces::Vector{Int32}
 end
 
 function SDFSamplingBuffer(params::SamplingParameters)
-    points = Matrix{Float32}(undef, 3, params.num_samples)
-    signed_dists = Vector{Float32}(undef, params.num_samples)
-    return SDFSamplingBuffer(points, signed_dists)
+    points = zeros(Float32, 3, params.num_samples)
+    signed_dists = zeros(Float32, params.num_samples)
+    hint_faces = zeros(Int32, length(params.slice_band))
+    return SDFSamplingBuffer(points, signed_dists, hint_faces)
 end
 
 struct EikonalSamplingBuffer
@@ -192,8 +194,8 @@ end
 function EikonalSamplingBuffer(params::SamplingParameters)
     sdf_buffer = SDFSamplingBuffer(params)
     num_off_surface = params.num_samples - last(params.slice_surface)
-    indices_eikonal = Vector{Int}(undef, num_off_surface)
-    points_eikonal = Vector{Float32}(undef, 3 * params.num_eikonal)
+    indices_eikonal = zeros(Int, num_off_surface)
+    points_eikonal = zeros(Float32, 3 * params.num_eikonal)
     return EikonalSamplingBuffer(sdf_buffer, indices_eikonal, points_eikonal)
 end
 
@@ -327,7 +329,7 @@ function sample_sdf_points!(
 
     points = buffer.points
     signed_dists = buffer.signed_dists
-    hint_faces = Vector{Int32}(undef, length(slice_band))
+    hint_faces = buffer.hint_faces
     shift = length(slice_surface)
 
     @inbounds begin
