@@ -5,7 +5,7 @@ using LinearAlgebra
 
 include("canonicalization.jl")
 
-using Polyester
+using Base.Threads
 using GLMakie: Figure, LScene, Screen, mesh!
 using Meshing: MarchingCubes, MarchingTetrahedra, isosurface
 
