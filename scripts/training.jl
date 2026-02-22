@@ -88,8 +88,9 @@ function train_model(
     )
     threshold_clamp = sampling_params.threshold_clamp
 
-    # pre-allocate sampling buffers (reused across all iterations)
-    eikonal_buffer = EikonalSamplingBuffer(sampling_params)
+    # pre-allocate sampling buffers
+    # double-buffering for asynchronous data generation to prevent data races
+    eikonal_buffers = (EikonalSamplingBuffer(sampling_params), EikonalSamplingBuffer(sampling_params))
     sdf_buffer = SDFSamplingBuffer(sampling_params)
 
     # load dataset into CPU memory
@@ -144,8 +145,21 @@ function train_model(
     @info "Training..."
     for epoch in 1:num_epochs
         loss_train = 0.0f0
-        for sampler in mesh_samplers_train
-            samples = sample_sdf_and_eikonal_points!(eikonal_buffer, sampler, sampling_params) |> device
+
+        # shuffle training data each epoch
+        shuffle!(rng, mesh_samplers_train)
+
+        # asynchronous data loading pipeline
+        channel = Channel(2; spawn=true) do ch
+            for (i, sampler) in enumerate(mesh_samplers_train)
+                buffer = eikonal_buffers[(i%2)+1]
+                samples_cpu = sample_sdf_and_eikonal_points!(buffer, sampler, sampling_params)
+                samples_device = samples_cpu |> device
+                put!(ch, samples_device)
+            end
+        end
+
+        for samples in channel
             _, loss, _, train_state = Training.single_train_step!(
                 ad_engine, loss_func, samples, train_state
             )
