@@ -14,6 +14,7 @@ const cpu = cpu_device()                       # move results back to host for i
 
 model_path = normpath(joinpath(@__DIR__, "..", "trained_models/trained_model_epoch_458.jld2"))
 dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers_test.jld2"))
+slab_size = 8   # or 4
 
 # load the trained model
 trained_model = load_object(model_path)
@@ -24,8 +25,6 @@ display(model)
 
 # load the mesh samplers
 mesh_samplers = load_object(dataset_path)
-slab_size = 8   # or 4
-
 # compile the model
 mesh_sampler = first(mesh_samplers)
 resolution = mesh_sampler.resolution
@@ -39,7 +38,7 @@ model_compiled = @compile model((points, mesh_params), params, states)
 mesh_params = device(mesh_sampler.parameters)
 sdf_flat = Array{Float32}(undef, resolution^3)
 for idx in eachindex(grid_slabs)
-    points = device(slab_points(grid_slabs, idx))
+    local points = device(slab_points(grid_slabs, idx))
     indices = point_indices(grid_slabs, idx)
     (signed_dists, _) = model_compiled((points, mesh_params), params, states)
     copyto!(view(sdf_flat, indices), cpu(signed_dists))
