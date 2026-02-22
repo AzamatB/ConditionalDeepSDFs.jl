@@ -28,16 +28,16 @@ slab_size = 8   # or 4
 
 # compile the model
 mesh_sampler = first(mesh_samplers)
-n = mesh_sampler.resolution
-# slab_size must evenly divide n
-grid_slabs = GridSlabs(n, slab_size)
+resolution = mesh_sampler.resolution
+# slab_size must evenly divide resolution
+grid_slabs = GridSlabs(resolution, slab_size)
 points = device(slab_points(grid_slabs, 1))
 mesh_params = device(mesh_sampler.parameters)
 model_compiled = @compile model((points, mesh_params), params, states)
 
 # run full inference on a single mesh
 mesh_params = device(mesh_sampler.parameters)
-sdf_flat = Array{Float32}(undef, n^3)
+sdf_flat = Array{Float32}(undef, resolution^3)
 for idx in eachindex(grid_slabs)
     points = device(slab_points(grid_slabs, idx))
     indices = point_indices(grid_slabs, idx)
@@ -45,7 +45,7 @@ for idx in eachindex(grid_slabs)
     copyto!(view(sdf_flat, indices), cpu(signed_dists))
 end
 # reshape into a signed distance field over the grid
-sdf = reshape(sdf_flat, n, n, n)
+sdf = reshape(sdf_flat, resolution, resolution, resolution)
 # construct a mesh from the signed distance field
 mesh = construct_mesh(sdf)
 # visualize the mesh
