@@ -72,7 +72,7 @@ function train_model(
     weight_eikonal::Float32=0.1f0,
     # set training hyperparameters
     num_epochs::Integer,
-    learning_rate::Float32=1f-3,
+    learning_rate::Float32=0.0004f0,
     weight_decay::Float32=1f-4
 )
     sampling_params = SamplingParameters(
