@@ -153,8 +153,8 @@ function train_model(
             for (i, sampler) in enumerate(mesh_samplers_train)
                 buffer = eikonal_buffers[(i%2)+1]
                 samples_cpu = sample_sdf_and_eikonal_points!(buffer, sampler, sampling_params)
-                samples_device = samples_cpu |> device
-                put!(ch, samples_device)
+                samples_gpu = samples_cpu |> device
+                put!(ch, samples_gpu)
             end
         end
 
@@ -162,7 +162,7 @@ function train_model(
             _, loss, _, train_state = Training.single_train_step!(
                 ad_engine, loss_func, samples, train_state
             )
-            loss_train += loss
+            loss_train += Reactant.to_number(loss)
         end
         loss_train /= num_meshes_train
         @printf "Epoch [%3d]: Training Loss  %4.6f\n" epoch loss_train
