@@ -33,3 +33,7 @@ sdf = reshape(sdf_flat, resolution, resolution, resolution)
 mesh = construct_mesh(sdf)
 # visualize the mesh
 visualize(mesh)
+
+using GeometryBasics
+mesh_gt = Mesh(mesh_sampler.vertices, TriangleFace{Int32}.(mesh_sampler.triangles))
+visualize(mesh_gt)
