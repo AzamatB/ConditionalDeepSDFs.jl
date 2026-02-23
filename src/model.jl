@@ -212,8 +212,8 @@ function ConditionalSDF(
     num_fourier::Int=256,
     fourier_scale::Float32=24.0f0,
     scale_film::Float32=0.2f0,
-    dim_hidden::Int=1024,
-    dim_film::Int=1024
+    dim_hidden::Int=512,
+    dim_film::Int=256
 )
     dim_p = 4
     mesh_params_norm = MeshParamsNorm(μ, σ)
