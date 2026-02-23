@@ -103,11 +103,11 @@ function train_model(
         model = ConditionalSDF(
             μ,
             σ;
-            num_fourier=256,
-            fourier_scale=24.0f0,
+            num_fourier=128,
+            fourier_scale=10.0f0,
             scale_film=0.1f0,
             dim_hidden=512,
-            dim_film=256
+            dim_film=128
         )
         # setup model parameters and states
         (ps, st) = Lux.setup(rng, model)
@@ -196,7 +196,7 @@ const num_epochs = 700
 
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 const model_save_dir = normpath(joinpath(@__DIR__, "..", "trained_models"))
-model_path = nothing
-# model_path = joinpath(model_save_dir, "trained_model_epoch_11.jld2")
+# model_path = nothing
+model_path = joinpath(model_save_dir, "trained_model_epoch_458.jld2")
 
 (model, params, states) = train_model(rng, dataset_path; model_path, num_epochs, model_save_dir)
