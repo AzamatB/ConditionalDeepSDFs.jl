@@ -30,6 +30,22 @@ const FEAT_E23 = UInt8(5)    # edge BC  (v2–v3)
 const FEAT_E31 = UInt8(6)    # edge CA  (v3–v1)
 const FEAT_FACE = UInt8(7)   # face interior
 
+@inline function is_top_left(dx::T, dy::T) where {T<:AbstractFloat}
+    return (dy > zero(T)) | ((dy == zero(T)) & (dx < zero(T)))
+end
+
+@inline function pack_parity_edge_flags(abx::T, aby::T, acx::T, acy::T) where {T<:AbstractFloat}
+    det_xy = muladd(aby, acx, -abx * acy)
+    s = ifelse(det_xy < zero(T), one(T), -one(T))
+    own_u = is_top_left(-s * acx, -s * acy)
+    own_v = is_top_left(s * abx, s * aby)
+    own_w = is_top_left(s * (acx - abx), s * (acy - aby))
+    flags = UInt8(0)
+    own_u && (flags |= UInt8(0x01))
+    own_v && (flags |= UInt8(0x02))
+    own_w && (flags |= UInt8(0x04))
+    return flags
+end
 @inline function norm²(point::Point3{T}) where {T<:AbstractFloat}
     n² = point ⋅ point
     return n²::T
@@ -60,12 +76,7 @@ struct TriangleGeometry{T<:AbstractFloat}
     ac::Point3{T}
 end
 
-# all 7 pseudonormals packed per-triangle.
-# tuple indices match feature codes for O(1) lookup: normals[feat]
-#   [1]=v1  [2]=v2  [3]=v3  [4]=e12  [5]=e23  [6]=e31  [7]=face
-struct TriangleNormals{T<:AbstractFloat}
-    normals::NTuple{7,Point3{T}}
-end
+
 
 # AoS BVH node with overlapped integer fields for cache efficiency.
 # for T=Float32 this is 6×4 + 2×4 = 32 bytes — exactly two nodes per 64-byte cache line.
@@ -97,10 +108,9 @@ struct NodeDist{T<:AbstractFloat}
 end
 
 # Tg: geometry/distance type (Float32 recommended)
-# Ts: pseudonormal/sign type (Float64 recommended)
-struct SignedDistanceMesh{Tg<:AbstractFloat,Ts<:AbstractFloat}
+struct SignedDistanceMesh{Tg<:AbstractFloat}
     tri_geometries::Vector{TriangleGeometry{Tg}}   # packed by BVH leaf order
-    tri_normals::Vector{TriangleNormals{Ts}}       # packed by BVH leaf order
+    tri_edge_flags::Vector{UInt8}                  # parity edge ownership packed flags
     bvh::BoundingVolumeHierarchy{Tg}
     # face_to_packed[f] = packed triangle index for original face id f
     # (used to exploit your “source triangle” hints)
@@ -225,99 +235,28 @@ end
 end
 
 """
-    preprocess_mesh(mesh::Mesh{3,Float32,GLTriangleFace}; leaf_capacity=8, sign_type=Float64)
+    preprocess_mesh(mesh::Mesh{3,Float32,GLTriangleFace}; leaf_capacity=8)
 
 Build the acceleration structure for signed-distance queries on a
 watertight, consistently-oriented triangle mesh.
-
-- `mesh`:  `Mesh{3,Float32,GLTriangleFace}` closed, watertight, consistently-oriented triangle mesh.
-
-`sign_type` controls the floating-point type used for pseudonormal sign tests.
-Using `Float64` is recommended for robustness of the inside/outside sign.
-
-Returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls.
 """
 function preprocess_mesh(
-    mesh::Mesh{3,Float32,GLTriangleFace}, sign_type::Type{Ts}=Float64; leaf_capacity::Int=8
-) where {Ts<:AbstractFloat}
+    mesh::Mesh{3,Float32,GLTriangleFace}; leaf_capacity::Int=8
+)
     vertices = GeometryBasics.coordinates(mesh)
     tri_faces = GeometryBasics.faces(mesh)
     faces = NTuple{3,Int32}.(tri_faces)
-    return preprocess_mesh(vertices, faces, sign_type; leaf_capacity)
+    return preprocess_mesh(vertices, faces; leaf_capacity)
 end
 
 function preprocess_mesh(
     vertices::Vector{Point3f},
-    faces::Vector{NTuple{3,Int32}},
-    sign_type::Type{Ts}=Float64;
+    faces::Vector{NTuple{3,Int32}};
     leaf_capacity::Int=8
-) where {Ts<:AbstractFloat}
+)
     Tg = Float32
     num_vertices = length(vertices)
     num_faces = length(faces)
-
-    # face unit normals computed in Ts (Float64 recommended)
-    normals = Vector{Point3{Ts}}(undef, num_faces)
-    @inbounds for idx_face in eachindex(faces)
-        (idx_v1, idx_v2, idx_v3) = faces[idx_face]
-        v1 = Point3{Ts}(vertices[idx_v1])
-        v2 = Point3{Ts}(vertices[idx_v2])
-        v3 = Point3{Ts}(vertices[idx_v3])
-        normal = (v2 - v1) × (v3 - v1)
-        normals[idx_face] = normalize(normal)
-    end
-
-    # face_adjacency[edge, face] = index of the face sharing local `edge` of `face` (0 if boundary)
-    face_adjacency = zeros(Int32, 3, num_faces)
-    neighbors = Dict{UInt64,Tuple{Int32,Int32}}()
-    sizehint!(neighbors, 3 * num_faces)
-    @inbounds for idx_face in eachindex(faces)
-        (idx_v1, idx_v2, idx_v3) = faces[idx_face]
-        for (edge, vertex_a, vertex_b) in ((Int32(1), idx_v1, idx_v2), (Int32(2), idx_v2, idx_v3), (Int32(3), idx_v3, idx_v1))
-            key = edge_key(vertex_a, vertex_b)
-            pair = get(neighbors, key, nothing)
-            if pair === nothing
-                neighbors[key] = (Int32(idx_face), edge)
-            else
-                (face_adjacent, edge_common) = pair
-                face_adjacency[edge, idx_face] = face_adjacent
-                face_adjacency[edge_common, face_adjacent] = Int32(idx_face)
-                delete!(neighbors, key)
-            end
-        end
-    end
-    isempty(neighbors) || throw(ArgumentError("Mesh is not watertight: $(length(neighbors)) boundary edges"))
-
-    # edge pseudonormals: sum of adjacent unit face normals (unnormalized as only sign matters)
-    pns_edge = Matrix{Point3{Ts}}(undef, 3, num_faces)
-    for idx_face₁ in eachindex(normals)
-        normal₁ = normals[idx_face₁]
-        for edge in 1:3
-            idx_face₂ = face_adjacency[edge, idx_face₁]
-            normal₂ = normals[idx_face₂]
-            pns_edge[edge, idx_face₁] = normal₁ + normal₂
-        end
-    end
-
-    # vertex pseudonormals (angle-weighted, unnormalized) in Ts
-    pns_vertex = zeros(Point3{Ts}, num_vertices)
-    @inbounds for idx_face in eachindex(faces)
-        face = faces[idx_face]
-        (idx_v1, idx_v2, idx_v3) = face
-        v1 = Point3{Ts}(vertices[idx_v1])
-        v2 = Point3{Ts}(vertices[idx_v2])
-        v3 = Point3{Ts}(vertices[idx_v3])
-        normal = normals[idx_face]
-
-        α1 = angle_between(v2 - v1, v3 - v1)
-        α2 = angle_between(v3 - v2, v1 - v2)
-        α3 = angle_between(v1 - v3, v2 - v3)
-
-        # intentionally unnormalized: only sign(rvec ⋅ pn) matters for Bærentzen signing
-        pns_vertex[idx_v1] += α1 * normal
-        pns_vertex[idx_v2] += α2 * normal
-        pns_vertex[idx_v3] += α3 * normal
-    end
 
     # build BVH (in Tg)
     lb_x_t = Vector{Tg}(undef, num_faces)
@@ -357,9 +296,9 @@ function preprocess_mesh(
         centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t; leaf_capacity
     )
 
-    # pack triangle geometry & normals contiguously by BVH leaf order
+    # pack triangle geometry & edge flags contiguously by BVH leaf order
     tri_geometries = Vector{TriangleGeometry{Tg}}(undef, num_faces)
-    tri_normals = Vector{TriangleNormals{Ts}}(undef, num_faces)
+    tri_edge_flags = Vector{UInt8}(undef, num_faces)
 
     # map original face index → packed index (for triangle-hint acceleration)
     face_to_packed = Vector{Int32}(undef, num_faces)
@@ -372,21 +311,13 @@ function preprocess_mesh(
         v1 = vertices[idx_v1]
         v2 = vertices[idx_v2]
         v3 = vertices[idx_v3]
-        tri_geometries[j] = TriangleGeometry{Tg}(v1, v2 - v1, v3 - v1)
-
-        # tuple indices match feature codes for direct normals[feat] lookup
-        tri_normals[j] = TriangleNormals{Ts}((
-            pns_vertex[idx_v1],      # [1] = FEAT_V1
-            pns_vertex[idx_v2],      # [2] = FEAT_V2
-            pns_vertex[idx_v3],      # [3] = FEAT_V3
-            pns_edge[1, idx_face],   # [4] = FEAT_E12
-            pns_edge[2, idx_face],   # [5] = FEAT_E23
-            pns_edge[3, idx_face],   # [6] = FEAT_E31
-            normals[idx_face],       # [7] = FEAT_FACE
-        ))
+        ab = v2 - v1
+        ac = v3 - v1
+        tri_geometries[j] = TriangleGeometry{Tg}(v1, ab, ac)
+        tri_edge_flags[j] = pack_parity_edge_flags(ab[1], ab[2], ac[1], ac[2])
     end
 
-    return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed)
+    return SignedDistanceMesh{Tg}(tri_geometries, tri_edge_flags, bvh, face_to_packed)
 end
 
 function calculate_tree_height(num_faces::Integer, leaf_capacity::Integer)
@@ -397,7 +328,7 @@ end
 
 # allocate one traversal stack per chunk
 # each stack is tiny (~256 bytes for 100k triangles), so per-call allocation is negligible
-function allocate_stacks(sdm::SignedDistanceMesh{Tg,Ts}, num_points::Int) where {Tg,Ts}
+function allocate_stacks(sdm::SignedDistanceMesh{Tg}, num_points::Int) where {Tg}
     num_faces = length(sdm.tri_geometries)
     leaf_capacity = sdm.bvh.leaf_capacity
     tree_height = calculate_tree_height(num_faces, leaf_capacity)
@@ -508,8 +439,8 @@ end
 ######################################   Single-Point Query   ######################################
 
 function signed_distance_point(
-    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, hint_face::Int32, stack::Vector{NodeDist{Tg}}
-) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+    sdm::SignedDistanceMesh{Tg}, point::Point3{Tg}, hint_face::Int32, stack::Vector{NodeDist{Tg}}
+) where {Tg<:AbstractFloat}
     # tighten initial bound using the provided triangle hint (packed index).
     # this is especially effective for near-surface samples.
     tri_best = hint_face
@@ -517,32 +448,28 @@ function signed_distance_point(
     (dist²_best, Δ_best, feat_best) = closest_diff_triangle(point, triangle)
     (dist²_best <= 0) && return zero(Tg)
 
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stack)
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, stack)
     return signed_distance::Tg
 end
 
 function signed_distance_point(
-    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, stack::Vector{NodeDist{Tg}}
-) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+    sdm::SignedDistanceMesh{Tg}, point::Point3{Tg}, stack::Vector{NodeDist{Tg}}
+) where {Tg<:AbstractFloat}
     dist²_best = Tg(Inf)
-    Δ_best = zero(Point3{Tg})
-    feat_best = UInt8(0)
-    tri_best = Int32(0)
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stack)
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, stack)
     return signed_distance::Tg
 end
 
 function signed_distance_point_kernel(
-    sdm::SignedDistanceMesh{Tg,Ts},
+    sdm::SignedDistanceMesh{Tg},
     point::Point3{Tg},
     dist²_best::Tg,
-    Δ_best::Point3{Tg},
-    feat_best::UInt8,
-    tri_best::Int32,
     stack::Vector{NodeDist{Tg}}
-) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+) where {Tg<:AbstractFloat}
     bvh = sdm.bvh
     tri_geometries = sdm.tri_geometries
+
+    # Phase 1: BVH closest point search
     stack_top = 1
     dist²_root = aabb_dist²(point, bvh, Int32(1))
     @inbounds stack[1] = NodeDist{Tg}(Int32(1), dist²_root)
@@ -587,28 +514,112 @@ function signed_distance_point_kernel(
                 (dist², Δ, feat) = closest_diff_triangle(point, tri_geometries[idx])
                 if dist² < dist²_best
                     dist²_best = dist²
-                    Δ_best = Δ
-                    feat_best = feat
-                    tri_best = idx
                 end
             end
         end
     end
 
-    iszero(tri_best) && error("No triangle found for point $point")
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
-    # O(1) branchless lookup: tuple index == feature code
-    @inbounds pseudonormal = sdm.tri_normals[tri_best].normals[feat_best]
+    # Phase 2: Ray parity for robust sign calculation
+    # Jitter ray origin in XY plane slightly to avoid exact vertex/edge hits.
+    jx = Tg(sqrt(2.0) * 1e-4)
+    jy = Tg(sqrt(3.0) * 1e-4)
 
-    # compute sign in Float64 for robustness (even if geometry is Float32)
-    dot64 = Float64(Δ_best[1]) * Float64(pseudonormal[1]) +
-            Float64(Δ_best[2]) * Float64(pseudonormal[2]) +
-            Float64(Δ_best[3]) * Float64(pseudonormal[3])
+    rx = point[1] + jx
+    ry = point[2] + jy
+    pz = point[3]
+
+    edge_flags = sdm.tri_edge_flags
+
+    stack_top = 1
+    @inbounds stack[1] = NodeDist{Tg}(Int32(1), zero(Tg))
+
+    parity = UInt8(0)
+    ε_det = Tg(1e-10)
+    ε_bary = Tg(0)
+
+    @inbounds while stack_top > 0
+        node_id = stack[stack_top].node_id
+        stack_top -= 1
+
+        node = bvh.nodes[node_id]
+        child_or_size = node.child_or_size
+
+        if child_or_size > 0 # internal node
+            child_l = node.index
+            child_r = child_or_size
+
+            node_l = bvh.nodes[child_l]
+            hit_l = (rx >= node_l.lb_x) & (rx <= node_l.ub_x) &
+                    (ry >= node_l.lb_y) & (ry <= node_l.ub_y) &
+                    (pz <= node_l.ub_z)
+
+            node_r = bvh.nodes[child_r]
+            hit_r = (rx >= node_r.lb_x) & (rx <= node_r.ub_x) &
+                    (ry >= node_r.lb_y) & (ry <= node_r.ub_y) &
+                    (pz <= node_r.ub_z)
+
+            if hit_r
+                stack_top += 1
+                stack[stack_top] = NodeDist{Tg}(child_r, zero(Tg))
+            end
+            if hit_l
+                stack_top += 1
+                stack[stack_top] = NodeDist{Tg}(child_l, zero(Tg))
+            end
+        else # leaf node
+            leaf_start = node.index
+            leaf_size = -child_or_size
+            leaf_end = leaf_start + leaf_size - Int32(1)
+            for idx in leaf_start:leaf_end
+                tri = tri_geometries[idx]
+                flags = edge_flags[idx]
+
+                ax, ay, az = tri.a
+                abx, aby, abz = tri.ab
+                acx, acy, acz = tri.ac
+
+                det = muladd(aby, acx, -abx * acy)
+                (abs(det) <= ε_det) && continue
+                inv_det = inv(det)
+
+                sx = rx - ax
+                sy = ry - ay
+                u = muladd(sy, acx, -sx * acy) * inv_det
+                v = muladd(sx, aby, -sy * abx) * inv_det
+
+                w = 1.0f0 - u - v
+
+                own_u = (flags & UInt8(0x01)) != UInt8(0)
+                own_v = (flags & UInt8(0x02)) != UInt8(0)
+                own_w = (flags & UInt8(0x04)) != UInt8(0)
+
+                abs_u = abs(u)
+                abs_v = abs(v)
+                abs_w = abs(w)
+
+                in_u = (u > ε_bary) | ((abs_u <= ε_bary) & own_u)
+                in_v = (v > ε_bary) | ((abs_v <= ε_bary) & own_v)
+                in_w = (w > ε_bary) | ((abs_w <= ε_bary) & own_w)
+
+                if !(in_u & in_v & in_w)
+                    continue
+                end
+
+                z_hit = az + u * abz + v * acz
+                isfinite(z_hit) || continue
+
+                if z_hit > pz
+                    parity ⊻= UInt8(1)
+                end
+            end
+        end
+    end
 
     uno = one(Tg)
-    sgn = ifelse(dot64 >= 0.0, uno, -uno)
+    sgn = ifelse((parity & UInt8(1)) == UInt8(1), -uno, uno)
     signed_distance = sgn * dist
     return signed_distance::Tg
 end
@@ -634,10 +645,10 @@ Notes:
 """
 function compute_signed_distance!(
     out::AbstractVector{Tg},
-    sdm::SignedDistanceMesh{Tg,Ts},
+    sdm::SignedDistanceMesh{Tg},
     points::StridedMatrix{Tg},
     hint_faces::Vector{Int32}
-) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+) where {Tg<:AbstractFloat}
     num_points = size(points, 2)
     @assert length(out) == length(hint_faces) == num_points
     @assert size(points, 1) == 3 "points matrix must be 3×n"
@@ -664,8 +675,8 @@ function compute_signed_distance!(
 end
 
 function compute_signed_distance!(
-    out::AbstractVector{Tg}, sdm::SignedDistanceMesh{Tg,Ts}, points::StridedMatrix{Tg}
-) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+    out::AbstractVector{Tg}, sdm::SignedDistanceMesh{Tg}, points::StridedMatrix{Tg}
+) where {Tg<:AbstractFloat}
     num_points = size(points, 2)
     @assert length(out) == num_points
     @assert size(points, 1) == 3 "points matrix must be 3×n"

@@ -10,7 +10,7 @@ struct MeshSampler
     triangles::Vector{NTuple{3,Int32}}
     # area-weighted categorical distribution over triangle faces stored as an alias table for O(1) sampling
     distribution::AliasTable{UInt32,Int}
-    sdm::SignedDistanceMesh{Float32,Float64}
+    sdm::SignedDistanceMesh{Float32}
     bbox_min::Point3f
     bbox_max::Point3f
 end
@@ -20,7 +20,7 @@ function MeshSampler(mesh::Mesh, parameters::Vector{Float32})
     vertices = coordinates(mesh)
     triangles = NTuple{3,Int32}.(faces(mesh))
     distribution = construct_triangle_distribution(vertices, triangles)
-    sdm = preprocess_mesh(vertices, triangles, Float64)
+    sdm = preprocess_mesh(vertices, triangles)
     (bbox_min, bbox_max) = compute_bounding_box(vertices)
     mesh_sampler = MeshSampler(
         parameters, vertices, triangles, distribution, sdm, bbox_min, bbox_max
