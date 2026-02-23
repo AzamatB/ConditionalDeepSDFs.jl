@@ -576,12 +576,16 @@ end
         return norm²(ap - w * triangle.ac)
     end
 
-    va = (d11 * d22 - d12 * d12) - vb - vc
     d43 = d11 - d12 - d1 + d2
     d56 = d22 - d12 + d1 - d2
-    if va <= 0 && d43 >= 0 && d56 >= 0
+
+    # Mathematically equivalent to testing va <= 0 but eliminates catastrophic cancellation risks on slivers
+    if (vb + vc) * triangle.inv_denom >= one(Tg) && d43 >= 0 && d56 >= 0
         w = d43 * triangle.inv_d33
-        return norm²(ap - (one(Tg) - w) * triangle.ab - w * triangle.ac)
+        # Simplifies geometry mapping to isolate vectors to optimize FLOPs & FMA
+        bp = ap - triangle.ab
+        bc = triangle.ac - triangle.ab
+        return norm²(bp - w * bc)
     end
 
     v = vb * triangle.inv_denom
@@ -638,10 +642,8 @@ const INV4PI64 = 1.0 / (4.0 * π)
 const INV2PI64 = 1.0 / (2.0 * π)
 
 # Signed solid angle of a single oriented triangle as seen from q, normalized.
-@inline function solid_angle_scaled(q::Point3{Tg}, tri::TriangleGeometry{Tg}) where {Tg<:AbstractFloat}
-    qx = Float64(q[1])
-    qy = Float64(q[2])
-    qz = Float64(q[3])
+@inline function solid_angle_scaled(q_f64::NTuple{3,Float64}, tri::TriangleGeometry{Tg}) where {Tg<:AbstractFloat}
+    qx, qy, qz = q_f64
 
     # Exploit relative vectors mapping to drop global coordinate additions
     ax = Float64(tri.a[1]) - qx
@@ -683,9 +685,11 @@ end
     bvh_nodes = sdm.bvh.nodes
     tri_geometries = sdm.tri_geometries
 
+    # Hoist casting out of the leaf winding loop to prevent redundant un-boxing
     qx = Float64(point[1])
     qy = Float64(point[2])
     qz = Float64(point[3])
+    q_f64 = (qx, qy, qz)
 
     wn = 0.0
     stack_top = 1
@@ -722,7 +726,7 @@ end
                 leaf_size = Int(-child_or_size)
                 leaf_end = leaf_start + leaf_size - 1
                 for tri_id in leaf_start:leaf_end
-                    wn += solid_angle_scaled(point, tri_geometries[tri_id])
+                    wn += solid_angle_scaled(q_f64, tri_geometries[tri_id])
                 end
             else
                 stack_top += 1
@@ -770,9 +774,9 @@ function signed_distance_point_kernel(
     stack = stacks.dist
     wind_stack = stacks.wind
 
-    dist²_root = aabb_dist²(point, bvh, Int32(1))
+    zer = zero(Tg)
     stack_top = 1
-    @inbounds stack[1] = NodeDist{Tg}(Int32(1), dist²_root)
+    @inbounds stack[1] = NodeDist{Tg}(Int32(1), zer)
 
     @inbounds while stack_top > 0
         node_dist = stack[stack_top]
@@ -795,11 +799,14 @@ function signed_distance_point_kernel(
                 (dist²_l, dist²_r) = (dist²_r, dist²_l)
             end
 
+            # Branch folded traversal exploiting the sorted distance checks
             if dist²_r <= dist²_best
-                stack_top += 1
-                stack[stack_top] = NodeDist{Tg}(child_r, dist²_r)
-            end
-            if dist²_l <= dist²_best
+                # Both are closer than the best distance found so far
+                stack[stack_top+1] = NodeDist{Tg}(child_r, dist²_r)
+                stack[stack_top+2] = NodeDist{Tg}(child_l, dist²_l)
+                stack_top += 2
+            elseif dist²_l <= dist²_best
+                # Only the closer child is valid
                 stack_top += 1
                 stack[stack_top] = NodeDist{Tg}(child_l, dist²_l)
             end
