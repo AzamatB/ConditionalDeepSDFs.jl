@@ -67,6 +67,26 @@ struct TriangleNormals{T<:AbstractFloat}
     normals::NTuple{7,Point3{T}}
 end
 
+
+# Fast generalized winding number (Barill et al. 2018) precomputation per BVH node.
+# We store a 0th-order (dipole) far-field expansion:
+#   w̃(q) = (n_sum ⋅ (c - q)) / (4π‖c - q‖³)
+# where n_sum = Σ_t area_t * n̂_t (vector area) and c is the area-weighted centroid.
+struct FastWindingData{T<:AbstractFloat}
+    cm_x::Vector{T}
+    cm_y::Vector{T}
+    cm_z::Vector{T}
+    # radius bound for the Barnes-Hut admissibility test: ‖q-c‖ > β r
+    r::Vector{T}
+    # n_sum = Σ area_t * n̂_t (vector area) for all triangles in node
+    n_x::Vector{T}
+    n_y::Vector{T}
+    n_z::Vector{T}
+    # Barnes–Hut accuracy parameter (β). Larger => more accurate, slower. Typical value: 2.
+    beta::T
+end
+
+
 # AoS BVH node with overlapped integer fields for cache efficiency.
 # for T=Float32 this is 6×4 + 2×4 = 32 bytes — exactly two nodes per 64-byte cache line.
 # internal and leaf nodes overlap integer fields via sign-bit discriminant:
@@ -96,6 +116,15 @@ struct NodeDist{T<:AbstractFloat}
     dist²::T
 end
 
+
+# Per-chunk scratch space: BVH traversal stacks for distance and winding-number queries.
+# (Allocated outside the hot point-loop, so there are no allocations per query.)
+struct QueryStacks{T<:AbstractFloat}
+    dist::Vector{NodeDist{T}}
+    wind::Vector{Int32}
+end
+
+
 # Tg: geometry/distance type (Float32 recommended)
 # Ts: pseudonormal/sign type (Float64 recommended)
 struct SignedDistanceMesh{Tg<:AbstractFloat,Ts<:AbstractFloat}
@@ -105,6 +134,7 @@ struct SignedDistanceMesh{Tg<:AbstractFloat,Ts<:AbstractFloat}
     # face_to_packed[f] = packed triangle index for original face id f
     # (used to exploit your “source triangle” hints)
     face_to_packed::Vector{Int32}
+    fwn::FastWindingData{Tg}
 end
 
 #######################################   BVH Construction   #######################################
@@ -225,32 +255,39 @@ end
 end
 
 """
-    preprocess_mesh(mesh::Mesh{3,Float32,GLTriangleFace}; leaf_capacity=8, sign_type=Float64)
+    preprocess_mesh(mesh::Mesh{3,Float32,GLTriangleFace}, [sign_type=Float64]; leaf_capacity=8, winding_beta=2.0)
 
-Build the acceleration structure for signed-distance queries on a
-watertight, consistently-oriented triangle mesh.
+Build the preprocessing data needed for fast signed-distance queries:
 
-- `mesh`:  `Mesh{3,Float32,GLTriangleFace}` closed, watertight, consistently-oriented triangle mesh.
+- A BVH for **unsigned** distance queries (closest-point distance).
+- A fast **generalized winding number** hierarchy for a robust inside/outside **sign**
+  (Barnes–Hut-style acceleration, Barill et al. 2018).
 
-`sign_type` controls the floating-point type used for pseudonormal sign tests.
-Using `Float64` is recommended for robustness of the inside/outside sign.
+Arguments:
+- `mesh`: closed, consistently-oriented triangle mesh.
+- `sign_type`: floating-point type used during preprocessing of face normals/pseudonormals.
+  (The final sign returned by `compute_signed_distance!` is determined by winding numbers.)
+- `leaf_capacity`: BVH leaf size (distance & winding traversal share the same BVH).
+- `winding_beta` (β): Barnes–Hut admissibility parameter. Larger ⇒ more accurate winding numbers,
+  but more tree traversal work. A common default is `2.0`.
 
 Returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls.
 """
 function preprocess_mesh(
-    mesh::Mesh{3,Float32,GLTriangleFace}, sign_type::Type{Ts}=Float64; leaf_capacity::Int=8
+    mesh::Mesh{3,Float32,GLTriangleFace}, sign_type::Type{Ts}=Float64; leaf_capacity::Int=8, winding_beta::Real=2.0
 ) where {Ts<:AbstractFloat}
     vertices = GeometryBasics.coordinates(mesh)
     tri_faces = GeometryBasics.faces(mesh)
     faces = NTuple{3,Int32}.(tri_faces)
-    return preprocess_mesh(vertices, faces, sign_type; leaf_capacity)
+    return preprocess_mesh(vertices, faces, sign_type; leaf_capacity, winding_beta)
 end
 
 function preprocess_mesh(
     vertices::Vector{Point3f},
     faces::Vector{NTuple{3,Int32}},
     sign_type::Type{Ts}=Float64;
-    leaf_capacity::Int=8
+    leaf_capacity::Int=8,
+    winding_beta::Real=2.0
 ) where {Ts<:AbstractFloat}
     Tg = Float32
     num_vertices = length(vertices)
@@ -386,7 +423,158 @@ function preprocess_mesh(
         ))
     end
 
-    return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed)
+
+    # Precompute fast generalized winding-number (Barill et al. 2018) data for robust sign queries.
+    # This adds a Barnes–Hut BVH traversal to the signed distance query, but is O(log m) per point
+    # and typically robust around sharp features where pseudonormal methods can fail.
+    fwn = precompute_fast_winding_data(bvh, tri_geometries; beta=Tg(winding_beta))
+
+    return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed, fwn)
+end
+
+
+#################################   Fast Winding Number Precompute   #################################
+
+# Precompute node-wise data for the fast generalized winding number of a triangle soup.
+# We use a Barnes–Hut style far-field approximation (0th order / "single dipole" per node)
+# as described in Barill et al. 2018.
+function precompute_fast_winding_data(
+    bvh::BoundingVolumeHierarchy{Tg},
+    tri_geometries::Vector{TriangleGeometry{Tg}};
+    beta::Tg=Tg(2)
+) where {Tg<:AbstractFloat}
+
+    num_nodes = Int(bvh.num_nodes)
+
+    # Stored per node (geometry type Tg for compactness/cache-efficiency)
+    cm_x = Vector{Tg}(undef, num_nodes)
+    cm_y = Vector{Tg}(undef, num_nodes)
+    cm_z = Vector{Tg}(undef, num_nodes)
+    r = Vector{Tg}(undef, num_nodes)
+    n_x = Vector{Tg}(undef, num_nodes)
+    n_y = Vector{Tg}(undef, num_nodes)
+    n_z = Vector{Tg}(undef, num_nodes)
+
+    # Temporary aggregation buffers in Float64 for stable summation during preprocessing
+    area_sum = Vector{Float64}(undef, num_nodes)
+    cent_sum_x = Vector{Float64}(undef, num_nodes)
+    cent_sum_y = Vector{Float64}(undef, num_nodes)
+    cent_sum_z = Vector{Float64}(undef, num_nodes)
+    n_sum_x = Vector{Float64}(undef, num_nodes)
+    n_sum_y = Vector{Float64}(undef, num_nodes)
+    n_sum_z = Vector{Float64}(undef, num_nodes)
+
+    @inbounds for node_id in num_nodes:-1:1
+        node = bvh.nodes[node_id]
+        child_or_size = node.child_or_size
+
+        if child_or_size < 0
+            leaf_start = Int(node.index)
+            leaf_size = Int(-child_or_size)
+            leaf_end = leaf_start + leaf_size - 1
+
+            a_sum = 0.0
+            c_x_sum = 0.0
+            c_y_sum = 0.0
+            c_z_sum = 0.0
+            nn_x_sum = 0.0
+            nn_y_sum = 0.0
+            nn_z_sum = 0.0
+
+            for idx in leaf_start:leaf_end
+                tri = tri_geometries[idx]
+                ax = Float64(tri.a[1])
+                ay = Float64(tri.a[2])
+                az = Float64(tri.a[3])
+
+                abx = Float64(tri.ab[1])
+                aby = Float64(tri.ab[2])
+                abz = Float64(tri.ab[3])
+
+                acx = Float64(tri.ac[1])
+                acy = Float64(tri.ac[2])
+                acz = Float64(tri.ac[3])
+
+                # cross = ab × ac (oriented)
+                cx = aby * acz - abz * acy
+                cy = abz * acx - abx * acz
+                cz = abx * acy - aby * acx
+
+                # vector area = 0.5 * cross  (= area * n̂)
+                vax = 0.5 * cx
+                vay = 0.5 * cy
+                vaz = 0.5 * cz
+
+                # scalar area = 0.5 * ‖cross‖
+                area = 0.5 * sqrt(cx * cx + cy * cy + cz * cz)
+
+                # centroid = a + (ab + ac)/3  (more flops-friendly than (a+b+c)/3)
+                if area > 0.0
+                    centx = ax + (abx + acx) / 3.0
+                    centy = ay + (aby + acy) / 3.0
+                    centz = az + (abz + acz) / 3.0
+
+                    a_sum += area
+                    c_x_sum += area * centx
+                    c_y_sum += area * centy
+                    c_z_sum += area * centz
+                end
+
+                nn_x_sum += vax
+                nn_y_sum += vay
+                nn_z_sum += vaz
+            end
+
+            area_sum[node_id] = a_sum
+            cent_sum_x[node_id] = c_x_sum
+            cent_sum_y[node_id] = c_y_sum
+            cent_sum_z[node_id] = c_z_sum
+            n_sum_x[node_id] = nn_x_sum
+            n_sum_y[node_id] = nn_y_sum
+            n_sum_z[node_id] = nn_z_sum
+        else
+            left = Int(node.index)
+            right = Int(child_or_size)
+
+            a_sum = area_sum[left] + area_sum[right]
+            area_sum[node_id] = a_sum
+            cent_sum_x[node_id] = cent_sum_x[left] + cent_sum_x[right]
+            cent_sum_y[node_id] = cent_sum_y[left] + cent_sum_y[right]
+            cent_sum_z[node_id] = cent_sum_z[left] + cent_sum_z[right]
+            n_sum_x[node_id] = n_sum_x[left] + n_sum_x[right]
+            n_sum_y[node_id] = n_sum_y[left] + n_sum_y[right]
+            n_sum_z[node_id] = n_sum_z[left] + n_sum_z[right]
+        end
+
+        # far-field expansion center = area-weighted centroid of elements in the node
+        a_sum = area_sum[node_id]
+        if a_sum > 0.0
+            c_x = cent_sum_x[node_id] / a_sum
+            c_y = cent_sum_y[node_id] / a_sum
+            c_z = cent_sum_z[node_id] / a_sum
+        else
+            # degenerate cluster: fall back to AABB center to avoid NaNs
+            c_x = 0.5 * (Float64(node.lb_x) + Float64(node.ub_x))
+            c_y = 0.5 * (Float64(node.lb_y) + Float64(node.ub_y))
+            c_z = 0.5 * (Float64(node.lb_z) + Float64(node.ub_z))
+        end
+
+        cm_x[node_id] = Tg(c_x)
+        cm_y[node_id] = Tg(c_y)
+        cm_z[node_id] = Tg(c_z)
+
+        n_x[node_id] = Tg(n_sum_x[node_id])
+        n_y[node_id] = Tg(n_sum_y[node_id])
+        n_z[node_id] = Tg(n_sum_z[node_id])
+
+        # radius bound: farthest AABB corner from (c_x, c_y, c_z)
+        dx = max(abs(c_x - Float64(node.lb_x)), abs(c_x - Float64(node.ub_x)))
+        dy = max(abs(c_y - Float64(node.lb_y)), abs(c_y - Float64(node.ub_y)))
+        dz = max(abs(c_z - Float64(node.lb_z)), abs(c_z - Float64(node.ub_z)))
+        r[node_id] = Tg(sqrt(dx * dx + dy * dy + dz * dz))
+    end
+
+    return FastWindingData{Tg}(cm_x, cm_y, cm_z, r, n_x, n_y, n_z, beta)
 end
 
 function calculate_tree_height(num_faces::Integer, leaf_capacity::Integer)
@@ -417,7 +605,11 @@ function allocate_stacks(sdm::SignedDistanceMesh{Tg,Ts}, num_points::Int) where 
         num_chunks = n_threads * factor
     end
 
-    stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_chunks]
+
+    stacks = [QueryStacks{Tg}(
+        Vector{NodeDist{Tg}}(undef, stack_capacity),   # distance BVH stack
+        Vector{Int32}(undef, stack_capacity)           # winding BVH stack
+    ) for _ in 1:num_chunks]
     return stacks
 end
 
@@ -434,7 +626,7 @@ end
         Δx = max(node.lb_x - point_x, point_x - node.ub_x, zer)
         Δy = max(node.lb_y - point_y, point_y - node.ub_y, zer)
         Δz = max(node.lb_z - point_z, point_z - node.ub_z, zer)
-        dist² = Δx * Δx + Δy * Δy + Δz * Δz
+        dist² = muladd(Δx, Δx, muladd(Δy, Δy, Δz * Δz))
     end
     return dist²
 end
@@ -505,10 +697,140 @@ end
     return (norm²(Δ), Δ, FEAT_FACE)
 end
 
+
+#################################   Fast Winding Number Query   #################################
+
+# 1/(4π) in Float64 for winding-number normalization.
+const INV4PI64 = 1.0 / (4.0 * π)
+
+# Signed solid angle of a single oriented triangle as seen from q, normalized by 4π.
+# Formula from Van Oosterom & Strackee (1983), widely used in generalized winding number code.
+@inline function solid_angle_over_4pi(q::Point3{Tg}, tri::TriangleGeometry{Tg}) where {Tg<:AbstractFloat}
+    # triangle vertices: a, b = a+ab, c = a+ac
+    ax0 = Float64(tri.a[1])
+    ay0 = Float64(tri.a[2])
+    az0 = Float64(tri.a[3])
+    bx0 = ax0 + Float64(tri.ab[1])
+    by0 = ay0 + Float64(tri.ab[2])
+    bz0 = az0 + Float64(tri.ab[3])
+    cx0 = ax0 + Float64(tri.ac[1])
+    cy0 = ay0 + Float64(tri.ac[2])
+    cz0 = az0 + Float64(tri.ac[3])
+
+    qx = Float64(q[1])
+    qy = Float64(q[2])
+    qz = Float64(q[3])
+
+    # vectors from q to vertices
+    ax = ax0 - qx
+    ay = ay0 - qy
+    az = az0 - qz
+    bx = bx0 - qx
+    by = by0 - qy
+    bz = bz0 - qz
+    cx = cx0 - qx
+    cy = cy0 - qy
+    cz = cz0 - qz
+
+    # lengths
+    la = sqrt(ax * ax + ay * ay + az * az)
+    lb = sqrt(bx * bx + by * by + bz * bz)
+    lc = sqrt(cx * cx + cy * cy + cz * cz)
+
+    # scalar triple product: a · (b × c)
+    tpx = by * cz - bz * cy
+    tpy = bz * cx - bx * cz
+    tpz = bx * cy - by * cx
+    det = ax * tpx + ay * tpy + az * tpz
+
+    # denominator
+    ab = ax * bx + ay * by + az * bz
+    ac = ax * cx + ay * cy + az * cz
+    bc = bx * cx + by * cy + bz * cz
+    denom = la * lb * lc + ab * lc + ac * lb + bc * la
+
+    Ω = 2.0 * atan(det, denom)
+    return Ω * INV4PI64
+end
+
+# Fast generalized winding number evaluation at a point using the precomputed BVH data.
+# Returns a scalar winding number, typically ~1 inside and ~0 outside (for oriented closed meshes).
+@inline function winding_number_point_kernel(
+    sdm::SignedDistanceMesh{Tg,Ts},
+    point::Point3{Tg},
+    stack::Vector{Int32}
+)::Float64 where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+
+    fwn = sdm.fwn
+    bvh = sdm.bvh
+    tri_geometries = sdm.tri_geometries
+
+    β = Float64(fwn.beta)
+    β2 = β * β
+
+    qx = Float64(point[1])
+    qy = Float64(point[2])
+    qz = Float64(point[3])
+
+    wn = 0.0
+    stack_top = 1
+    @inbounds stack[1] = Int32(1)
+
+    @inbounds while stack_top > 0
+        node_id_i32 = stack[stack_top]
+        stack_top -= 1
+        node_id = Int(node_id_i32)
+
+        # Load precomputed node data
+        cmx = Float64(fwn.cm_x[node_id])
+        cmy = Float64(fwn.cm_y[node_id])
+        cmz = Float64(fwn.cm_z[node_id])
+
+        rx = cmx - qx
+        ry = cmy - qy
+        rz = cmz - qz
+
+        dist2 = rx * rx + ry * ry + rz * rz
+        r_node = Float64(fwn.r[node_id])
+
+        if dist2 > β2 * (r_node * r_node)
+            # Far field: 0th order (dipole) approximation
+            nx = Float64(fwn.n_x[node_id])
+            ny = Float64(fwn.n_y[node_id])
+            nz = Float64(fwn.n_z[node_id])
+
+            dot = rx * nx + ry * ny + rz * nz
+            inv_denom = inv(dist2 * sqrt(dist2))  # 1/‖r‖^3
+            wn += dot * INV4PI64 * inv_denom
+        else
+            node = bvh.nodes[node_id]
+            child_or_size = node.child_or_size
+
+            if child_or_size < 0
+                # Near field: exact sum of triangle solid angles for this leaf
+                leaf_start = Int(node.index)
+                leaf_size = Int(-child_or_size)
+                leaf_end = leaf_start + leaf_size - 1
+                for tri_id in leaf_start:leaf_end
+                    wn += solid_angle_over_4pi(point, tri_geometries[tri_id])
+                end
+            else
+                # Recurse into children
+                stack_top += 1
+                stack[stack_top] = node.index
+                stack_top += 1
+                stack[stack_top] = child_or_size
+            end
+        end
+    end
+
+    return wn
+end
+
 ######################################   Single-Point Query   ######################################
 
 function signed_distance_point(
-    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, hint_face::Int32, stack::Vector{NodeDist{Tg}}
+    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, hint_face::Int32, stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
     # tighten initial bound using the provided triangle hint (packed index).
     # this is especially effective for near-surface samples.
@@ -517,18 +839,18 @@ function signed_distance_point(
     (dist²_best, Δ_best, feat_best) = closest_diff_triangle(point, triangle)
     (dist²_best <= 0) && return zero(Tg)
 
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stack)
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stacks)
     return signed_distance::Tg
 end
 
 function signed_distance_point(
-    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, stack::Vector{NodeDist{Tg}}
+    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
     dist²_best = Tg(Inf)
     Δ_best = zero(Point3{Tg})
     feat_best = UInt8(0)
     tri_best = Int32(0)
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stack)
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stacks)
     return signed_distance::Tg
 end
 
@@ -539,10 +861,12 @@ function signed_distance_point_kernel(
     Δ_best::Point3{Tg},
     feat_best::UInt8,
     tri_best::Int32,
-    stack::Vector{NodeDist{Tg}}
+    stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
     bvh = sdm.bvh
     tri_geometries = sdm.tri_geometries
+    stack = stacks.dist
+    wind_stack = stacks.wind
     stack_top = 1
     dist²_root = aabb_dist²(point, bvh, Int32(1))
     @inbounds stack[1] = NodeDist{Tg}(Int32(1), dist²_root)
@@ -599,16 +923,13 @@ function signed_distance_point_kernel(
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
-    # O(1) branchless lookup: tuple index == feature code
-    @inbounds pseudonormal = sdm.tri_normals[tri_best].normals[feat_best]
 
-    # compute sign in Float64 for robustness (even if geometry is Float32)
-    dot64 = Float64(Δ_best[1]) * Float64(pseudonormal[1]) +
-            Float64(Δ_best[2]) * Float64(pseudonormal[2]) +
-            Float64(Δ_best[3]) * Float64(pseudonormal[3])
+    # Robust inside/outside sign via (fast) generalized winding number.
+    # For a consistently oriented closed mesh: wn ≈ 1 inside, wn ≈ 0 outside.
+    wn = winding_number_point_kernel(sdm, point, wind_stack)
 
     uno = one(Tg)
-    sgn = ifelse(dot64 >= 0.0, uno, -uno)
+    sgn = ifelse(abs(wn) > 0.5, -uno, uno)  # inside => negative signed distance
     signed_distance = sgn * dist
     return signed_distance::Tg
 end
@@ -630,7 +951,8 @@ Positive = outside, negative = inside.
 
 Notes:
 - The unsigned distance is computed in the geometry type `Tg` (Float32).
-- The *sign decision* (inner product with angle-weighted pseudo-normal) is computed in Float64.
+- The sign is determined by the (fast) generalized winding number (wn>0.5 ⇒ inside).
+  The winding number accumulation is done in Float64.
 """
 function compute_signed_distance!(
     out::AbstractVector{Tg},
@@ -674,6 +996,74 @@ function compute_signed_distance!(
     # equipartition the work into chunks, so each chunk gets its own stack.
     # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
     # concurrent callers on the same sdm never share mutable scratch space.
+    num_chunks = length(stacks)
+    chunk_size = cld(num_points, num_chunks)
+    Threads.@threads :dynamic for idx_chunk in 1:num_chunks
+        stack = stacks[idx_chunk]
+        chunk_start = (idx_chunk - 1) * chunk_size + 1
+        chunk_end = min(idx_chunk * chunk_size, num_points)
+        for idx in chunk_start:chunk_end
+            @inbounds point = Point3{Tg}(points[1, idx], points[2, idx], points[3, idx])
+            @inbounds out[idx] = signed_distance_point(sdm, point, stack)
+        end
+    end
+    return out
+end
+
+
+########################################   Optional Reusable Scratch   ########################################
+
+"""
+    compute_signed_distance!(out, sdm, points, stacks)
+    compute_signed_distance!(out, sdm, points, hint_faces, stacks)
+
+Same as the other `compute_signed_distance!` methods, but reuses a preallocated `stacks`
+workspace (from `allocate_stacks`) to avoid allocations when calling this function many
+times in a hot loop.
+"""
+# (docstring-only helper; the function is defined above)
+
+function compute_signed_distance!(
+    out::AbstractVector{Tg},
+    sdm::SignedDistanceMesh{Tg,Ts},
+    points::StridedMatrix{Tg},
+    hint_faces::Vector{Int32},
+    stacks::Vector{QueryStacks{Tg}}
+) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+    num_points = size(points, 2)
+    @assert length(out) == length(hint_faces) == num_points
+    @assert size(points, 1) == 3 "points matrix must be 3×n"
+    @assert !isempty(stacks)
+
+    face_to_packed = sdm.face_to_packed
+
+    num_chunks = length(stacks)
+    chunk_size = cld(num_points, num_chunks)
+    Threads.@threads :dynamic for idx_chunk in 1:num_chunks
+        stack = stacks[idx_chunk]
+        chunk_start = (idx_chunk - 1) * chunk_size + 1
+        chunk_end = min(idx_chunk * chunk_size, num_points)
+        for idx in chunk_start:chunk_end
+            idx_face = hint_faces[idx]
+            @inbounds idx_face_packed = face_to_packed[idx_face]
+            @inbounds point = Point3{Tg}(points[1, idx], points[2, idx], points[3, idx])
+            @inbounds out[idx] = signed_distance_point(sdm, point, idx_face_packed, stack)
+        end
+    end
+    return out
+end
+
+function compute_signed_distance!(
+    out::AbstractVector{Tg},
+    sdm::SignedDistanceMesh{Tg,Ts},
+    points::StridedMatrix{Tg},
+    stacks::Vector{QueryStacks{Tg}}
+) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+    num_points = size(points, 2)
+    @assert length(out) == num_points
+    @assert size(points, 1) == 3 "points matrix must be 3×n"
+    @assert !isempty(stacks)
+
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
     Threads.@threads :dynamic for idx_chunk in 1:num_chunks
