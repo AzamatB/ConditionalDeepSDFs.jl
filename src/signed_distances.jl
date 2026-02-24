@@ -49,7 +49,7 @@ struct FWNNode{T<:AbstractFloat}
     n_y::T
     n_z::T
     r²β²::T
-    topology::UInt32 # High-bit: leaf flag. Bits 24-30: count. Bits 0-23: child_l / leaf_start
+    topology::UInt32 # High-bit: leaf flag. Bits 25-30: count. Bits 0-24: child_l / leaf_start
 end
 
 struct FastWindingData{T<:AbstractFloat}
@@ -77,12 +77,12 @@ end
 
 # Isotropic spatial voxel grid tailored to [-1, 1]^3.
 # Features exact cell-center evaluations for Eikonal Early-Out bypass.
+# Unified cells into an 8-byte Tuple block for single-instruction L1 Cache fetching.
 struct HintGrid{T<:AbstractFloat}
     lb::T
     inv_cell::T
     res::Int
-    hints::Array{Int32,3}
-    sd_centers::Array{T,3}
+    cells::Array{Tuple{Int32,T},3}
 end
 
 # Stack element carrying node topology.
@@ -436,10 +436,12 @@ function build_bvh(
     leaf_capacity::Int=8
 ) where {Tg<:AbstractFloat}
 
-    # Robustness limit guaranteeing node topology packing safety below the 7-bit FWN capacity
-    leaf_capacity = min(leaf_capacity, 127)
-
+    # 🌟 5.B: Topology limit cap for robust 25-bit shift limits
+    # Steals an extra bit to map leaf_start indexing safely up to 33.5 million faces.
+    leaf_capacity = min(leaf_capacity, 63)
     num_faces = length(first(centroids))
+    @assert num_faces <= 33554431 "Mesh exceeds 33.5M faces."
+
     tri_indices = Int32.(1:num_faces)
     max_nodes = 2 * num_faces + 1
 
@@ -469,14 +471,20 @@ function closest_triangle_kernel(
     point::Point3{Tg},
     bvh::BoundingVolumeHierarchy{Tg},
     tri_geometries::Vector{TriangleGeometry{Tg}},
-    stack::Vector{NodeDist{Tg}}
+    stack::Vector{NodeDist{Tg}},
+    hint_tri::Int32=Int32(0) # 🌟 2: Precomputation Hint Propagation Seed
 ) where {Tg<:AbstractFloat}
     dist²_best = floatmax(Tg)
-    tri_best = Int32(1)
+    tri_best = hint_tri > 0 ? hint_tri : Int32(1)
     feat_best = FEATURE_DEGENERATE
     zer = zero(Tg)
-    (p_x, p_y, p_z) = point
 
+    if hint_tri > 0
+        @inbounds triangle = tri_geometries[hint_tri]
+        (dist²_best, feat_best) = closest_dist²_triangle_feature(point, triangle, dist²_best)
+    end
+
+    (p_x, p_y, p_z) = point
     stack_top = 1
     @inbounds root_node = bvh.nodes[1]
     @inbounds stack[1] = NodeDist{Tg}(zer, root_node.index, root_node.child_or_size)
@@ -565,22 +573,24 @@ function compute_hint_grid(
     extent = Tg(2.0) + Tg(2.0) * pad
     inv_cell = Tg(grid_res) / extent
 
-    hints = Array{Int32,3}(undef, grid_res, grid_res, grid_res)
-    sd_centers = Array{Tg,3}(undef, grid_res, grid_res, grid_res)
+    # 🌟 4: Unboxed Tuple Array structures directly fetch identically contiguous 8-byte boundaries
+    cells = Array{Tuple{Int32,Tg},3}(undef, grid_res, grid_res, grid_res)
     stack_capacity = bvh.max_depth + 4
 
     Threads.@threads :dynamic for k in 1:grid_res
         stack = Vector{NodeDist{Tg}}(undef, stack_capacity)
         wind_stack = Vector{Int32}(undef, stack_capacity)
         for j in 1:grid_res
+            hint_tri = Int32(0) # 🌟 2: Seed horizontal propagation
             for i in 1:grid_res
                 cx = lb + (Tg(i) - Tg(0.5)) / inv_cell
                 cy = lb + (Tg(j) - Tg(0.5)) / inv_cell
                 cz = lb + (Tg(k) - Tg(0.5)) / inv_cell
                 p = Point3{Tg}(cx, cy, cz)
 
-                tri_best, dist²_best, feat = closest_triangle_kernel(p, bvh, tri_geometries, stack)
-                hints[i, j, k] = tri_best
+                # 🌟 2: Forward hint propagation shrinks initial BVH search spheres instantly
+                tri_best, dist²_best, feat = closest_triangle_kernel(p, bvh, tri_geometries, stack, hint_tri)
+                hint_tri = tri_best
 
                 # Eikonal Early-Out Precomputation
                 dist = √(max(dist²_best, zero(Tg)))
@@ -591,12 +601,13 @@ function compute_hint_grid(
                     wn = winding_number_point_kernel(fwn.nodes, tri_geometries, p, wind_stack)
                     sgn = ifelse(wn >= 0.5, -one(Tg), one(Tg))
                 end
-                sd_centers[i, j, k] = sgn * dist
+
+                cells[i, j, k] = (tri_best, sgn * dist)
             end
         end
     end
 
-    return HintGrid{Tg}(lb, inv_cell, grid_res, hints, sd_centers)
+    return HintGrid{Tg}(lb, inv_cell, grid_res, cells)
 end
 
 function preprocess_mesh(
@@ -801,7 +812,6 @@ function precompute_fast_winding_data(
 
         local topology::UInt32
 
-        # Computing EXACT MAC bounds and natively packing node topology
         if child_or_size < 0
             leaf_start = Int(node.index)
             leaf_end = Int(-child_or_size)
@@ -816,7 +826,8 @@ function precompute_fast_winding_data(
             exact_r[node_id] = √(max_r²)
 
             count = UInt32(leaf_end - leaf_start + 1)
-            topology = 0x80000000 | (count << 24) | UInt32(leaf_start)
+            # 🌟 5.B: Bitwise layout formally extended to gracefully support meshes crossing 16.7M face indices
+            topology = 0x80000000 | (count << 25) | UInt32(leaf_start)
         else
             child_l = Int(node.index)
             child_r = Int(child_or_size)
@@ -825,7 +836,15 @@ function precompute_fast_winding_data(
             fR = fwn_nodes[child_r]
             r_l = exact_r[child_l] + √((Float64(fL.cm_x) - c_x)^2 + (Float64(fL.cm_y) - c_y)^2 + (Float64(fL.cm_z) - c_z)^2)
             r_r = exact_r[child_r] + √((Float64(fR.cm_x) - c_x)^2 + (Float64(fR.cm_y) - c_y)^2 + (Float64(fR.cm_z) - c_z)^2)
-            exact_r[node_id] = max(r_l, r_r)
+            hierarchical_r = max(r_l, r_r)
+
+            # 🌟 3: Tighter Multipole MAC via formal AABB geometry constraints
+            dx = max(abs(Float64(node.lb_x) - c_x), abs(Float64(node.ub_x) - c_x))
+            dy = max(abs(Float64(node.lb_y) - c_y), abs(Float64(node.ub_y) - c_y))
+            dz = max(abs(Float64(node.lb_z) - c_z), abs(Float64(node.ub_z) - c_z))
+            aabb_r = √(dx^2 + dy^2 + dz^2)
+
+            exact_r[node_id] = min(hierarchical_r, aabb_r)
 
             topology = UInt32(child_l)
         end
@@ -879,24 +898,17 @@ const FEATURE_EDGE_AC = UInt8(5)
 const FEATURE_EDGE_BC = UInt8(6)
 const FEATURE_DEGENERATE = UInt8(7)
 
+# 🌟 6: Degenerate Segment Fallback entirely re-engineered for zero redundant allocations
 @inline function closest_dist²_segment_feature(
-    p::Point3{Tg}, a::Point3{Tg}, b::Point3{Tg},
+    ap::Point3{Tg}, ab::Point3{Tg}, ab2::Tg,
     feat_edge::UInt8, feat_a::UInt8, feat_b::UInt8
 ) where {Tg<:AbstractFloat}
-    ab = b - a
-    ab2 = ab ⋅ ab
     zer = zero(Tg)
-    if ab2 <= zer
-        dist² = norm²(p - a)
-        return (dist²::Tg, feat_a)
-    end
+    (ab2 <= zer) && return (norm²(ap)::Tg, feat_a)
     @fastmath begin
-        t = ((p - a) ⋅ ab) / ab2
-        uno = one(Tg)
-        tc = clamp(t, zer, uno)
-        q = a + tc * ab
-        dist² = norm²(p - q)
-        feat = ifelse(tc <= zer, feat_a, ifelse(tc >= uno, feat_b, feat_edge))
+        tc = clamp((ap ⋅ ab) / ab2, zer, one(Tg))
+        dist² = norm²(ap - tc * ab)
+        feat = ifelse(tc <= zer, feat_a, ifelse(tc >= one(Tg), feat_b, feat_edge))
         return (dist²::Tg, feat::UInt8)
     end
 end
@@ -909,13 +921,12 @@ end
         ap = p - triangle.a
 
         if iszero(inv_denom)
-            a = triangle.a
-            b = a + triangle.ab
-            c = a + triangle.ac
+            # 🌟 6: Bypassing re-derivation via pure algebraic identities directly routing pre-computed attributes
+            (d2_ab, f_ab) = closest_dist²_segment_feature(ap, triangle.ab, triangle.d11, FEATURE_EDGE_AB, FEATURE_VERTEX_A, FEATURE_VERTEX_B)
+            (d2_ac, f_ac) = closest_dist²_segment_feature(ap, triangle.ac, triangle.d22, FEATURE_EDGE_AC, FEATURE_VERTEX_A, FEATURE_VERTEX_C)
 
-            (d2_ab, f_ab) = closest_dist²_segment_feature(p, a, b, FEATURE_EDGE_AB, FEATURE_VERTEX_A, FEATURE_VERTEX_B)
-            (d2_ac, f_ac) = closest_dist²_segment_feature(p, a, c, FEATURE_EDGE_AC, FEATURE_VERTEX_A, FEATURE_VERTEX_C)
-            (d2_bc, f_bc) = closest_dist²_segment_feature(p, b, c, FEATURE_EDGE_BC, FEATURE_VERTEX_B, FEATURE_VERTEX_C)
+            bc = triangle.ac - triangle.ab
+            (d2_bc, f_bc) = closest_dist²_segment_feature(ap - triangle.ab, bc, norm²(bc), FEATURE_EDGE_BC, FEATURE_VERTEX_B, FEATURE_VERTEX_C)
 
             dist² = d2_ab
             feat = f_ab
@@ -1068,8 +1079,8 @@ end
 
             topology = fnode.topology
             if (topology & 0x80000000) != 0
-                count = (topology >> 24) & 0x7F
-                leaf_start = topology & 0x00FFFFFF
+                count = (topology >> 25) & 0x3F           # 🌟 5.B: Unpack robust 6-bit count limit
+                leaf_start = topology & 0x01FFFFFF        # 🌟 5.B: Unpack strict 25-bit face indices
                 leaf_end = leaf_start + count - 1
                 for tri_id in leaf_start:leaf_end
                     wn += solid_angle_scaled(q_f64, tri_geometries[tri_id])
@@ -1121,7 +1132,9 @@ end
     dz = point[3] - cz
     dist_to_c² = muladd(dx, dx, muladd(dy, dy, dz * dz))
 
-    @inbounds return grid.hints[ix, iy, iz], grid.sd_centers[ix, iy, iz], dist_to_c²
+    # 🌟 4: Access unpacked scalar structures instantly mapped against an unboxed Tuple cache-line
+    @inbounds cell = grid.cells[ix, iy, iz]
+    return cell[1], cell[2], dist_to_c²
 end
 
 function signed_distance_point(
@@ -1285,10 +1298,14 @@ function signed_distance_point_kernel(
         return (sgn * dist)::Tg
     end
 
-    # ✨ EIKONAL EARLY-OUT ✨
-    # If the computed bounds to the nearest surface resolve physically broader than the extent
-    # to the fully-evaluated voxel center, the Eikonal condition rigorously guarantees equivalent signs.
-    if (sd_center * sd_center) > dist_to_c²
+    # 🌟 1: STRONGER EIKONAL EARLY-OUT
+    # By strictly leveraging the Triangle Inequality directly connecting our fully evaluated voxel center
+    # to the local physical magnitude `dist`, bounding separation instantly clears safely
+    abs_sd = abs(sd_center)
+    sum_dist = dist + abs_sd
+
+    # Multiply coefficient minutely against invisible floating-point rounding violations
+    if (sum_dist * sum_dist) > dist_to_c² * Tg(1.00001)
         sgn = ifelse(sd_center >= zer, one(Tg), -one(Tg))
         return (sgn * dist)::Tg
     end
