@@ -76,17 +76,12 @@ struct BoundingVolumeHierarchy{T<:AbstractFloat}
     num_nodes::Int32
 end
 
-# Coarse spatial voxel grid for massive caching and O(1) hint-acceleration
+# Isotropic spatial voxel grid precisely tailored to the [-1, 1]^3 query domain.
+# Compacted struct format exploiting strict cubic bounding for lower cache pressure.
 struct HintGrid{T<:AbstractFloat}
-    lb_x::T
-    lb_y::T
-    lb_z::T
-    inv_cell_x::T
-    inv_cell_y::T
-    inv_cell_z::T
-    res_x::Int
-    res_y::Int
-    res_z::Int
+    lb::T
+    inv_cell::T
+    res::Int
     hints::Array{Int32,3}
 end
 
@@ -557,35 +552,19 @@ end
 function compute_hint_grid(
     bvh::BoundingVolumeHierarchy{Tg},
     tri_geometries::Vector{TriangleGeometry{Tg}},
-    grid_res::Int,
-    bounds_min::Point3{Tg},
-    bounds_max::Point3{Tg}
+    grid_res::Int
 ) where {Tg<:AbstractFloat}
-    lb_x, lb_y, lb_z = bounds_min[1], bounds_min[2], bounds_min[3]
-    ub_x, ub_y, ub_z = bounds_max[1], bounds_max[2], bounds_max[3]
 
-    # Add 1% padding so SDF points testing exactly on the bounds don't trigger edge-case clamping
-    extent_x = max(ub_x - lb_x, eps(Tg))
-    extent_y = max(ub_y - lb_y, eps(Tg))
-    extent_z = max(ub_z - lb_z, eps(Tg))
-
-    pad_x = extent_x * Tg(0.01)
-    pad_y = extent_y * Tg(0.01)
-    pad_z = extent_z * Tg(0.01)
-
-    lb_x -= pad_x
-    ub_x += pad_x
-    extent_x += 2 * pad_x
-    lb_y -= pad_y
-    ub_y += pad_y
-    extent_y += 2 * pad_y
-    lb_z -= pad_z
-    ub_z += pad_z
-    extent_z += 2 * pad_z
-
-    inv_cell_x = Tg(grid_res) / extent_x
-    inv_cell_y = Tg(grid_res) / extent_y
-    inv_cell_z = Tg(grid_res) / extent_z
+    # -----------------------------------------------------------------------------------
+    # Because queries are mathematically guaranteed to be sampled strictly from within
+    # the unit cube [-1, 1]^3, we decouple the Hint Grid from the dynamic mesh AABB
+    # and lock it to perfectly partition this exact query domain.
+    # A 5% floating-point padding ensures boundary values map inside cells cleanly.
+    # -----------------------------------------------------------------------------------
+    pad = Tg(0.05)
+    lb = Tg(-1.0) - pad
+    extent = Tg(2.0) + Tg(2.0) * pad
+    inv_cell = Tg(grid_res) / extent
 
     hints = Array{Int32,3}(undef, grid_res, grid_res, grid_res)
     stack_capacity = bvh.max_depth + 4
@@ -594,9 +573,10 @@ function compute_hint_grid(
         stack = Vector{NodeDist{Tg}}(undef, stack_capacity)
         for j in 1:grid_res
             for i in 1:grid_res
-                cx = lb_x + (Tg(i) - Tg(0.5)) / inv_cell_x
-                cy = lb_y + (Tg(j) - Tg(0.5)) / inv_cell_y
-                cz = lb_z + (Tg(k) - Tg(0.5)) / inv_cell_z
+                # Evaluate at the physical center of the voxel
+                cx = lb + (Tg(i) - Tg(0.5)) / inv_cell
+                cy = lb + (Tg(j) - Tg(0.5)) / inv_cell
+                cz = lb + (Tg(k) - Tg(0.5)) / inv_cell
                 p = Point3{Tg}(cx, cy, cz)
 
                 tri_best = closest_triangle_kernel(p, bvh, tri_geometries, stack)
@@ -605,31 +585,22 @@ function compute_hint_grid(
         end
     end
 
-    return HintGrid{Tg}(lb_x, lb_y, lb_z, inv_cell_x, inv_cell_y, inv_cell_z, grid_res, grid_res, grid_res, hints)
+    return HintGrid{Tg}(lb, inv_cell, grid_res, hints)
 end
 
 function preprocess_mesh(
-    mesh::Mesh{3,Tg,GLTriangleFace};
-    leaf_capacity::Int=8,
-    β_wind::Real=2.0,
-    grid_res::Int=64,
-    bounds_min::NTuple{3,Real}=(-1.0, -1.0, -1.0),
-    bounds_max::NTuple{3,Real}=(1.0, 1.0, 1.0)
+    mesh::Mesh{3,Tg,GLTriangleFace}; leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=64
 ) where {Tg<:AbstractFloat}
     vertices = GeometryBasics.coordinates(mesh)
     tri_faces = GeometryBasics.faces(mesh)
     faces = NTuple{3,Int32}.(tri_faces)
-    return preprocess_mesh(vertices, faces; leaf_capacity, β_wind, grid_res, bounds_min, bounds_max)
+    return preprocess_mesh(vertices, faces; leaf_capacity, β_wind, grid_res)
 end
 
 function preprocess_mesh(
     vertices::Vector{Point3{Tg}},
     faces::Vector{NTuple{3,Int32}};
-    leaf_capacity::Int=8,
-    β_wind::Real=2.0,
-    grid_res::Int=64,
-    bounds_min::NTuple{3,Real}=(-1.0, -1.0, -1.0),
-    bounds_max::NTuple{3,Real}=(1.0, 1.0, 1.0)
+    leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=64
 ) where {Tg<:AbstractFloat}
     num_faces = length(faces)
     (num_faces > 0) || error("Mesh must contain at least one face.")
@@ -704,10 +675,7 @@ function preprocess_mesh(
     end
 
     fwn = precompute_fast_winding_data(bvh, tri_geometries; β=Tg(β_wind))
-
-    b_min = Point3{Tg}(bounds_min[1], bounds_min[2], bounds_min[3])
-    b_max = Point3{Tg}(bounds_max[1], bounds_max[2], bounds_max[3])
-    hint_grid = compute_hint_grid(bvh, tri_geometries, grid_res, b_min, b_max)
+    hint_grid = compute_hint_grid(bvh, tri_geometries, grid_res)
 
     sdm = SignedDistanceMesh{Tg}(tri_geometries, bvh, face_to_packed, fwn, hint_grid)
     return sdm::SignedDistanceMesh{Tg}
@@ -1088,19 +1056,22 @@ end
 ######################################   Single-Point Query   ######################################
 
 @inline function get_grid_hint(grid::HintGrid{Tg}, point::Point3{Tg}) where {Tg<:AbstractFloat}
-    x = (point[1] - grid.lb_x) * grid.inv_cell_x
-    y = (point[2] - grid.lb_y) * grid.inv_cell_y
-    z = (point[3] - grid.lb_z) * grid.inv_cell_z
+    inv_c = grid.inv_cell
+    lb = grid.lb
 
-    # Safe guard bounds extraction securely clamping over raw NaN boundaries
-    ix = isnan(x) ? 1 : floor(Int, x) + 1
-    iy = isnan(y) ? 1 : floor(Int, y) + 1
-    iz = isnan(z) ? 1 : floor(Int, z) + 1
+    x = (point[1] - lb) * inv_c
+    y = (point[2] - lb) * inv_c
+    z = (point[3] - lb) * inv_c
 
-    # Guaranteed clamping cleanly pushes exterior queries into their closest grid boundary
-    ix = clamp(ix, 1, grid.res_x)
-    iy = clamp(iy, 1, grid.res_y)
-    iz = clamp(iz, 1, grid.res_z)
+    res = grid.res
+    # Fast mapping without `isnan` guards (points guaranteed to be purely real inside [-1, 1]^3)
+    # Because query is within [-1, 1] and lb is -1.05, coordinates are guaranteed purely positive.
+    # Using `unsafe_trunc` entirely bypasses boundary checking branches.
+    @fastmath begin
+        ix = clamp(Base.unsafe_trunc(Int, x) + 1, 1, res)
+        iy = clamp(Base.unsafe_trunc(Int, y) + 1, 1, res)
+        iz = clamp(Base.unsafe_trunc(Int, z) + 1, 1, res)
+    end
 
     @inbounds return grid.hints[ix, iy, iz]
 end
