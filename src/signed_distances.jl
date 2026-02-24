@@ -32,7 +32,7 @@ struct TriangleGeometry{T<:AbstractFloat}
     a::Point3{T}
     ab::Point3{T}
     ac::Point3{T}
-    n::Point3{T}     # Unnormalized face normal: ab × ac
+    n::Point3{T}     # unnormalized face normal: ab × ac
     d11::T           # norm²(ab)
     d12::T           # ab ⋅ ac
     d22::T           # norm²(ac)
@@ -44,11 +44,10 @@ struct FWNNode{T<:AbstractFloat}
     cm_x::T
     cm_y::T
     cm_z::T
-    r_beta_sq::T
     n_x::T
     n_y::T
     n_z::T
-    _pad::T
+    r²β²::T
 end
 
 struct FastWindingData{T<:AbstractFloat}
@@ -204,18 +203,18 @@ end
 ######################################   Mesh Preprocessing   ######################################
 
 function preprocess_mesh(
-    mesh::Mesh{3,Tg,GLTriangleFace}; leaf_capacity::Int=8, winding_beta::Real=2.0
+    mesh::Mesh{3,Tg,GLTriangleFace}; leaf_capacity::Int=8, β_wind::Real=2.0
 ) where {Tg<:AbstractFloat}
     vertices = GeometryBasics.coordinates(mesh)
     tri_faces = GeometryBasics.faces(mesh)
     faces = NTuple{3,Int32}.(tri_faces)
-    return preprocess_mesh(vertices, faces; leaf_capacity, winding_beta)
+    return preprocess_mesh(vertices, faces; leaf_capacity, β_wind)
 end
 
 function preprocess_mesh(
     vertices::AbstractVector{<:Point3{Tg}},
     faces::AbstractVector{NTuple{3,Int32}};
-    leaf_capacity::Int=8, winding_beta::Real=2.0
+    leaf_capacity::Int=8, β_wind::Real=2.0
 ) where {Tg<:AbstractFloat}
     num_faces = length(faces)
     num_faces > 0 || error("Mesh must contain at least one face.")
@@ -281,7 +280,7 @@ function preprocess_mesh(
         )
     end
 
-    fwn = precompute_fast_winding_data(bvh, tri_geometries; beta=Tg(winding_beta))
+    fwn = precompute_fast_winding_data(bvh, tri_geometries; β=Tg(β_wind))
     return SignedDistanceMesh{Tg}(tri_geometries, bvh, face_to_packed, fwn)
 end
 
@@ -294,7 +293,7 @@ const INV2PI64 = 1.0 / (2.0 * π)
 function precompute_fast_winding_data(
     bvh::BoundingVolumeHierarchy{Tg},
     tri_geometries::Vector{TriangleGeometry{Tg}};
-    beta::Tg=Tg(2)
+    β::Tg=Tg(2)
 ) where {Tg<:AbstractFloat}
 
     num_nodes = Int(bvh.num_nodes)
@@ -326,7 +325,7 @@ function precompute_fast_winding_data(
                 # Retrieve from pristine L1 cache geometry arrays securely initialized earlier!
                 nx, ny, nz = Float64(tri.n[1]), Float64(tri.n[2]), Float64(tri.n[3])
                 vax, vay, vaz = 0.5 * nx, 0.5 * ny, 0.5 * nz
-                area = 0.5 * sqrt(nx * nx + ny * ny + nz * nz)
+                area = 0.5 * √(nx * nx + ny * ny + nz * nz)
 
                 if area > 0.0
                     centx = Float64(tri.a[1]) + (Float64(tri.ab[1]) + Float64(tri.ac[1])) / 3.0
@@ -372,18 +371,18 @@ function precompute_fast_winding_data(
             c_z = 0.5 * (Float64(node.lb_z) + Float64(node.ub_z))
         end
 
-        dx = max(abs(c_x - Float64(node.lb_x)), abs(c_x - Float64(node.ub_x)))
-        dy = max(abs(c_y - Float64(node.lb_y)), abs(c_y - Float64(node.ub_y)))
-        dz = max(abs(c_z - Float64(node.lb_z)), abs(c_z - Float64(node.ub_z)))
+        Δx = max(abs(c_x - Float64(node.lb_x)), abs(c_x - Float64(node.ub_x)))
+        Δy = max(abs(c_y - Float64(node.lb_y)), abs(c_y - Float64(node.ub_y)))
+        Δz = max(abs(c_z - Float64(node.lb_z)), abs(c_z - Float64(node.ub_z)))
 
-        r_sq = dx * dx + dy * dy + dz * dz
-        r_beta_sq = (Float64(beta)^2) * r_sq
+        r² = muladd(Δx, Δx, muladd(Δy, Δy, Δz * Δz))
+        r²β² = (Float64(β))^2 * r²
 
-        # Optimization: Pre-absorb `INV4PI64` factor into the normal area sum to prune BVH internal loop logic
+        # optimization: pre-absorb `INV4PI64` factor into the normal area sum to prune BVH internal loop logic
         fwn_nodes[node_id] = FWNNode{Tg}(
-            Tg(c_x), Tg(c_y), Tg(c_z), Tg(r_beta_sq),
+            Tg(c_x), Tg(c_y), Tg(c_z),
             Tg(n_sum_x[node_id] * INV4PI64), Tg(n_sum_y[node_id] * INV4PI64), Tg(n_sum_z[node_id] * INV4PI64),
-            zero(Tg)
+            Tg(r²β²)
         )
     end
 
@@ -527,9 +526,9 @@ end
         # Mathematical substitution: (B_q × C_q) ⋅ A_q equates perfectly to A_q ⋅ (AB × AC)
         det = ax * Float64(tri.n[1]) + ay * Float64(tri.n[2]) + az * Float64(tri.n[3])
 
-        la = sqrt(ax * ax + ay * ay + az * az)
-        lb = sqrt(bx * bx + by * by + bz * bz)
-        lc = sqrt(cx * cx + cy * cy + cz * cz)
+        la = √(ax * ax + ay * ay + az * az)
+        lb = √(bx * bx + by * by + bz * bz)
+        lc = √(cx * cx + cy * cy + cz * cz)
 
         ab = ax * bx + ay * by + az * bz
         ac = ax * cx + ay * cy + az * cz
@@ -572,9 +571,9 @@ end
 
                 dist2 = rx * rx + ry * ry + rz * rz
 
-                if dist2 > Float64(fnode.r_beta_sq)
+                if dist2 > Float64(fnode.r²β²)
                     dot = rx * Float64(fnode.n_x) + ry * Float64(fnode.n_y) + rz * Float64(fnode.n_z)
-                    inv_dist = inv(sqrt(dist2))
+                    inv_dist = inv(√(dist2))
                     wn += dot * (inv_dist * inv_dist * inv_dist)
                     break
                 else
