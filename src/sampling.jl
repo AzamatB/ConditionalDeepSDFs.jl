@@ -98,8 +98,8 @@ end
 
 ########################################   Sampling APIs   ########################################
 
-struct SamplingParameters{N}
-    rng::TaskLocalRNG
+struct SamplingParameters{N,R<:AbstractRNG}
+    rng::R
     num_samples::Int
     num_eikonal::Int
     voxel_size::Float32
@@ -113,7 +113,7 @@ struct SamplingParameters{N}
 end
 
 function SamplingParameters(
-    rng::TaskLocalRNG;
+    rng::R;
     num_samples::Int=131_072,
     grid_resolution::Int=256,
     ratio_eikonal::Float32=0.25f0,
@@ -122,7 +122,7 @@ function SamplingParameters(
     splits::NamedTuple{(:surface, :band, :volume),NTuple{3,Float32}}=(; surface=0.2f0, band=0.7f0, volume=0.1f0),
     splits_band::NTuple{N,Float32}=(0.35f0, 0.3f0, 0.2f0, 0.15f0),
     voxel_σs::NTuple{N,Int}=(1, 4, 8, 12)
-) where {N}
+) where {N,R<:AbstractRNG}
     (box_min, box_max) = (-1.0f0, 1.0f0)
     num_eikonal = round(Int, num_samples * ratio_eikonal)
 
@@ -134,7 +134,8 @@ function SamplingParameters(
 
     (slice_surface, slice_band, slice_volume) = partition_slice(1:num_samples, splits)
     subslices_band = partition_slice(slice_band, splits_band)
-    return SamplingParameters{N}(
+
+    return SamplingParameters{N,R}(
         rng,
         num_samples,
         num_eikonal,
@@ -146,6 +147,22 @@ function SamplingParameters(
         slice_volume,
         subslices_band,
         σs
+    )
+end
+
+function SamplingParameters(params::SamplingParameters{N}, rng::R) where {N,R<:AbstractRNG}
+    return SamplingParameters{N,R}(
+        rng,
+        params.num_samples,
+        params.num_eikonal,
+        params.voxel_size,
+        params.threshold_clamp,
+        params.threshold_eikonal,
+        params.slice_surface,
+        params.slice_band,
+        params.slice_volume,
+        params.subslices_band,
+        params.σs
     )
 end
 

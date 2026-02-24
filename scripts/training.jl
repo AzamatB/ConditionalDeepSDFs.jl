@@ -148,11 +148,17 @@ function train_model(
         # shuffle training data each epoch
         shuffle!(rng, mesh_samplers_train)
 
+        # create an isolated, deterministically seeded RNG for the background thread
+        seed_bg = rand(rng, UInt64)
+        rng_bg = Xoshiro(seed_bg)
+        sampling_params_bg = SamplingParameters(sampling_params, rng_bg)
+
         # asynchronous data loading pipeline
         channel = Channel(2; spawn=true) do ch
             for (i, sampler) in enumerate(mesh_samplers_train)
                 buffer = eikonal_buffers[(i%2)+1]
-                samples_cpu = sample_sdf_and_eikonal_points!(buffer, sampler, sampling_params)
+                # pass the isolated sampling_params_bg here instead of the main one
+                samples_cpu = sample_sdf_and_eikonal_points!(buffer, sampler, sampling_params_bg)
                 samples_gpu = samples_cpu |> device
                 put!(ch, samples_gpu)
             end
