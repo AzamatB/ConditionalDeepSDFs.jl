@@ -298,7 +298,7 @@ function build_node!(
     tri_indices::Vector{Int32}, lo::Int, hi::Int, centroids::NTuple{3,Vector{T}},
     lb_x_t::Vector{T}, lb_y_t::Vector{T}, lb_z_t::Vector{T},
     ub_x_t::Vector{T}, ub_y_t::Vector{T}, ub_z_t::Vector{T},
-    depth::Int
+    tri_areas::Vector{T}, depth::Int
 ) where {T<:AbstractFloat}
     count = hi - lo + 1
     if count <= builder.leaf_capacity
@@ -423,10 +423,10 @@ function build_node!(
     builder.next_node += Int32(2)
 
     build_node!(
-        builder, child_l, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, depth + 1
+        builder, child_l, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, tri_areas, depth + 1
     )
     build_node!(
-        builder, child_r, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, depth + 1
+        builder, child_r, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, tri_areas, depth + 1
     )
 
     # bottom-up exact bound merge from children
@@ -440,24 +440,18 @@ function build_node!(
         )
     end
 
-    # representative triangle: the packed triangle index closest to this node's centroid.
+    # representative triangle: the triangle with the largest area in this subtree.
+    # large triangles cover more spatial extent and have the highest probability of being
+    # the actual closest triangle for arbitrary query points hitting this AABB.
     # store triangle *position* (1..num_faces in packed/leaf order) so queries can directly index tri_geometries.
     @inbounds begin
-        node = builder.nodes[node_id]
-        c_x = (node.lb_x + node.ub_x) * T(0.5)
-        c_y = (node.lb_y + node.ub_y) * T(0.5)
-        c_z = (node.lb_z + node.ub_z) * T(0.5)
-
-        best_d2 = T(Inf)
+        best_area = -T(Inf)
         rep_pos = lo
         for i in lo:hi
             t = tri_indices[i]
-            dx = centroids[1][t] - c_x
-            dy = centroids[2][t] - c_y
-            dz = centroids[3][t] - c_z
-            d2 = muladd(dx, dx, muladd(dy, dy, dz * dz))
-            if d2 < best_d2
-                best_d2 = d2
+            a = tri_areas[t]
+            if a > best_area
+                best_area = a
                 rep_pos = i
             end
         end
@@ -470,7 +464,8 @@ end
 function build_bvh(
     centroids::NTuple{3,Vector{Tg}},
     lb_x_t::Vector{Tg}, lb_y_t::Vector{Tg}, lb_z_t::Vector{Tg},
-    ub_x_t::Vector{Tg}, ub_y_t::Vector{Tg}, ub_z_t::Vector{Tg};
+    ub_x_t::Vector{Tg}, ub_y_t::Vector{Tg}, ub_z_t::Vector{Tg},
+    tri_areas::Vector{Tg};
     leaf_capacity::Int=8
 ) where {Tg<:AbstractFloat}
     num_faces = length(first(centroids))
@@ -496,7 +491,7 @@ function build_bvh(
     build_node!(
         builder, Int32(1), tri_indices, 1, num_faces, centroids,
         lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t,
-        1
+        tri_areas, 1
     )
 
     num_nodes = builder.next_node - 1
@@ -533,6 +528,8 @@ function preprocess_mesh(
     centroids_x = Vector{Tg}(undef, num_faces)
     centroids_y = Vector{Tg}(undef, num_faces)
     centroids_z = Vector{Tg}(undef, num_faces)
+    # triangle areas for representative triangle selection (largest-area heuristic)
+    tri_areas = Vector{Tg}(undef, num_faces)
 
     @inbounds for idx_face in eachindex(faces)
         face = faces[idx_face]
@@ -555,10 +552,18 @@ function preprocess_mesh(
         centroids_x[idx_face] = centroid[1]
         centroids_y[idx_face] = centroid[2]
         centroids_z[idx_face] = centroid[3]
+
+        # triangle area = 0.5 * ‖ab × ac‖; store ‖ab × ac‖² for comparison (avoids sqrt)
+        ab_x = x2 - x1; ab_y = y2 - y1; ab_z = z2 - z1
+        ac_x = x3 - x1; ac_y = y3 - y1; ac_z = z3 - z1
+        cx = ab_y * ac_z - ab_z * ac_y
+        cy = ab_z * ac_x - ab_x * ac_z
+        cz = ab_x * ac_y - ab_y * ac_x
+        tri_areas[idx_face] = muladd(cx, cx, muladd(cy, cy, cz * cz))
     end
     centroids = (centroids_x, centroids_y, centroids_z)
     (bvh, tri_order) = build_bvh(
-        centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t; leaf_capacity
+        centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, tri_areas; leaf_capacity
     )
 
     # pack triangle geometry contiguously by BVH leaf order
@@ -623,7 +628,16 @@ function precompute_fast_winding_data(
     n_sum_z = Vector{Float64}(undef, num_nodes)
 
     @inbounds for node_id in num_nodes:-1:1
-        (node_id == 2) && continue
+        if node_id == 2
+            # node 2 is the reserved dummy slot; initialize with safe sentinel so
+            # far-field test always fails (forces exact evaluation) if ever touched.
+            fwn_nodes[2] = FWNNode{Tg}(
+                zero(Tg), zero(Tg), zero(Tg),
+                zero(Tg), zero(Tg), zero(Tg),
+                Tg(Inf)
+            )
+            continue
+        end
 
         node = bvh.nodes[node_id]
         child_or_size = node.child_or_size
@@ -776,14 +790,15 @@ const FEATURE_DEGENERATE = UInt8(7)
     p::Point3{Tg}, a::Point3{Tg}, b::Point3{Tg},
     feat_edge::UInt8, feat_a::UInt8, feat_b::UInt8
 ) where {Tg<:AbstractFloat}
+    ab = b - a
+    ab2 = ab ⋅ ab
+    zer = zero(Tg)
+    # degenerate guard outside @fastmath to avoid nnan/ninf eliding the check
+    if ab2 <= zer
+        dist² = norm²(p - a)
+        return (dist²::Tg, feat_a)
+    end
     @fastmath begin
-        ab = b - a
-        ab2 = ab ⋅ ab
-        zer = zero(Tg)
-        if ab2 <= zer
-            dist² = norm²(p - a)
-            return (dist²::Tg, feat_a)
-        end
         t = ((p - a) ⋅ ab) / ab2
         uno = one(Tg)
         tc = clamp(t, zer, uno)
@@ -884,9 +899,10 @@ end
             return (dist²::Tg, FEATURE_EDGE_AC)
         end
 
-        # edge BC
+        # edge BC vs face interior (exhaustive else to prevent @fastmath numerical cracks)
         uno = one(Tg)
-        if (vb + vc) * inv_denom >= uno
+        v_bary = (vb + vc) * inv_denom
+        if v_bary >= uno
             d43 = d11 - d12 - d1 + d2
             zer = zero(Tg)
             d33 = max(zer, d11 + d22 - Tg(2) * d12)
@@ -895,11 +911,11 @@ end
             bp = ap - triangle.ab
             dist² = norm²(bp - w * (triangle.ac - triangle.ab))
             return (dist²::Tg, FEATURE_EDGE_BC)
+        else
+            # face interior
+            dist² = plane_dist²
+            return (dist²::Tg, FEATURE_FACE)
         end
-
-        # face interior
-        dist² = plane_dist²
-        return (dist²::Tg, FEATURE_FACE)
     end
 end
 
@@ -928,6 +944,10 @@ end
         la = √(ax * ax + ay * ay + az * az)
         lb = √(bx * bx + by * by + bz * bz)
         lc = √(cx * cx + cy * cy + cz * cz)
+
+        # guard: if query point coincides with a vertex, solid angle is undefined → return 0
+        eps_val = 1.0e-30
+        (la < eps_val || lb < eps_val || lc < eps_val) && return 0.0
 
         ab = ax * bx + ay * by + az * bz
         ac = ax * cx + ay * cy + az * cz
@@ -992,10 +1012,30 @@ end
                     break
                 end
 
-                # push right child, iterate into left
-                stack_top += 1
-                stack[stack_top] = child_or_size
-                node_id = Int(node.index)
+                # sort children by distance to query point for cache coherence:
+                # iterate into nearer child, push farther child.
+                child_l_id = Int(node.index)
+                child_r_id = Int(child_or_size)
+                node_l = bvh_nodes[child_l_id]
+                node_r = bvh_nodes[child_r_id]
+
+                # AABB center distance (cheap proxy for spatial proximity)
+                dl = (0.5 * (Float64(node_l.lb_x) + Float64(node_l.ub_x)) - qx)^2 +
+                     (0.5 * (Float64(node_l.lb_y) + Float64(node_l.ub_y)) - qy)^2 +
+                     (0.5 * (Float64(node_l.lb_z) + Float64(node_l.ub_z)) - qz)^2
+                dr = (0.5 * (Float64(node_r.lb_x) + Float64(node_r.ub_x)) - qx)^2 +
+                     (0.5 * (Float64(node_r.lb_y) + Float64(node_r.ub_y)) - qy)^2 +
+                     (0.5 * (Float64(node_r.lb_z) + Float64(node_r.ub_z)) - qz)^2
+
+                if dl <= dr
+                    stack_top += 1
+                    stack[stack_top] = Int32(child_r_id)
+                    node_id = child_l_id
+                else
+                    stack_top += 1
+                    stack[stack_top] = Int32(child_l_id)
+                    node_id = child_r_id
+                end
                 continue
             end
         end
@@ -1053,8 +1093,9 @@ function signed_distance_point_kernel(
     zer = zero(Tg)
     (p_x, p_y, p_z) = point
 
-    # evaluate representative triangles only on the first root→leaf descent
-    do_reps = true
+    # evaluate representative triangles only when we have no initial bound (no hint face).
+    # once tri_best is set from any source, reps add cost without meaningful pruning benefit.
+    do_reps = iszero(tri_best)
 
     stack_top = 1
     @inbounds root_node = bvh.nodes[1]
@@ -1132,8 +1173,7 @@ function signed_distance_point_kernel(
                 end
                 break
             else
-                # leaf: after the first leaf is visited, stop evaluating representative triangles
-                do_reps = false
+                # leaf node: scan all triangles in the leaf
                 leaf_start = node_dist.index
                 leaf_end = -child_or_size
                 for idx in leaf_start:leaf_end
