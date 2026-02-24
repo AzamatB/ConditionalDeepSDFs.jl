@@ -72,14 +72,16 @@ end
 
 struct BoundingVolumeHierarchy{T<:AbstractFloat}
     nodes::Vector{BVHNode{T}}
+    rep_tris::Vector{Int32}      # representative triangle index per node (0 for leaves)
     leaf_capacity::Int32
     num_nodes::Int32
 end
 
 # stack element carrying node topology cache to avoid redundant bvh.nodes fetches on pop.
-# dense 12-byte layout for Float32.
+# dense 16-byte layout for Float32 (adds node_id for representative-triangle eval).
 struct NodeDist{T<:AbstractFloat}
     dist²::T
+    node_id::Int32
     index::Int32
     child_or_size::Int32
 end
@@ -111,9 +113,183 @@ function median_split_sort!(
     return nothing
 end
 
+
+mutable struct SAHScratch{T<:AbstractFloat}
+    count::Vector{Int32}
+    lb_x::Vector{T}
+    lb_y::Vector{T}
+    lb_z::Vector{T}
+    ub_x::Vector{T}
+    ub_y::Vector{T}
+    ub_z::Vector{T}
+    suffix_count::Vector{Int32}
+    suffix_lb_x::Vector{T}
+    suffix_lb_y::Vector{T}
+    suffix_lb_z::Vector{T}
+    suffix_ub_x::Vector{T}
+    suffix_ub_y::Vector{T}
+    suffix_ub_z::Vector{T}
+end
+
+const SAH_BINS = 16
+
+function SAHScratch{T}() where {T<:AbstractFloat}
+    nb = SAH_BINS
+    count = Vector{Int32}(undef, nb)
+    lb_x = Vector{T}(undef, nb)
+    lb_y = Vector{T}(undef, nb)
+    lb_z = Vector{T}(undef, nb)
+    ub_x = Vector{T}(undef, nb)
+    ub_y = Vector{T}(undef, nb)
+    ub_z = Vector{T}(undef, nb)
+
+    suffix_count = Vector{Int32}(undef, nb + 1)
+    suffix_lb_x = Vector{T}(undef, nb + 1)
+    suffix_lb_y = Vector{T}(undef, nb + 1)
+    suffix_lb_z = Vector{T}(undef, nb + 1)
+    suffix_ub_x = Vector{T}(undef, nb + 1)
+    suffix_ub_y = Vector{T}(undef, nb + 1)
+    suffix_ub_z = Vector{T}(undef, nb + 1)
+
+    return SAHScratch{T}(
+        count, lb_x, lb_y, lb_z, ub_x, ub_y, ub_z,
+        suffix_count, suffix_lb_x, suffix_lb_y, suffix_lb_z,
+        suffix_ub_x, suffix_ub_y, suffix_ub_z
+    )
+end
+
+@inline function reset_sah_bins!(scratch::SAHScratch{T}) where {T<:AbstractFloat}
+    nb = SAH_BINS
+    fill!(scratch.count, Int32(0))
+    inf = T(Inf)
+    ninf = -T(Inf)
+    @inbounds for b in 1:nb
+        scratch.lb_x[b] = inf
+        scratch.lb_y[b] = inf
+        scratch.lb_z[b] = inf
+        scratch.ub_x[b] = ninf
+        scratch.ub_y[b] = ninf
+        scratch.ub_z[b] = ninf
+    end
+    return nothing
+end
+
+@inline function centroid_bin_index(c::T, cmin::T, inv_extent::T) where {T<:AbstractFloat}
+    # map c in [cmin,cmax] to bin in 1:SAH_BINS
+    x = (c - cmin) * inv_extent
+    b = Int(floor(x))
+    nbm1 = SAH_BINS - 1
+    b = ifelse(b < 0, 0, ifelse(b > nbm1, nbm1, b))
+    return (b + 1)::Int
+end
+
+@inline function aabb_half_area(lb_x::T, lb_y::T, lb_z::T, ub_x::T, ub_y::T, ub_z::T) where {T<:AbstractFloat}
+    zer = zero(T)
+    dx = max(ub_x - lb_x, zer)
+    dy = max(ub_y - lb_y, zer)
+    dz = max(ub_z - lb_z, zer)
+    # half surface area: dx*dy + dx*dz + dy*dz
+    area = muladd(dx, dy, muladd(dx, dz, dy * dz))
+    return area::T
+end
+
+@inline function sah_best_split_axis!(
+    scratch::SAHScratch{T},
+    tri_indices::Vector{Int32}, lo::Int, hi::Int,
+    centroids_axis::Vector{T}, cmin::T, cmax::T,
+    lb_x_t::Vector{T}, lb_y_t::Vector{T}, lb_z_t::Vector{T},
+    ub_x_t::Vector{T}, ub_y_t::Vector{T}, ub_z_t::Vector{T}
+) where {T<:AbstractFloat}
+    extent = cmax - cmin
+    (extent > zero(T)) || return (T(Inf), 0, zero(T))
+
+    nb = SAH_BINS
+    inv_extent = T(nb) / extent
+
+    reset_sah_bins!(scratch)
+
+    @inbounds for i in lo:hi
+        tri = tri_indices[i]
+        b = centroid_bin_index(centroids_axis[tri], cmin, inv_extent)
+
+        scratch.count[b] += Int32(1)
+        scratch.lb_x[b] = min(scratch.lb_x[b], lb_x_t[tri])
+        scratch.lb_y[b] = min(scratch.lb_y[b], lb_y_t[tri])
+        scratch.lb_z[b] = min(scratch.lb_z[b], lb_z_t[tri])
+        scratch.ub_x[b] = max(scratch.ub_x[b], ub_x_t[tri])
+        scratch.ub_y[b] = max(scratch.ub_y[b], ub_y_t[tri])
+        scratch.ub_z[b] = max(scratch.ub_z[b], ub_z_t[tri])
+    end
+
+    # build suffix bounds/counts for bins b:nb (suffix_*[b]) with sentinel at nb+1
+    inf = T(Inf)
+    ninf = -T(Inf)
+    scratch.suffix_count[nb+1] = Int32(0)
+    scratch.suffix_lb_x[nb+1] = inf
+    scratch.suffix_lb_y[nb+1] = inf
+    scratch.suffix_lb_z[nb+1] = inf
+    scratch.suffix_ub_x[nb+1] = ninf
+    scratch.suffix_ub_y[nb+1] = ninf
+    scratch.suffix_ub_z[nb+1] = ninf
+
+    @inbounds for b in nb:-1:1
+        scratch.suffix_count[b] = scratch.suffix_count[b+1] + scratch.count[b]
+        scratch.suffix_lb_x[b] = min(scratch.lb_x[b], scratch.suffix_lb_x[b+1])
+        scratch.suffix_lb_y[b] = min(scratch.lb_y[b], scratch.suffix_lb_y[b+1])
+        scratch.suffix_lb_z[b] = min(scratch.lb_z[b], scratch.suffix_lb_z[b+1])
+        scratch.suffix_ub_x[b] = max(scratch.ub_x[b], scratch.suffix_ub_x[b+1])
+        scratch.suffix_ub_y[b] = max(scratch.ub_y[b], scratch.suffix_ub_y[b+1])
+        scratch.suffix_ub_z[b] = max(scratch.ub_z[b], scratch.suffix_ub_z[b+1])
+    end
+
+    # scan split positions between bins and pick minimal SAH proxy cost:
+    #   cost = area(L)*count(L) + area(R)*count(R)
+    left_count = Int32(0)
+    left_lb_x = inf
+    left_lb_y = inf
+    left_lb_z = inf
+    left_ub_x = ninf
+    left_ub_y = ninf
+    left_ub_z = ninf
+
+    best_cost = T(Inf)
+    best_split = 0
+
+    @inbounds for b in 1:(nb-1)
+        ccount = scratch.count[b]
+        if ccount != 0
+            left_count += ccount
+            left_lb_x = min(left_lb_x, scratch.lb_x[b])
+            left_lb_y = min(left_lb_y, scratch.lb_y[b])
+            left_lb_z = min(left_lb_z, scratch.lb_z[b])
+            left_ub_x = max(left_ub_x, scratch.ub_x[b])
+            left_ub_y = max(left_ub_y, scratch.ub_y[b])
+            left_ub_z = max(left_ub_z, scratch.ub_z[b])
+        end
+
+        right_count = scratch.suffix_count[b+1]
+        if (left_count > 0) && (right_count > 0)
+            area_l = aabb_half_area(left_lb_x, left_lb_y, left_lb_z, left_ub_x, left_ub_y, left_ub_z)
+            area_r = aabb_half_area(
+                scratch.suffix_lb_x[b+1], scratch.suffix_lb_y[b+1], scratch.suffix_lb_z[b+1],
+                scratch.suffix_ub_x[b+1], scratch.suffix_ub_y[b+1], scratch.suffix_ub_z[b+1]
+            )
+            cost = area_l * T(left_count) + area_r * T(right_count)
+            if cost < best_cost
+                best_cost = cost
+                best_split = b
+            end
+        end
+    end
+
+    return (best_cost::T, best_split::Int, inv_extent::T)
+end
+
 mutable struct BVHBuilder{T}
     const nodes::Vector{BVHNode{T}}
+    const rep_tris::Vector{Int32}
     const leaf_capacity::Int32
+    const sah_scratch::Vector{SAHScratch{T}}
     next_node::Int32
 end
 
@@ -121,8 +297,9 @@ function build_node!(
     builder::BVHBuilder{T}, node_id::Int32,
     tri_indices::Vector{Int32}, lo::Int, hi::Int, centroids::NTuple{3,Vector{T}},
     lb_x_t::Vector{T}, lb_y_t::Vector{T}, lb_z_t::Vector{T},
-    ub_x_t::Vector{T}, ub_y_t::Vector{T}, ub_z_t::Vector{T}
-) where {T}
+    ub_x_t::Vector{T}, ub_y_t::Vector{T}, ub_z_t::Vector{T},
+    depth::Int
+) where {T<:AbstractFloat}
     count = hi - lo + 1
     if count <= builder.leaf_capacity
         # compute leaf bounds
@@ -145,10 +322,11 @@ function build_node!(
         @inbounds builder.nodes[node_id] = BVHNode{T}(
             min_x, min_y, min_z, max_x, max_y, max_z, Int32(lo), -Int32(hi)
         )
+        @inbounds builder.rep_tris[node_id] = Int32(0)
         return node_id::Int32
     end
 
-    # split axis = longest centroid extent
+    # centroid bounds (for SAH binning)
     centroid_min_x = T(Inf)
     centroid_min_y = T(Inf)
     centroid_min_z = T(Inf)
@@ -164,24 +342,91 @@ function build_node!(
         centroid_max_y = max(centroid_max_y, centroids[2][t])
         centroid_max_z = max(centroid_max_z, centroids[3][t])
     end
-    spread_x = centroid_max_x - centroid_min_x
-    spread_y = centroid_max_y - centroid_min_y
-    spread_z = centroid_max_z - centroid_min_z
-    (spread_max, axis) = findmax((spread_x, spread_y, spread_z))
 
-    mid = (lo + hi) >>> 1
-    # median split via partial sort (skip if all centroids identical along all axes)
-    (spread_max > 0) && median_split_sort!(tri_indices, lo, mid, hi, centroids, axis)
+    scratch = builder.sah_scratch[depth]
+
+    best_cost = T(Inf)
+    best_axis = 0
+    best_split = 0
+    best_inv_extent = zero(T)
+    best_cmin = zero(T)
+
+    # evaluate SAH proxy cost on each axis using binned splitting
+    (cost_x, split_x, inv_ext_x) = sah_best_split_axis!(
+        scratch, tri_indices, lo, hi, centroids[1], centroid_min_x, centroid_max_x,
+        lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
+    )
+    if (split_x != 0) && (cost_x < best_cost)
+        best_cost = cost_x
+        best_axis = 1
+        best_split = split_x
+        best_inv_extent = inv_ext_x
+        best_cmin = centroid_min_x
+    end
+
+    (cost_y, split_y, inv_ext_y) = sah_best_split_axis!(
+        scratch, tri_indices, lo, hi, centroids[2], centroid_min_y, centroid_max_y,
+        lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
+    )
+    if (split_y != 0) && (cost_y < best_cost)
+        best_cost = cost_y
+        best_axis = 2
+        best_split = split_y
+        best_inv_extent = inv_ext_y
+        best_cmin = centroid_min_y
+    end
+
+    (cost_z, split_z, inv_ext_z) = sah_best_split_axis!(
+        scratch, tri_indices, lo, hi, centroids[3], centroid_min_z, centroid_max_z,
+        lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
+    )
+    if (split_z != 0) && (cost_z < best_cost)
+        best_cost = cost_z
+        best_axis = 3
+        best_split = split_z
+        best_inv_extent = inv_ext_z
+        best_cmin = centroid_min_z
+    end
+
+    mid = 0
+
+    if best_axis != 0
+        # partition triangles by bin index along best_axis
+        axis = best_axis
+        i = lo
+        j = hi
+        @inbounds while i <= j
+            t = tri_indices[i]
+            b = centroid_bin_index(centroids[axis][t], best_cmin, best_inv_extent)
+            if b <= best_split
+                i += 1
+            else
+                tri_indices[i], tri_indices[j] = tri_indices[j], tri_indices[i]
+                j -= 1
+            end
+        end
+        mid = j
+    end
+
+    # fallback: robust median split when SAH binning degenerates (all go to one side)
+    if (best_axis == 0) || (mid < lo) || (mid >= hi)
+        spread_x = centroid_max_x - centroid_min_x
+        spread_y = centroid_max_y - centroid_min_y
+        spread_z = centroid_max_z - centroid_min_z
+        (spread_max, axis) = findmax((spread_x, spread_y, spread_z))
+        mid = (lo + hi) >>> 1
+        (spread_max > 0) && median_split_sort!(tri_indices, lo, mid, hi, centroids, axis)
+    end
 
     child_l = builder.next_node
     child_r = builder.next_node + Int32(1)
     builder.next_node += Int32(2)
 
     build_node!(
-        builder, child_l, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
+        builder, child_l, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, depth + 1
     )
     build_node!(
-        builder, child_r, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
+        builder, child_r, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, depth + 1
     )
 
     # bottom-up exact bound merge from children
@@ -194,6 +439,31 @@ function build_node!(
             child_l, child_r
         )
     end
+
+    # representative triangle: the packed triangle index closest to this node's centroid.
+    # store triangle *position* (1..num_faces in packed/leaf order) so queries can directly index tri_geometries.
+    @inbounds begin
+        node = builder.nodes[node_id]
+        c_x = (node.lb_x + node.ub_x) * T(0.5)
+        c_y = (node.lb_y + node.ub_y) * T(0.5)
+        c_z = (node.lb_z + node.ub_z) * T(0.5)
+
+        best_d2 = T(Inf)
+        rep_pos = lo
+        for i in lo:hi
+            t = tri_indices[i]
+            dx = centroids[1][t] - c_x
+            dy = centroids[2][t] - c_y
+            dz = centroids[3][t] - c_z
+            d2 = muladd(dx, dx, muladd(dy, dy, dz * dz))
+            if d2 < best_d2
+                best_d2 = d2
+                rep_pos = i
+            end
+        end
+        builder.rep_tris[node_id] = Int32(rep_pos)
+    end
+
     return node_id::Int32
 end
 
@@ -202,26 +472,39 @@ function build_bvh(
     lb_x_t::Vector{Tg}, lb_y_t::Vector{Tg}, lb_z_t::Vector{Tg},
     ub_x_t::Vector{Tg}, ub_y_t::Vector{Tg}, ub_z_t::Vector{Tg};
     leaf_capacity::Int=8
-) where {Tg}
+) where {Tg<:AbstractFloat}
     num_faces = length(first(centroids))
     tri_indices = Int32.(1:num_faces)
     max_nodes = 2 * num_faces + 1
 
-    builder = BVHBuilder{Tg}(Vector{BVHNode{Tg}}(undef, max_nodes), Int32(leaf_capacity), Int32(3))
+    nodes = Vector{BVHNode{Tg}}(undef, max_nodes)
+    rep_tris = Vector{Int32}(undef, max_nodes)
+    fill!(rep_tris, Int32(0))
+
+    # SAH scratch (build-time only). Oversize a bit to stay safe for mildly unbalanced trees.
+    max_depth = max(64, ceil(Int, log2(max(num_faces, 1))) + 8)
+    sah_scratch = [SAHScratch{Tg}() for _ in 1:max_depth]
+
+    builder = BVHBuilder{Tg}(nodes, rep_tris, Int32(leaf_capacity), sah_scratch, Int32(3))
+
     if max_nodes >= 2
         zer = zero(Tg)
         builder.nodes[2] = BVHNode{Tg}(zer, zer, zer, zer, zer, zer, Int32(0), Int32(0))
+        builder.rep_tris[2] = Int32(0)
     end
 
     build_node!(
-        builder, Int32(1), tri_indices, 1, num_faces, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
+        builder, Int32(1), tri_indices, 1, num_faces, centroids,
+        lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t,
+        1
     )
 
     num_nodes = builder.next_node - 1
-    bvh = BoundingVolumeHierarchy{Tg}(builder.nodes[1:num_nodes], builder.leaf_capacity, Int32(num_nodes))
+    resize!(builder.nodes, num_nodes)
+    resize!(builder.rep_tris, num_nodes)
+    bvh = BoundingVolumeHierarchy{Tg}(builder.nodes, builder.rep_tris, builder.leaf_capacity, Int32(num_nodes))
     return (bvh, tri_indices)
 end
-
 ######################################   Mesh Preprocessing   ######################################
 
 function preprocess_mesh(
@@ -476,62 +759,134 @@ end
 
 ##############################   High-Performance Hot Loop Routines   ##############################
 
-# exact closest-distance-to-triangle with early plane-distance rejection.
-# returns squared distance only (no Δ vector needed — sign is determined by winding number).
-@inline function closest_dist²_triangle(p::Point3{Tg}, triangle::TriangleGeometry{Tg}, dist²_best::Tg) where {Tg}
+# closest-feature classification for sign selection.
+#  - FEATURE_FACE: closest point is strictly in the triangle interior
+#  - FEATURE_EDGE_* / FEATURE_VERTEX_*: closest point lies on an edge or vertex
+const FEATURE_FACE = UInt8(0)
+const FEATURE_VERTEX_A = UInt8(1)
+const FEATURE_VERTEX_B = UInt8(2)
+const FEATURE_VERTEX_C = UInt8(3)
+const FEATURE_EDGE_AB = UInt8(4)
+const FEATURE_EDGE_AC = UInt8(5)
+const FEATURE_EDGE_BC = UInt8(6)
+const FEATURE_DEGENERATE = UInt8(7)
+
+# closest distance to segment with feature classification (used only for degenerate triangles)
+@inline function closest_dist²_segment_feature(
+    p::Point3{Tg}, a::Point3{Tg}, b::Point3{Tg},
+    feat_edge::UInt8, feat_a::UInt8, feat_b::UInt8
+) where {Tg<:AbstractFloat}
     @fastmath begin
+        ab = b - a
+        ab2 = ab ⋅ ab
+        zer = zero(Tg)
+        if ab2 <= zer
+            dist² = norm²(p - a)
+            return (dist²::Tg, feat_a)
+        end
+        t = ((p - a) ⋅ ab) / ab2
+        uno = one(Tg)
+        tc = clamp(t, zer, uno)
+        q = a + tc * ab
+        dist² = norm²(p - q)
+        feat = ifelse(tc <= zer, feat_a, ifelse(tc >= uno, feat_b, feat_edge))
+        return (dist²::Tg, feat::UInt8)
+    end
+end
+
+# exact closest-distance-to-triangle with early plane-distance rejection.
+# returns squared distance and closest-feature type (for robust sign selection without heuristics).
+@inline function closest_dist²_triangle_feature(
+    p::Point3{Tg}, triangle::TriangleGeometry{Tg}, dist²_best::Tg
+) where {Tg<:AbstractFloat}
+    @fastmath begin
+        inv_denom = triangle.inv_denom
         ap = p - triangle.a
+
+        # degenerate triangle (zero area): fall back to segment distances
+        if iszero(inv_denom)
+            a = triangle.a
+            b = a + triangle.ab
+            c = a + triangle.ac
+
+            (d2_ab, f_ab) = closest_dist²_segment_feature(
+                p, a, b, FEATURE_EDGE_AB, FEATURE_VERTEX_A, FEATURE_VERTEX_B
+            )
+            (d2_ac, f_ac) = closest_dist²_segment_feature(
+                p, a, c, FEATURE_EDGE_AC, FEATURE_VERTEX_A, FEATURE_VERTEX_C
+            )
+            (d2_bc, f_bc) = closest_dist²_segment_feature(
+                p, b, c, FEATURE_EDGE_BC, FEATURE_VERTEX_B, FEATURE_VERTEX_C
+            )
+
+            dist² = d2_ab
+            feat = f_ab
+            if d2_ac < dist²
+                dist² = d2_ac
+                feat = f_ac
+            end
+            if d2_bc < dist²
+                dist² = d2_bc
+                feat = f_bc
+            end
+            return (dist²::Tg, feat::UInt8)
+        end
 
         # early rejection: plane distance is a lower bound on triangle distance
         dot_n = triangle.n ⋅ ap
-        plane_dist² = (dot_n * dot_n) * triangle.inv_denom
-        (plane_dist² >= dist²_best) && return plane_dist²::Tg
+        plane_dist² = (dot_n * dot_n) * inv_denom
+        (plane_dist² >= dist²_best) && return (plane_dist²::Tg, FEATURE_FACE)
 
         d1 = triangle.ab ⋅ ap
         d2 = triangle.ac ⋅ ap
 
+        # vertex A
         if (d1 <= 0) && (d2 <= 0)
             dist² = norm²(ap)
-            return dist²::Tg
+            return (dist²::Tg, FEATURE_VERTEX_A)
         end
 
         d11 = triangle.d11
         d12 = triangle.d12
         d22 = triangle.d22
 
+        # vertex B
         d3 = d1 - d11
         d4 = d2 - d12
         if (d3 >= 0) && (d4 <= d3)
             dist² = norm²(ap - triangle.ab)
-            return dist²::Tg
+            return (dist²::Tg, FEATURE_VERTEX_B)
         end
 
+        # edge AB
         vc = muladd(d11, d2, -d12 * d1)
         if (vc <= 0) && (d1 >= 0) && (d3 <= 0)
             zer = zero(Tg)
             v = ifelse(d11 > zer, d1 / d11, zer)
             dist² = norm²(ap - v * triangle.ab)
-            return dist²::Tg
+            return (dist²::Tg, FEATURE_EDGE_AB)
         end
 
+        # vertex C
         d5 = d1 - d12
         d6 = d2 - d22
         if (d6 >= 0) && (d5 <= d6)
             dist² = norm²(ap - triangle.ac)
-            return dist²::Tg
+            return (dist²::Tg, FEATURE_VERTEX_C)
         end
 
+        # edge AC
         vb = muladd(d22, d1, -d12 * d2)
         if (vb <= 0) && (d2 >= 0) && (d6 <= 0)
             zer = zero(Tg)
             w = ifelse(d22 > zer, d2 / d22, zer)
             dist² = norm²(ap - w * triangle.ac)
-            return dist²::Tg
+            return (dist²::Tg, FEATURE_EDGE_AC)
         end
 
-        # edge BC test
+        # edge BC
         uno = one(Tg)
-        if (vb + vc) * triangle.inv_denom >= uno
+        if (vb + vc) * inv_denom >= uno
             d43 = d11 - d12 - d1 + d2
             zer = zero(Tg)
             d33 = max(zer, d11 + d22 - Tg(2) * d12)
@@ -539,40 +894,12 @@ end
             w = clamp(ifelse(d33 > zer, d43 / d33, zer), zer, uno)
             bp = ap - triangle.ab
             dist² = norm²(bp - w * (triangle.ac - triangle.ab))
-            return dist²::Tg
+            return (dist²::Tg, FEATURE_EDGE_BC)
         end
 
         # face interior
-        zer = zero(Tg)
-        dist² = ifelse(triangle.inv_denom > zer, plane_dist², norm²(ap))
-        return dist²::Tg
-    end
-end
-
-###############################   Fast Face-Interior Sign Shortcut   ###############################
-
-@inline function face_interior_sign_or_zero(
-    p::Point3{Tg}, tri::TriangleGeometry{Tg}, bary_tol::Tg=Tg(1e-4)
-) where {Tg<:AbstractFloat}
-    inv_denom = tri.inv_denom
-    iszero(inv_denom) && return zero(Tg)
-
-    @fastmath begin
-        ap = p - tri.a
-
-        d1 = tri.ab ⋅ ap
-        d2 = tri.ac ⋅ ap
-
-        v = muladd(tri.d22, d1, -tri.d12 * d2) * inv_denom
-        w = muladd(tri.d11, d2, -tri.d12 * d1) * inv_denom
-
-        if (v <= bary_tol) || (w <= bary_tol) || ((one(Tg) - v - w) <= bary_tol)
-            return zero(Tg)
-        end
-
-        # reuse precomputed face normal to avoid cross product
-        sgn = ifelse((tri.n ⋅ ap) >= zero(Tg), one(Tg), -one(Tg))
-        return sgn::Tg
+        dist² = plane_dist²
+        return (dist²::Tg, FEATURE_FACE)
     end
 end
 
@@ -687,14 +1014,15 @@ function signed_distance_point(
     if (hint_face > 0) && (hint_face <= length(sdm.tri_geometries))
         tri_best = hint_face
         @inbounds triangle = sdm.tri_geometries[tri_best]
-        dist²_best = closest_dist²_triangle(point, triangle, Tg(Inf))
+        (dist²_best, feature_best) = closest_dist²_triangle_feature(point, triangle, Tg(Inf))
         (dist²_best <= 0) && return zero(Tg)
     else
         tri_best = Int32(0)
         dist²_best = Tg(Inf)
+        feature_best = FEATURE_DEGENERATE
     end
 
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, tri_best, stacks)
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, tri_best, feature_best, stacks)
     return signed_distance::Tg
 end
 
@@ -703,7 +1031,8 @@ function signed_distance_point(
 ) where {Tg<:AbstractFloat}
     dist²_best = Tg(Inf)
     tri_best = Int32(0)
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, tri_best, stacks)
+    feature_best = FEATURE_DEGENERATE
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, tri_best, feature_best, stacks)
     return signed_distance::Tg
 end
 
@@ -712,19 +1041,24 @@ function signed_distance_point_kernel(
     point::Point3{Tg},
     dist²_best::Tg,
     tri_best::Int32,
+    feature_best::UInt8,
     stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat}
     bvh = sdm.bvh
     tri_geometries = sdm.tri_geometries
+    rep_tris = bvh.rep_tris
     stack = stacks.dist
     wind_stack = stacks.wind
 
     zer = zero(Tg)
     (p_x, p_y, p_z) = point
 
+    # evaluate representative triangles only on the first root→leaf descent
+    do_reps = true
+
     stack_top = 1
     @inbounds root_node = bvh.nodes[1]
-    @inbounds stack[1] = NodeDist{Tg}(zer, root_node.index, root_node.child_or_size)
+    @inbounds stack[1] = NodeDist{Tg}(zer, Int32(1), root_node.index, root_node.child_or_size)
 
     @inbounds while stack_top > 0
         node_dist = stack[stack_top]
@@ -736,6 +1070,21 @@ function signed_distance_point_kernel(
             child_or_size = node_dist.child_or_size
 
             if child_or_size > 0
+                # representative triangle evaluation (first descent only)
+                if do_reps
+                    rep_idx = rep_tris[Int(node_dist.node_id)]
+                    if rep_idx != 0
+                        (dist²_rep, feat_rep) = closest_dist²_triangle_feature(
+                            point, tri_geometries[rep_idx], dist²_best
+                        )
+                        if dist²_rep < dist²_best
+                            dist²_best = dist²_rep
+                            tri_best = Int32(rep_idx)
+                            feature_best = feat_rep
+                        end
+                    end
+                end
+
                 child_l_id = node_dist.index
                 child_r_id = child_or_size
 
@@ -762,31 +1111,37 @@ function signed_distance_point_kernel(
 
                 # branchless child sorting via ifelse (compiles to cmov)
                 swap = dist²_l > dist²_r
-                (dist²_near, dist²_far, idx_near, idx_far, cos_near, cos_far) = ifelse(
-                    swap,
-                    (dist²_r, dist²_l, idx_r, idx_l, cos_r, cos_l),
-                    (dist²_l, dist²_r, idx_l, idx_r, cos_l, cos_r)
-                )
+                near_dist² = ifelse(swap, dist²_r, dist²_l)
+                far_dist² = ifelse(swap, dist²_l, dist²_r)
+                near_id = ifelse(swap, child_r_id, child_l_id)
+                far_id = ifelse(swap, child_l_id, child_r_id)
+                near_idx = ifelse(swap, idx_r, idx_l)
+                far_idx = ifelse(swap, idx_l, idx_r)
+                near_cos = ifelse(swap, cos_r, cos_l)
+                far_cos = ifelse(swap, cos_l, cos_r)
 
-                if dist²_near < dist²_best
-                    if dist²_far < dist²_best
+                if near_dist² < dist²_best
+                    if far_dist² < dist²_best
                         # push far child
                         stack_top += 1
-                        @inbounds stack[stack_top] = NodeDist{Tg}(dist²_far, idx_far, cos_far)
+                        @inbounds stack[stack_top] = NodeDist{Tg}(far_dist², far_id, far_idx, far_cos)
                     end
                     # iterate into near child
-                    node_dist = NodeDist{Tg}(dist²_near, idx_near, cos_near)
+                    node_dist = NodeDist{Tg}(near_dist², near_id, near_idx, near_cos)
                     continue
                 end
                 break
             else
+                # leaf: after the first leaf is visited, stop evaluating representative triangles
+                do_reps = false
                 leaf_start = node_dist.index
                 leaf_end = -child_or_size
                 for idx in leaf_start:leaf_end
-                    dist² = closest_dist²_triangle(point, tri_geometries[idx], dist²_best)
+                    (dist², feat) = closest_dist²_triangle_feature(point, tri_geometries[idx], dist²_best)
                     if dist² < dist²_best
                         dist²_best = dist²
                         tri_best = idx
+                        feature_best = feat
                     end
                 end
                 break
@@ -795,18 +1150,20 @@ function signed_distance_point_kernel(
     end
 
     iszero(tri_best) && error("No triangle found for point $point")
+    dist²_best = max(dist²_best, zer)
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
-    # fast path: if closest point is in face interior, use face normal for sign
+    # robust sign selection without barycentric heuristics:
+    # - face interior: sign from the closest triangle's face normal
+    # - edge/vertex: fall back to winding number
     @inbounds tri = tri_geometries[tri_best]
-    sgn_fast = face_interior_sign_or_zero(point, tri)
-    if !iszero(sgn_fast)
-        signed_distance = sgn_fast * dist
-        return signed_distance::Tg
+    if feature_best == FEATURE_FACE
+        ap = point - tri.a
+        sgn = ifelse((tri.n ⋅ ap) >= zer, one(Tg), -one(Tg))
+        return (sgn * dist)::Tg
     end
 
-    # fallback: winding number for edge/vertex closest features
     wn = winding_number_point_kernel(sdm, point, wind_stack)
     uno = one(Tg)
     sgn = ifelse(wn >= 0.5, -uno, uno)
