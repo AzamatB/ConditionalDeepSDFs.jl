@@ -555,13 +555,16 @@ function closest_triangle_kernel(
 end
 
 function compute_hint_grid(
-    bvh::BoundingVolumeHierarchy{Tg}, tri_geometries::Vector{TriangleGeometry{Tg}}, grid_res::Int
+    bvh::BoundingVolumeHierarchy{Tg},
+    tri_geometries::Vector{TriangleGeometry{Tg}},
+    grid_res::Int,
+    bounds_min::Point3{Tg},
+    bounds_max::Point3{Tg}
 ) where {Tg<:AbstractFloat}
-    root = bvh.nodes[1]
-    lb_x, lb_y, lb_z = root.lb_x, root.lb_y, root.lb_z
-    ub_x, ub_y, ub_z = root.ub_x, root.ub_y, root.ub_z
+    lb_x, lb_y, lb_z = bounds_min[1], bounds_min[2], bounds_min[3]
+    ub_x, ub_y, ub_z = bounds_max[1], bounds_max[2], bounds_max[3]
 
-    # Add 1% padding so SDF points map effectively inside without dropping boundaries
+    # Add 1% padding so SDF points testing exactly on the bounds don't trigger edge-case clamping
     extent_x = max(ub_x - lb_x, eps(Tg))
     extent_y = max(ub_y - lb_y, eps(Tg))
     extent_z = max(ub_z - lb_z, eps(Tg))
@@ -606,18 +609,27 @@ function compute_hint_grid(
 end
 
 function preprocess_mesh(
-    mesh::Mesh{3,Tg,GLTriangleFace}; leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=64
+    mesh::Mesh{3,Tg,GLTriangleFace};
+    leaf_capacity::Int=8,
+    β_wind::Real=2.0,
+    grid_res::Int=64,
+    bounds_min::NTuple{3,Real}=(-1.0, -1.0, -1.0),
+    bounds_max::NTuple{3,Real}=(1.0, 1.0, 1.0)
 ) where {Tg<:AbstractFloat}
     vertices = GeometryBasics.coordinates(mesh)
     tri_faces = GeometryBasics.faces(mesh)
     faces = NTuple{3,Int32}.(tri_faces)
-    return preprocess_mesh(vertices, faces; leaf_capacity, β_wind, grid_res)
+    return preprocess_mesh(vertices, faces; leaf_capacity, β_wind, grid_res, bounds_min, bounds_max)
 end
 
 function preprocess_mesh(
     vertices::Vector{Point3{Tg}},
     faces::Vector{NTuple{3,Int32}};
-    leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=64
+    leaf_capacity::Int=8,
+    β_wind::Real=2.0,
+    grid_res::Int=64,
+    bounds_min::NTuple{3,Real}=(-1.0, -1.0, -1.0),
+    bounds_max::NTuple{3,Real}=(1.0, 1.0, 1.0)
 ) where {Tg<:AbstractFloat}
     num_faces = length(faces)
     (num_faces > 0) || error("Mesh must contain at least one face.")
@@ -692,7 +704,10 @@ function preprocess_mesh(
     end
 
     fwn = precompute_fast_winding_data(bvh, tri_geometries; β=Tg(β_wind))
-    hint_grid = compute_hint_grid(bvh, tri_geometries, grid_res)
+
+    b_min = Point3{Tg}(bounds_min[1], bounds_min[2], bounds_min[3])
+    b_max = Point3{Tg}(bounds_max[1], bounds_max[2], bounds_max[3])
+    hint_grid = compute_hint_grid(bvh, tri_geometries, grid_res, b_min, b_max)
 
     sdm = SignedDistanceMesh{Tg}(tri_geometries, bvh, face_to_packed, fwn, hint_grid)
     return sdm::SignedDistanceMesh{Tg}
@@ -1082,6 +1097,7 @@ end
     iy = isnan(y) ? 1 : floor(Int, y) + 1
     iz = isnan(z) ? 1 : floor(Int, z) + 1
 
+    # Guaranteed clamping cleanly pushes exterior queries into their closest grid boundary
     ix = clamp(ix, 1, grid.res_x)
     iy = clamp(iy, 1, grid.res_y)
     iz = clamp(iz, 1, grid.res_z)
