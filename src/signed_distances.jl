@@ -27,7 +27,7 @@ end
 
 #######################################   Data Structures   #######################################
 
-# packed triangle geometries perfectly aligned to exactly 64 bytes (16 floats) for an unbroken L1 cache-line
+# packed triangle geometry aligned to 64 bytes (16 floats) for L1 cache-line
 struct TriangleGeometry{T<:AbstractFloat}
     a::Point3{T}
     ab::Point3{T}
@@ -39,7 +39,7 @@ struct TriangleGeometry{T<:AbstractFloat}
     inv_denom::T     # 1.0 / norm²(n)
 end
 
-# 32-byte aligned AoS fast winding number (0th-order dipole expansion)
+# 0th-order dipole expansion for fast winding numbers
 struct FWNNode{T<:AbstractFloat}
     cm_x::T
     cm_y::T
@@ -54,7 +54,11 @@ struct FastWindingData{T<:AbstractFloat}
     nodes::Vector{FWNNode{T}}
 end
 
-# AoS BVH node with overlapped integer fields for cache efficiency
+# AoS BVH node with overlapped integer fields for cache efficiency.
+# for T=Float32 this is 6×4 + 2×4 = 32 bytes — two nodes per 64-byte cache line.
+# internal and leaf nodes overlap integer fields via sign-bit discriminant:
+#   internal: index = left child,  child_or_size = right child  (both > 0)
+#   leaf:     index = leaf_start,  child_or_size = -leaf_end    (< 0)
 struct BVHNode{T<:AbstractFloat}
     lb_x::T
     lb_y::T
@@ -72,8 +76,8 @@ struct BoundingVolumeHierarchy{T<:AbstractFloat}
     num_nodes::Int32
 end
 
-# upgraded stack element carrying exact topology cache to eradicate redundant
-# bvh.nodes memory fetches when elements are popped. (dense 12-byte layout for Float32)
+# stack element carrying node topology cache to avoid redundant bvh.nodes fetches on pop.
+# dense 12-byte layout for Float32.
 struct NodeDist{T<:AbstractFloat}
     dist²::T
     index::Int32
@@ -89,7 +93,7 @@ struct SignedDistanceMesh{Tg<:AbstractFloat}
     tri_geometries::Vector{TriangleGeometry{Tg}}
     bvh::BoundingVolumeHierarchy{Tg}
     # face_to_packed[f] = packed triangle index for original face id f
-    # (used to exploit your “source triangle” hints)
+    # (used to exploit your "source triangle" hints)
     face_to_packed::Vector{Int32}
     fwn::FastWindingData{Tg}
 end
@@ -121,7 +125,7 @@ function build_node!(
 ) where {T}
     count = hi - lo + 1
     if count <= builder.leaf_capacity
-        # optimization: O(N) primitive bound limits purely evaluated exclusively for terminal nodes
+        # compute leaf bounds
         min_x = T(Inf)
         min_y = T(Inf)
         min_z = T(Inf)
@@ -138,7 +142,6 @@ function build_node!(
             max_z = max(max_z, ub_z_t[idx_face])
         end
 
-        # store bounds directly so leaf_end doesn't need sequential arithmetic later
         @inbounds builder.nodes[node_id] = BVHNode{T}(
             min_x, min_y, min_z, max_x, max_y, max_z, Int32(lo), -Int32(hi)
         )
@@ -181,7 +184,7 @@ function build_node!(
         builder, child_r, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
 
-    # internal bound reduction: O(1) bottom-up exact bound merge natively spanning calculated child depths
+    # bottom-up exact bound merge from children
     @inbounds begin
         node_l = builder.nodes[child_l]
         node_r = builder.nodes[child_r]
@@ -276,6 +279,7 @@ function preprocess_mesh(
         centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t; leaf_capacity
     )
 
+    # pack triangle geometry contiguously by BVH leaf order
     tri_geometries = Vector{TriangleGeometry{Tg}}(undef, num_faces)
     # map original face index → packed index (for triangle-hint acceleration)
     face_to_packed = Vector{Int32}(undef, num_faces)
@@ -303,7 +307,6 @@ function preprocess_mesh(
         zer = zero(Tg)
         inv_denom = ifelse(denom_sum > zer, inv(denom_sum), zer)
 
-        # precompute & persist identical 64-byte layout mapping structural normal to memory
         tri_geometries[j] = TriangleGeometry{Tg}(
             v1, ab, ac, Point3{Tg}(c_x, c_y, c_z),
             d11, d12, d22, inv_denom
@@ -358,7 +361,6 @@ function precompute_fast_winding_data(
             for idx in leaf_start:leaf_end
                 tri = tri_geometries[idx]
 
-                # retrieve from pristine L1 cache geometry arrays securely initialized earlier
                 n_x = Float64(tri.n[1])
                 n_y = Float64(tri.n[2])
                 n_z = Float64(tri.n[3])
@@ -422,7 +424,7 @@ function precompute_fast_winding_data(
         r² = muladd(Δx, Δx, muladd(Δy, Δy, Δz * Δz))
         r²β² = Float64(β)^2 * r²
 
-        # optimization: pre-absorb `INV4PI64` factor into the normal area sum to prune BVH internal loop logic
+        # pre-absorb INV4PI64 into the normal sum
         fwn_nodes[node_id] = FWNNode{Tg}(
             Tg(c_x), Tg(c_y), Tg(c_z),
             Tg(n_sum_x[node_id] * INV4PI64),
@@ -449,7 +451,7 @@ function allocate_stacks(sdm::SignedDistanceMesh{Tg}, num_points::Int) where {Tg
     leaf_capacity = sdm.bvh.leaf_capacity
     tree_height = calculate_tree_height(num_faces, leaf_capacity)
 
-    # absolute bounds safety padding against heavily degenerate meshes
+    # safety padding for degenerate meshes
     stack_capacity = max(128, 2 * tree_height + 4)
     n_threads = Threads.nthreads()
     # enforce a minimum chunk size to prevent false sharing and guarantee cache locality
@@ -475,13 +477,13 @@ end
 
 ##############################   High-Performance Hot Loop Routines   ##############################
 
-# optimized O(1) fast rejection and division-free exact algebraic projection
+# exact closest-distance-to-triangle with early plane-distance rejection.
+# returns squared distance only (no Δ vector needed — sign is determined by winding number).
 @inline function closest_dist²_triangle(p::Point3{Tg}, triangle::TriangleGeometry{Tg}, dist²_best::Tg) where {Tg}
     @fastmath begin
         ap = p - triangle.a
 
-        # early rejection isolating out-of-range primitives before computationally heavy FMA logic!
-        # because theoretical lower-bound distance to the full triangle maps strictly to the face plane distance
+        # early rejection: plane distance is a lower bound on triangle distance
         dot_n = triangle.n ⋅ ap
         plane_dist² = (dot_n * dot_n) * triangle.inv_denom
         (plane_dist² >= dist²_best) && return plane_dist²::Tg
@@ -505,7 +507,6 @@ end
             return dist²::Tg
         end
 
-        # FMA operation substituted for pure multiplication map
         vc = muladd(d11, d2, -d12 * d1)
         if (vc <= 0) && (d1 >= 0) && (d3 <= 0)
             zer = zero(Tg)
@@ -521,7 +522,6 @@ end
             return dist²::Tg
         end
 
-        # FMA operation substituted for pure multiplication map
         vb = muladd(d22, d1, -d12 * d2)
         if (vb <= 0) && (d2 >= 0) && (d6 <= 0)
             zer = zero(Tg)
@@ -530,22 +530,20 @@ end
             return dist²::Tg
         end
 
-        # deferred edge arithmetic (branchless): heavily prevents unneeded allocations mapped out to pure scalar bounds
+        # edge BC test
         uno = one(Tg)
         if (vb + vc) * triangle.inv_denom >= uno
             d43 = d11 - d12 - d1 + d2
-            # fast algebraic scalar shortcut dynamically maps vectors outside the norm checks
             zer = zero(Tg)
             d33 = max(zer, d11 + d22 - Tg(2) * d12)
 
-            # unconditionally clamp the algebraic weight to bypass CPU branches
             w = clamp(ifelse(d33 > zer, d43 / d33, zer), zer, uno)
             bp = ap - triangle.ab
             dist² = norm²(bp - w * (triangle.ac - triangle.ab))
             return dist²::Tg
         end
 
-        # fast algebraic interior plane mapping bypassing 15 interpolation vector arithmetic operations
+        # face interior
         zer = zero(Tg)
         dist² = ifelse(triangle.inv_denom > zer, plane_dist², norm²(ap))
         return dist²::Tg
@@ -563,11 +561,9 @@ end
     @fastmath begin
         ap = p - tri.a
 
-        # extracted: calculate barycentric dot products exactly once per primitive
         d1 = tri.ab ⋅ ap
         d2 = tri.ac ⋅ ap
 
-        # optimized: hardware fused multiply-add (muladd) natively drops op count and register latency
         v = muladd(tri.d22, d1, -tri.d12 * d2) * inv_denom
         w = muladd(tri.d11, d2, -tri.d12 * d1) * inv_denom
 
@@ -575,7 +571,7 @@ end
             return zero(Tg)
         end
 
-        # re-used exact structural normal entirely avoids the cross product calculation
+        # reuse precomputed face normal to avoid cross product
         sgn = ifelse((tri.n ⋅ ap) >= zero(Tg), one(Tg), -one(Tg))
         return sgn::Tg
     end
@@ -583,6 +579,7 @@ end
 
 ###################################   Fast Winding Number Query   ##################################
 
+# solid angle of triangle as seen from query point, scaled by 1/(2π)
 @inline function solid_angle_scaled(q_f64::NTuple{3,Float64}, tri::TriangleGeometry{Tg}) where {Tg<:AbstractFloat}
     @fastmath begin
         (qx, qy, qz) = q_f64
@@ -599,7 +596,7 @@ end
         cy = ay + Float64(tri.ac[2])
         cz = az + Float64(tri.ac[3])
 
-        # mathematical substitution: (B_q × C_q) ⋅ A_q equates perfectly to A_q ⋅ (AB × AC)
+        # det = A_q ⋅ (ab × ac)
         det = ax * Float64(tri.n[1]) + ay * Float64(tri.n[2]) + az * Float64(tri.n[3])
 
         la = √(ax * ax + ay * ay + az * az)
@@ -639,7 +636,6 @@ end
         node_id = Int(stack[stack_top])
         stack_top -= 1
 
-        # tail-call winding number traversal continuous path loops straight to internal limits
         while true
             fnode = fwn_nodes[node_id]
 
@@ -650,6 +646,7 @@ end
 
                 dist2 = rx * rx + ry * ry + rz * rz
 
+                # far-field approximation: dipole expansion
                 if dist2 > Float64(fnode.r²β²)
                     dot_val = rx * Float64(fnode.n_x) + ry * Float64(fnode.n_y) + rz * Float64(fnode.n_z)
                     inv_dist = inv(√(dist2))
@@ -669,7 +666,7 @@ end
                     break
                 end
 
-                # safely drop the right child into memory and loop straight into left properties
+                # push right child, iterate into left
                 stack_top += 1
                 stack[stack_top] = child_or_size
                 node_id = Int(node.index)
@@ -734,7 +731,7 @@ function signed_distance_point_kernel(
         node_dist = stack[stack_top]
         stack_top -= 1
 
-        # tail-call logic purely traverses bounded limits straight to closer branch L1 cache
+        # tail-call traversal: iterate into near child, push far child
         while true
             (node_dist.dist² >= dist²_best) && break
             child_or_size = node_dist.child_or_size
@@ -746,7 +743,7 @@ function signed_distance_point_kernel(
                 node_l = bvh.nodes[child_l_id]
                 node_r = bvh.nodes[child_r_id]
 
-                # inlining AABB overlap avoids generic `Point` tuple unpacks and speeds up traversal heavily
+                # inline AABB squared distance
                 @fastmath begin
                     Δx_l = max(node_l.lb_x - p_x, p_x - node_l.ub_x, zer)
                     Δy_l = max(node_l.lb_y - p_y, p_y - node_l.ub_y, zer)
@@ -764,7 +761,7 @@ function signed_distance_point_kernel(
                 idx_r = node_r.index
                 cos_r = node_r.child_or_size
 
-                # branchless child sorting converted natively into hardware cmov instructions via ifelse
+                # branchless child sorting via ifelse (compiles to cmov)
                 swap = dist²_l > dist²_r
                 near_dist² = ifelse(swap, dist²_r, dist²_l)
                 far_dist² = ifelse(swap, dist²_l, dist²_r)
@@ -775,11 +772,11 @@ function signed_distance_point_kernel(
 
                 if near_dist² < dist²_best
                     if far_dist² < dist²_best
-                        # drop STRICTLY the farther node out of bounds to stack arrays
+                        # push far child
                         stack_top += 1
                         @inbounds stack[stack_top] = NodeDist{Tg}(far_dist², far_idx, far_cos)
                     end
-                    # iterate the tail-called closure inside registers explicitly
+                    # iterate into near child
                     node_dist = NodeDist{Tg}(near_dist², near_idx, near_cos)
                     continue
                 end
@@ -803,6 +800,7 @@ function signed_distance_point_kernel(
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
+    # fast path: if closest point is in face interior, use face normal for sign
     @inbounds tri = tri_geometries[tri_best]
     sgn_fast = face_interior_sign_or_zero(point, tri)
     if !iszero(sgn_fast)
@@ -810,6 +808,7 @@ function signed_distance_point_kernel(
         return signed_distance::Tg
     end
 
+    # fallback: winding number for edge/vertex closest features
     wn = winding_number_point_kernel(sdm, point, wind_stack)
     uno = one(Tg)
     sgn = ifelse(wn >= 0.5, -uno, uno)
