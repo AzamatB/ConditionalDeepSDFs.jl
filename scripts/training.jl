@@ -72,7 +72,7 @@ function train_model(
     weight_eikonal::Float32=0.1f0,
     # set training hyperparameters
     num_epochs::Integer,
-    learning_rate::Float32=0.0004f0,
+    learning_rate::Float32=0.0001f0,
     weight_decay::Float32=1f-4
 )
     sampling_params = SamplingParameters(
@@ -197,6 +197,6 @@ const num_epochs = 700
 const dataset_path = normpath(joinpath(@__DIR__, "..", "data/preprocessed/mesh_samplers.jld2"))
 const model_save_dir = normpath(joinpath(@__DIR__, "..", "trained_models"))
 # model_path = nothing
-model_path = joinpath(model_save_dir, "trained_model_epoch_458.jld2")
+model_path = joinpath(model_save_dir, "trained_model_epoch_159.jld2")
 
 (model, params, states) = train_model(rng, dataset_path; model_path, num_epochs, model_save_dir)
