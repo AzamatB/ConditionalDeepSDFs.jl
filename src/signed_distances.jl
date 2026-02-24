@@ -40,7 +40,7 @@ struct TriangleGeometry{T<:AbstractFloat}
 end
 
 # 0th-order dipole expansion for fast winding numbers.
-# Explicitly padded to exactly 32 bytes (8 floats) to avoid 64-byte L1 cache-line straddling.
+# Topology packed natively to avoid redundant BVH fetches.
 struct FWNNode{T<:AbstractFloat}
     cm_x::T
     cm_y::T
@@ -49,7 +49,7 @@ struct FWNNode{T<:AbstractFloat}
     n_y::T
     n_z::T
     r²β²::T
-    _pad::T
+    topology::UInt32 # High-bit: leaf flag. Bits 24-30: count. Bits 0-23: child_l / leaf_start
 end
 
 struct FastWindingData{T<:AbstractFloat}
@@ -57,7 +57,6 @@ struct FastWindingData{T<:AbstractFloat}
 end
 
 # AoS BVH node with overlapped integer fields for cache efficiency.
-# for T=Float32 this is 6×4 + 2×4 = 32 bytes — two nodes per 64-byte cache line.
 struct BVHNode{T<:AbstractFloat}
     lb_x::T
     lb_y::T
@@ -76,22 +75,21 @@ struct BoundingVolumeHierarchy{T<:AbstractFloat}
     num_nodes::Int32
 end
 
-# Isotropic spatial voxel grid precisely tailored to the [-1, 1]^3 query domain.
-# Compacted struct format exploiting strict cubic bounding for lower cache pressure.
+# Isotropic spatial voxel grid tailored to [-1, 1]^3.
+# Features exact cell-center evaluations for Eikonal Early-Out bypass.
 struct HintGrid{T<:AbstractFloat}
     lb::T
     inv_cell::T
     res::Int
     hints::Array{Int32,3}
+    sd_centers::Array{T,3}
 end
 
-# stack element carrying node topology cache to avoid redundant bvh.nodes fetches on pop.
-# explicitly padded to exactly 16 bytes for Float32 architectures.
+# Stack element carrying node topology.
 struct NodeDist{T<:AbstractFloat}
     dist²::T
     index::Int32
     child_or_size::Int32
-    _pad::Int32
 end
 
 struct QueryStacks{T<:AbstractFloat}
@@ -102,7 +100,6 @@ end
 struct SignedDistanceMesh{Tg<:AbstractFloat}
     tri_geometries::Vector{TriangleGeometry{Tg}}
     bvh::BoundingVolumeHierarchy{Tg}
-    # face_to_packed[f] = packed triangle index for original face id f
     face_to_packed::Vector{Int32}
     fwn::FastWindingData{Tg}
     hint_grid::HintGrid{Tg}
@@ -300,7 +297,6 @@ function build_node!(
     depth::Int
 ) where {T<:AbstractFloat}
 
-    # Exact depth tracking to robustly avoid stack overflows natively during DFS traversal
     builder.max_depth = max(builder.max_depth, Int32(depth))
 
     count = hi - lo + 1
@@ -439,13 +435,15 @@ function build_bvh(
     ub_x_t::Vector{Tg}, ub_y_t::Vector{Tg}, ub_z_t::Vector{Tg};
     leaf_capacity::Int=8
 ) where {Tg<:AbstractFloat}
+
+    # Robustness limit guaranteeing node topology packing safety below the 7-bit FWN capacity
+    leaf_capacity = min(leaf_capacity, 127)
+
     num_faces = length(first(centroids))
     tri_indices = Int32.(1:num_faces)
     max_nodes = 2 * num_faces + 1
 
     nodes = Vector{BVHNode{Tg}}(undef, max_nodes)
-
-    # Pre-allocating sequentially guarantees memory safety and omits allocation limits
     sah_scratch = SAHScratch{Tg}()
     builder = BVHBuilder{Tg}(nodes, Int32(leaf_capacity), sah_scratch, Int32(3), Int32(1))
 
@@ -467,7 +465,6 @@ end
 
 ######################################   Mesh Preprocessing   ######################################
 
-# Sub-routine natively separated purely for computing bounds indices without full signed computation overhead
 function closest_triangle_kernel(
     point::Point3{Tg},
     bvh::BoundingVolumeHierarchy{Tg},
@@ -476,12 +473,13 @@ function closest_triangle_kernel(
 ) where {Tg<:AbstractFloat}
     dist²_best = floatmax(Tg)
     tri_best = Int32(1)
+    feat_best = FEATURE_DEGENERATE
     zer = zero(Tg)
     (p_x, p_y, p_z) = point
 
     stack_top = 1
     @inbounds root_node = bvh.nodes[1]
-    @inbounds stack[1] = NodeDist{Tg}(zer, root_node.index, root_node.child_or_size, Int32(0))
+    @inbounds stack[1] = NodeDist{Tg}(zer, root_node.index, root_node.child_or_size)
 
     @inbounds while stack_top > 0
         node_dist = stack[stack_top]
@@ -526,9 +524,9 @@ function closest_triangle_kernel(
                 if near_dist² < dist²_best
                     if far_dist² < dist²_best
                         stack_top += 1
-                        @inbounds stack[stack_top] = NodeDist{Tg}(far_dist², far_idx, far_cos, Int32(0))
+                        @inbounds stack[stack_top] = NodeDist{Tg}(far_dist², far_idx, far_cos)
                     end
-                    node_dist = NodeDist{Tg}(near_dist², near_idx, near_cos, Int32(0))
+                    node_dist = NodeDist{Tg}(near_dist², near_idx, near_cos)
                     continue
                 end
                 break
@@ -536,22 +534,24 @@ function closest_triangle_kernel(
                 leaf_start = node_dist.index
                 leaf_end = -child_or_size
                 @inbounds for idx in leaf_start:leaf_end
-                    (dist², _) = closest_dist²_triangle_feature(point, tri_geometries[idx], dist²_best)
+                    (dist², feat) = closest_dist²_triangle_feature(point, tri_geometries[idx], dist²_best)
                     if dist² < dist²_best
                         dist²_best = dist²
                         tri_best = Int32(idx)
+                        feat_best = feat
                     end
                 end
                 break
             end
         end
     end
-    return tri_best::Int32
+    return (tri_best::Int32, dist²_best::Tg, feat_best::UInt8)
 end
 
 function compute_hint_grid(
     bvh::BoundingVolumeHierarchy{Tg},
     tri_geometries::Vector{TriangleGeometry{Tg}},
+    fwn::FastWindingData{Tg},
     grid_res::Int
 ) where {Tg<:AbstractFloat}
 
@@ -559,7 +559,6 @@ function compute_hint_grid(
     # Because queries are mathematically guaranteed to be sampled strictly from within
     # the unit cube [-1, 1]^3, we decouple the Hint Grid from the dynamic mesh AABB
     # and lock it to perfectly partition this exact query domain.
-    # A 5% floating-point padding ensures boundary values map inside cells cleanly.
     # -----------------------------------------------------------------------------------
     pad = Tg(0.05)
     lb = Tg(-1.0) - pad
@@ -567,25 +566,37 @@ function compute_hint_grid(
     inv_cell = Tg(grid_res) / extent
 
     hints = Array{Int32,3}(undef, grid_res, grid_res, grid_res)
+    sd_centers = Array{Tg,3}(undef, grid_res, grid_res, grid_res)
     stack_capacity = bvh.max_depth + 4
 
     Threads.@threads :dynamic for k in 1:grid_res
         stack = Vector{NodeDist{Tg}}(undef, stack_capacity)
+        wind_stack = Vector{Int32}(undef, stack_capacity)
         for j in 1:grid_res
             for i in 1:grid_res
-                # Evaluate at the physical center of the voxel
                 cx = lb + (Tg(i) - Tg(0.5)) / inv_cell
                 cy = lb + (Tg(j) - Tg(0.5)) / inv_cell
                 cz = lb + (Tg(k) - Tg(0.5)) / inv_cell
                 p = Point3{Tg}(cx, cy, cz)
 
-                tri_best = closest_triangle_kernel(p, bvh, tri_geometries, stack)
+                tri_best, dist²_best, feat = closest_triangle_kernel(p, bvh, tri_geometries, stack)
                 hints[i, j, k] = tri_best
+
+                # Eikonal Early-Out Precomputation
+                dist = √(max(dist²_best, zero(Tg)))
+                if feat == FEATURE_FACE
+                    ap = p - tri_geometries[tri_best].a
+                    sgn = ifelse((tri_geometries[tri_best].n ⋅ ap) >= zero(Tg), one(Tg), -one(Tg))
+                else
+                    wn = winding_number_point_kernel(fwn.nodes, tri_geometries, p, wind_stack)
+                    sgn = ifelse(wn >= 0.5, -one(Tg), one(Tg))
+                end
+                sd_centers[i, j, k] = sgn * dist
             end
         end
     end
 
-    return HintGrid{Tg}(lb, inv_cell, grid_res, hints)
+    return HintGrid{Tg}(lb, inv_cell, grid_res, hints, sd_centers)
 end
 
 function preprocess_mesh(
@@ -667,7 +678,9 @@ function preprocess_mesh(
         c_z = ab[1] * ac[2] - ab[2] * ac[1]
         denom_sum = c_x * c_x + c_y * c_y + c_z * c_z
         zer = zero(Tg)
-        inv_denom = ifelse(denom_sum > zer, inv(denom_sum), zer)
+
+        # Guard prevents division by subnormal cascades throwing downstream NaNs
+        inv_denom = ifelse(denom_sum > floatmin(Tg), inv(denom_sum), zer)
 
         tri_geometries[j] = TriangleGeometry{Tg}(
             v1, ab, ac, Point3{Tg}(c_x, c_y, c_z), d11, d12, d22, inv_denom
@@ -675,7 +688,7 @@ function preprocess_mesh(
     end
 
     fwn = precompute_fast_winding_data(bvh, tri_geometries; β=Tg(β_wind))
-    hint_grid = compute_hint_grid(bvh, tri_geometries, grid_res)
+    hint_grid = compute_hint_grid(bvh, tri_geometries, fwn, grid_res)
 
     sdm = SignedDistanceMesh{Tg}(tri_geometries, bvh, face_to_packed, fwn, hint_grid)
     return sdm::SignedDistanceMesh{Tg}
@@ -694,6 +707,7 @@ function precompute_fast_winding_data(
 
     num_nodes = Int(bvh.num_nodes)
     fwn_nodes = Vector{FWNNode{Tg}}(undef, num_nodes)
+    exact_r = Vector{Float64}(undef, num_nodes)
 
     area_sum = Vector{Float64}(undef, num_nodes)
     cent_sum_x = Vector{Float64}(undef, num_nodes)
@@ -703,14 +717,15 @@ function precompute_fast_winding_data(
     n_sum_y = Vector{Float64}(undef, num_nodes)
     n_sum_z = Vector{Float64}(undef, num_nodes)
 
+    # Clean bottom-up reverse iteration inherently evaluates structurally deepest nodes exactly
     @inbounds for node_id in num_nodes:-1:1
         if node_id == 2
-            # Safe sentinel mathematically immune to undefined Fastmath overrides
             fwn_nodes[2] = FWNNode{Tg}(
                 zero(Tg), zero(Tg), zero(Tg),
                 zero(Tg), zero(Tg), zero(Tg),
-                floatmax(Tg), zero(Tg)
+                floatmax(Tg), UInt32(0)
             )
+            exact_r[2] = 0.0
             continue
         end
 
@@ -784,12 +799,38 @@ function precompute_fast_winding_data(
             c_z = 0.5 * (Float64(node.lb_z) + Float64(node.ub_z))
         end
 
-        Δx = max(abs(c_x - Float64(node.lb_x)), abs(c_x - Float64(node.ub_x)))
-        Δy = max(abs(c_y - Float64(node.lb_y)), abs(c_y - Float64(node.ub_y)))
-        Δz = max(abs(c_z - Float64(node.lb_z)), abs(c_z - Float64(node.ub_z)))
+        local topology::UInt32
 
-        r² = muladd(Δx, Δx, muladd(Δy, Δy, Δz * Δz))
-        r²β² = Float64(β)^2 * r²
+        # Computing EXACT MAC bounds and natively packing node topology
+        if child_or_size < 0
+            leaf_start = Int(node.index)
+            leaf_end = Int(-child_or_size)
+            max_r² = 0.0
+            for idx in leaf_start:leaf_end
+                tri = tri_geometries[idx]
+                for v in (tri.a, tri.a + tri.ab, tri.a + tri.ac)
+                    d² = (Float64(v[1]) - c_x)^2 + (Float64(v[2]) - c_y)^2 + (Float64(v[3]) - c_z)^2
+                    max_r² = max(max_r², d²)
+                end
+            end
+            exact_r[node_id] = √(max_r²)
+
+            count = UInt32(leaf_end - leaf_start + 1)
+            topology = 0x80000000 | (count << 24) | UInt32(leaf_start)
+        else
+            child_l = Int(node.index)
+            child_r = Int(child_or_size)
+
+            fL = fwn_nodes[child_l]
+            fR = fwn_nodes[child_r]
+            r_l = exact_r[child_l] + √((Float64(fL.cm_x) - c_x)^2 + (Float64(fL.cm_y) - c_y)^2 + (Float64(fL.cm_z) - c_z)^2)
+            r_r = exact_r[child_r] + √((Float64(fR.cm_x) - c_x)^2 + (Float64(fR.cm_y) - c_y)^2 + (Float64(fR.cm_z) - c_z)^2)
+            exact_r[node_id] = max(r_l, r_r)
+
+            topology = UInt32(child_l)
+        end
+
+        r²β² = exact_r[node_id]^2 * Float64(β)^2
 
         fwn_nodes[node_id] = FWNNode{Tg}(
             Tg(c_x), Tg(c_y), Tg(c_z),
@@ -797,7 +838,7 @@ function precompute_fast_winding_data(
             Tg(n_sum_y[node_id] * INV4PI64),
             Tg(n_sum_z[node_id] * INV4PI64),
             Tg(r²β²),
-            zero(Tg)
+            topology
         )
     end
 
@@ -806,7 +847,6 @@ function precompute_fast_winding_data(
 end
 
 function allocate_stacks(sdm::SignedDistanceMesh{Tg}, num_points::Int) where {Tg}
-    # Dynamic capacity natively removes bounds-overflow vulnerability.
     stack_capacity = Int(sdm.bvh.max_depth) + 4
 
     n_threads = Threads.nthreads()
@@ -990,12 +1030,11 @@ end
 end
 
 @inline function winding_number_point_kernel(
-    sdm::SignedDistanceMesh{Tg}, point::Point3{Tg}, stack::Vector{Int32}
+    fwn_nodes::Vector{FWNNode{Tg}},
+    tri_geometries::Vector{TriangleGeometry{Tg}},
+    point::Point3{Tg},
+    stack::Vector{Int32}
 ) where {Tg<:AbstractFloat}
-
-    fwn_nodes = sdm.fwn.nodes
-    bvh_nodes = sdm.bvh.nodes
-    tri_geometries = sdm.tri_geometries
 
     qx = Float64(point[1])
     qy = Float64(point[2])
@@ -1025,23 +1064,21 @@ end
                     wn += dot_val * (inv_dist * inv_dist * inv_dist)
                     break
                 end
+            end
 
-                node = bvh_nodes[node_id]
-                child_or_size = node.child_or_size
-
-                if child_or_size < 0
-                    leaf_start = Int(node.index)
-                    leaf_end = Int(-child_or_size)
-                    for tri_id in leaf_start:leaf_end
-                        wn += solid_angle_scaled(q_f64, tri_geometries[tri_id])
-                    end
-                    break
+            topology = fnode.topology
+            if (topology & 0x80000000) != 0
+                count = (topology >> 24) & 0x7F
+                leaf_start = topology & 0x00FFFFFF
+                leaf_end = leaf_start + count - 1
+                for tri_id in leaf_start:leaf_end
+                    wn += solid_angle_scaled(q_f64, tri_geometries[tri_id])
                 end
+                break
+            else
+                child_l_id = Int(topology)
+                child_r_id = child_l_id + 1
 
-                child_l_id = Int(node.index)
-                child_r_id = Int(child_or_size)
-
-                # Additive unpruned bypass. Sorting mathematically impossible to change the FWN node count.
                 stack_top += 1
                 stack[stack_top] = Int32(child_r_id)
                 node_id = child_l_id
@@ -1064,16 +1101,27 @@ end
     z = (point[3] - lb) * inv_c
 
     res = grid.res
-    # Fast mapping without `isnan` guards (points guaranteed to be purely real inside [-1, 1]^3)
-    # Because query is within [-1, 1] and lb is -1.05, coordinates are guaranteed purely positive.
-    # Using `unsafe_trunc` entirely bypasses boundary checking branches.
     @fastmath begin
-        ix = clamp(Base.unsafe_trunc(Int, x) + 1, 1, res)
-        iy = clamp(Base.unsafe_trunc(Int, y) + 1, 1, res)
-        iz = clamp(Base.unsafe_trunc(Int, z) + 1, 1, res)
+        # Pre-truncation bounding gracefully intercepts uninitialized query hazards
+        x_c = clamp(x, zero(Tg), Tg(res - 1))
+        y_c = clamp(y, zero(Tg), Tg(res - 1))
+        z_c = clamp(z, zero(Tg), Tg(res - 1))
+
+        ix = Base.unsafe_trunc(Int, x_c) + 1
+        iy = Base.unsafe_trunc(Int, y_c) + 1
+        iz = Base.unsafe_trunc(Int, z_c) + 1
     end
 
-    @inbounds return grid.hints[ix, iy, iz]
+    cx = lb + (Tg(ix) - Tg(0.5)) / inv_c
+    cy = lb + (Tg(iy) - Tg(0.5)) / inv_c
+    cz = lb + (Tg(iz) - Tg(0.5)) / inv_c
+
+    dx = point[1] - cx
+    dy = point[2] - cy
+    dz = point[3] - cz
+    dist_to_c² = muladd(dx, dx, muladd(dy, dy, dz * dz))
+
+    @inbounds return grid.hints[ix, iy, iz], grid.sd_centers[ix, iy, iz], dist_to_c²
 end
 
 function signed_distance_point(
@@ -1081,7 +1129,6 @@ function signed_distance_point(
 ) where {Tg<:AbstractFloat}
     dist²_best = floatmax(Tg)
 
-    # 1. Evaluate explicit user hint limits
     if (hint_face > 0) && (hint_face <= length(sdm.tri_geometries))
         tri_best = hint_face
         @inbounds triangle = sdm.tri_geometries[tri_best]
@@ -1092,8 +1139,8 @@ function signed_distance_point(
         feature_best = FEATURE_DEGENERATE
     end
 
-    # 2. Extract bounding limits strictly from the cached Hint Grid
-    grid_hint = get_grid_hint(sdm.hint_grid, point)
+    (grid_hint, sd_center, dist_to_c²) = get_grid_hint(sdm.hint_grid, point)
+
     if (grid_hint > 0) && (grid_hint != tri_best)
         @inbounds triangle = sdm.tri_geometries[grid_hint]
         (d², feat) = closest_dist²_triangle_feature(point, triangle, dist²_best)
@@ -1107,19 +1154,20 @@ function signed_distance_point(
         end
     end
 
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, tri_best, feature_best, stacks)
+    signed_distance = signed_distance_point_kernel(
+        sdm, point, dist²_best, tri_best, feature_best, sd_center, dist_to_c², stacks
+    )
     return signed_distance::Tg
 end
 
 function signed_distance_point(
     sdm::SignedDistanceMesh{Tg}, point::Point3{Tg}, stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat}
-    # Immediately default to hashing cell bindings if array indices are missing
-    hint_face = get_grid_hint(sdm.hint_grid, point)
+    (grid_hint, sd_center, dist_to_c²) = get_grid_hint(sdm.hint_grid, point)
 
     dist²_best = floatmax(Tg)
-    if (hint_face > 0) && (hint_face <= length(sdm.tri_geometries))
-        tri_best = hint_face
+    if (grid_hint > 0) && (grid_hint <= length(sdm.tri_geometries))
+        tri_best = grid_hint
         @inbounds triangle = sdm.tri_geometries[tri_best]
         (dist²_best, feature_best) = closest_dist²_triangle_feature(point, triangle, dist²_best)
         (dist²_best <= zero(Tg)) && return zero(Tg)
@@ -1128,7 +1176,9 @@ function signed_distance_point(
         feature_best = FEATURE_DEGENERATE
     end
 
-    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, tri_best, feature_best, stacks)
+    signed_distance = signed_distance_point_kernel(
+        sdm, point, dist²_best, tri_best, feature_best, sd_center, dist_to_c², stacks
+    )
     return signed_distance::Tg
 end
 
@@ -1138,6 +1188,8 @@ function signed_distance_point_kernel(
     dist²_best_in::Tg,
     tri_best_in::Int32,
     feature_best_in::UInt8,
+    sd_center::Tg,
+    dist_to_c²::Tg,
     stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat}
     bvh = sdm.bvh
@@ -1154,7 +1206,7 @@ function signed_distance_point_kernel(
 
     stack_top = 1
     @inbounds root_node = bvh.nodes[1]
-    @inbounds stack[1] = NodeDist{Tg}(zer, root_node.index, root_node.child_or_size, Int32(0))
+    @inbounds stack[1] = NodeDist{Tg}(zer, root_node.index, root_node.child_or_size)
 
     @inbounds while stack_top > 0
         node_dist = stack[stack_top]
@@ -1199,9 +1251,9 @@ function signed_distance_point_kernel(
                 if near_dist² < dist²_best
                     if far_dist² < dist²_best
                         stack_top += 1
-                        @inbounds stack[stack_top] = NodeDist{Tg}(far_dist², far_idx, far_cos, Int32(0))
+                        @inbounds stack[stack_top] = NodeDist{Tg}(far_dist², far_idx, far_cos)
                     end
-                    node_dist = NodeDist{Tg}(near_dist², near_idx, near_cos, Int32(0))
+                    node_dist = NodeDist{Tg}(near_dist², near_idx, near_cos)
                     continue
                 end
                 break
@@ -1233,7 +1285,15 @@ function signed_distance_point_kernel(
         return (sgn * dist)::Tg
     end
 
-    wn = winding_number_point_kernel(sdm, point, wind_stack)
+    # ✨ EIKONAL EARLY-OUT ✨
+    # If the computed bounds to the nearest surface resolve physically broader than the extent
+    # to the fully-evaluated voxel center, the Eikonal condition rigorously guarantees equivalent signs.
+    if (sd_center * sd_center) > dist_to_c²
+        sgn = ifelse(sd_center >= zer, one(Tg), -one(Tg))
+        return (sgn * dist)::Tg
+    end
+
+    wn = winding_number_point_kernel(sdm.fwn.nodes, tri_geometries, point, wind_stack)
     uno = one(Tg)
     sgn = ifelse(wn >= 0.5, -uno, uno)
     signed_distance = sgn * dist
