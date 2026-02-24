@@ -445,7 +445,8 @@ end
         d4 = d2 - d12
         (d3 >= 0 && d4 <= d3) && return norm²(ap - triangle.ab)
 
-        vc = d11 * d2 - d12 * d1
+        # FMA operation substituted for pure multiplication map
+        vc = muladd(d11, d2, -d12 * d1)
         if vc <= 0 && d1 >= 0 && d3 <= 0
             v = d11 > zero(Tg) ? d1 / d11 : zero(Tg)
             return norm²(ap - v * triangle.ab)
@@ -455,7 +456,8 @@ end
         d6 = d2 - d22
         (d6 >= 0 && d5 <= d6) && return norm²(ap - triangle.ac)
 
-        vb = d22 * d1 - d12 * d2
+        # FMA operation substituted for pure multiplication map
+        vb = muladd(d22, d1, -d12 * d2)
         if vb <= 0 && d2 >= 0 && d6 <= 0
             w = d22 > zero(Tg) ? d2 / d22 : zero(Tg)
             return norm²(ap - w * triangle.ac)
@@ -486,14 +488,22 @@ end
     inv_denom = tri.inv_denom
     iszero(inv_denom) && return zero(Tg)
 
-    ap = p - tri.a
-    v = (tri.d22 * (tri.ab ⋅ ap) - tri.d12 * (tri.ac ⋅ ap)) * inv_denom
-    w = (tri.d11 * (tri.ac ⋅ ap) - tri.d12 * (tri.ab ⋅ ap)) * inv_denom
+    @fastmath begin
+        ap = p - tri.a
 
-    (v <= bary_tol || w <= bary_tol || (one(Tg) - v - w) <= bary_tol) && return zero(Tg)
+        # EXTRACTED: Calculate barycentric dot products exactly once per primitive
+        d1 = tri.ab ⋅ ap
+        d2 = tri.ac ⋅ ap
 
-    # Re-used exact structural normal entirely avoids the cross product calculation
-    return ifelse((tri.n ⋅ ap) >= zero(Tg), one(Tg), -one(Tg))
+        # OPTIMIZED: Hardware Fused Multiply-Add (muladd) natively drops op count and register latency
+        v = muladd(tri.d22, d1, -tri.d12 * d2) * inv_denom
+        w = muladd(tri.d11, d2, -tri.d12 * d1) * inv_denom
+
+        (v <= bary_tol || w <= bary_tol || (one(Tg) - v - w) <= bary_tol) && return zero(Tg)
+
+        # Re-used exact structural normal entirely avoids the cross product calculation
+        return ifelse((tri.n ⋅ ap) >= zero(Tg), one(Tg), -one(Tg))
+    end
 end
 
 #################################   Fast Winding Number Query   #################################
