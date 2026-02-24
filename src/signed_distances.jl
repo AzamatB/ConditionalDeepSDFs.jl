@@ -762,21 +762,20 @@ function signed_distance_point_kernel(
 
                 # branchless child sorting via ifelse (compiles to cmov)
                 swap = dist²_l > dist²_r
-                near_dist² = ifelse(swap, dist²_r, dist²_l)
-                far_dist² = ifelse(swap, dist²_l, dist²_r)
-                near_idx = ifelse(swap, idx_r, idx_l)
-                far_idx = ifelse(swap, idx_l, idx_r)
-                near_cos = ifelse(swap, cos_r, cos_l)
-                far_cos = ifelse(swap, cos_l, cos_r)
+                (dist²_near, dist²_far, idx_near, idx_far, cos_near, cos_far) = ifelse(
+                    swap,
+                    (dist²_r, dist²_l, idx_r, idx_l, cos_r, cos_l),
+                    (dist²_l, dist²_r, idx_l, idx_r, cos_l, cos_r)
+                )
 
-                if near_dist² < dist²_best
-                    if far_dist² < dist²_best
+                if dist²_near < dist²_best
+                    if dist²_far < dist²_best
                         # push far child
                         stack_top += 1
-                        @inbounds stack[stack_top] = NodeDist{Tg}(far_dist², far_idx, far_cos)
+                        @inbounds stack[stack_top] = NodeDist{Tg}(dist²_far, idx_far, cos_far)
                     end
                     # iterate into near child
-                    node_dist = NodeDist{Tg}(near_dist², near_idx, near_cos)
+                    node_dist = NodeDist{Tg}(dist²_near, idx_near, cos_near)
                     continue
                 end
                 break
