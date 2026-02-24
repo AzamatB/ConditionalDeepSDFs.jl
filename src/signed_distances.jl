@@ -218,8 +218,7 @@ function build_bvh(
     )
 
     num_nodes = builder.next_node - 1
-    resize!(builder.nodes, num_nodes)
-    bvh = BoundingVolumeHierarchy{Tg}(builder.nodes, builder.leaf_capacity, Int32(num_nodes))
+    bvh = BoundingVolumeHierarchy{Tg}(builder.nodes[1:num_nodes], builder.leaf_capacity, Int32(num_nodes))
     return (bvh, tri_indices)
 end
 
@@ -452,7 +451,7 @@ function allocate_stacks(sdm::SignedDistanceMesh{Tg}, num_points::Int) where {Tg
     tree_height = calculate_tree_height(num_faces, leaf_capacity)
 
     # safety padding for degenerate meshes
-    stack_capacity = max(128, 2 * tree_height + 4)
+    stack_capacity = max(16, 2 * tree_height + 4)
     n_threads = Threads.nthreads()
     # enforce a minimum chunk size to prevent false sharing and guarantee cache locality
     min_chunk_size = 512
