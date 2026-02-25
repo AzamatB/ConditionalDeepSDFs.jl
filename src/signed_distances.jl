@@ -475,15 +475,14 @@ function closest_triangle_kernel(
     tri_geometries::Vector{TriangleGeometry{Tg}},
     stack::Vector{NodeDist{Tg}},
     tri_best::Int32=Int32(0),
-    dist²_best::Tg=floatmax(Tg),
-    feat_best::UInt8=FEATURE_DEGENERATE
+    dist²_best::Tg=floatmax(Tg)
 ) where {Tg<:AbstractFloat}
     zer = zero(Tg)
 
     # Honor pre-evaluated localized bounds dynamically bypassing initial distance limits
     if dist²_best == floatmax(Tg) && tri_best > 0
         @inbounds triangle = tri_geometries[tri_best]
-        (dist²_best, feat_best) = closest_dist²_triangle_feature(point, triangle, dist²_best)
+        dist²_best = closest_dist²_triangle(point, triangle, dist²_best)
     end
 
     if dist²_best == floatmax(Tg)
@@ -548,18 +547,17 @@ function closest_triangle_kernel(
                 leaf_start = node_dist.index
                 leaf_end = -child_or_size
                 @inbounds for idx in leaf_start:leaf_end
-                    (dist², feat) = closest_dist²_triangle_feature(point, tri_geometries[idx], dist²_best)
+                    dist² = closest_dist²_triangle(point, tri_geometries[idx], dist²_best)
                     if dist² < dist²_best
                         dist²_best = dist²
                         tri_best = Int32(idx)
-                        feat_best = feat
                     end
                 end
                 break
             end
         end
     end
-    return (tri_best::Int32, dist²_best::Tg, feat_best::UInt8)
+    return (tri_best::Int32, dist²_best::Tg)
 end
 
 function compute_hint_grid(
@@ -600,16 +598,18 @@ function compute_hint_grid(
                 p = Point3{Tg}(cx, cy, cz)
 
                 # Forward hint propagation shrinks initial BVH search spheres instantly
-                tri_best, dist²_best, feat = closest_triangle_kernel(p, bvh, tri_geometries, stack, hint_tri)
+                tri_best, dist²_best = closest_triangle_kernel(p, bvh, tri_geometries, stack, hint_tri)
                 hint_tri = tri_best
 
                 # Eikonal Early-Out Precomputation
                 dist = √(max(dist²_best, zero(Tg)))
 
+                @inbounds tri = tri_geometries[tri_best]
+                sgn_fast = face_interior_sign_or_zero(p, tri)
+
                 # Eliminating ifelse assignments directly yielding CPU bit-shifting intrinsics
-                if feat == FEATURE_FACE
-                    ap = p - tri_geometries[tri_best].a
-                    sgn_dist = copysign(dist, tri_geometries[tri_best].n ⋅ ap)
+                if !iszero(sgn_fast)
+                    sgn_dist = sgn_fast * dist
                 else
                     wn = winding_number_point_kernel(fwn.nodes, tri_geometries, p, wind_stack)
                     sgn_dist = copysign(dist, Tg(0.5) - Tg(wn))
@@ -899,31 +899,20 @@ end
 
 ##############################   High-Performance Hot Loop Routines   ##############################
 
-const FEATURE_FACE = UInt8(0)
-const FEATURE_VERTEX_A = UInt8(1)
-const FEATURE_VERTEX_B = UInt8(2)
-const FEATURE_VERTEX_C = UInt8(3)
-const FEATURE_EDGE_AB = UInt8(4)
-const FEATURE_EDGE_AC = UInt8(5)
-const FEATURE_EDGE_BC = UInt8(6)
-const FEATURE_DEGENERATE = UInt8(7)
-
-@inline function closest_dist²_segment_feature(
-    ap::Point3{Tg}, ab::Point3{Tg}, ab2::Tg,
-    feat_edge::UInt8, feat_a::UInt8, feat_b::UInt8
+@inline function closest_dist²_segment(
+    ap::Point3{Tg}, ab::Point3{Tg}, ab2::Tg
 ) where {Tg<:AbstractFloat}
     zer = zero(Tg)
     # floatmin natively replaces pure zero limits entirely avoiding subnormal division panics
-    (ab2 <= floatmin(Tg)) && return (norm²(ap)::Tg, feat_a)
+    (ab2 <= floatmin(Tg)) && return norm²(ap)::Tg
     @fastmath begin
         tc = clamp((ap ⋅ ab) / ab2, zer, one(Tg))
         dist² = norm²(ap - tc * ab)
-        feat = ifelse(tc <= zer, feat_a, ifelse(tc >= one(Tg), feat_b, feat_edge))
-        return (dist²::Tg, feat::UInt8)
+        return dist²::Tg
     end
 end
 
-@inline function closest_dist²_triangle_feature(
+@inline function closest_dist²_triangle(
     p::Point3{Tg}, triangle::TriangleGeometry{Tg}, dist²_best::Tg
 ) where {Tg<:AbstractFloat}
     @fastmath begin
@@ -931,35 +920,27 @@ end
         ap = p - triangle.a
 
         if iszero(inv_denom)
-            (d2_ab, f_ab) = closest_dist²_segment_feature(ap, triangle.ab, triangle.d11, FEATURE_EDGE_AB, FEATURE_VERTEX_A, FEATURE_VERTEX_B)
-            (d2_ac, f_ac) = closest_dist²_segment_feature(ap, triangle.ac, triangle.d22, FEATURE_EDGE_AC, FEATURE_VERTEX_A, FEATURE_VERTEX_C)
-
+            d2_ab = closest_dist²_segment(ap, triangle.ab, triangle.d11)
+            d2_ac = closest_dist²_segment(ap, triangle.ac, triangle.d22)
             bc = triangle.ac - triangle.ab
-            (d2_bc, f_bc) = closest_dist²_segment_feature(ap - triangle.ab, bc, norm²(bc), FEATURE_EDGE_BC, FEATURE_VERTEX_B, FEATURE_VERTEX_C)
+            d2_bc = closest_dist²_segment(ap - triangle.ab, bc, norm²(bc))
 
             dist² = d2_ab
-            feat = f_ab
-            if d2_ac < dist²
-                dist² = d2_ac
-                feat = f_ac
-            end
-            if d2_bc < dist²
-                dist² = d2_bc
-                feat = f_bc
-            end
-            return (dist²::Tg, feat::UInt8)
+            dist² = ifelse(d2_ac < dist², d2_ac, dist²)
+            dist² = ifelse(d2_bc < dist², d2_bc, dist²)
+            return dist²::Tg
         end
 
         dot_n = triangle.n ⋅ ap
         plane_dist² = (dot_n * dot_n) * inv_denom
-        (plane_dist² >= dist²_best) && return (plane_dist²::Tg, FEATURE_FACE)
+        (plane_dist² >= dist²_best) && return plane_dist²::Tg
 
         d1 = triangle.ab ⋅ ap
         d2 = triangle.ac ⋅ ap
 
         if (d1 <= 0) && (d2 <= 0)
             dist² = norm²(ap)
-            return (dist²::Tg, FEATURE_VERTEX_A)
+            return dist²::Tg
         end
 
         d11 = triangle.d11
@@ -970,7 +951,7 @@ end
         d4 = d2 - d12
         if (d3 >= 0) && (d4 <= d3)
             dist² = norm²(ap - triangle.ab)
-            return (dist²::Tg, FEATURE_VERTEX_B)
+            return dist²::Tg
         end
 
         vc = muladd(d11, d2, -d12 * d1)
@@ -979,14 +960,14 @@ end
             zer = zero(Tg)
             v = ifelse(d11 > floatmin(Tg), d1 / d11, zer)
             dist² = norm²(ap - v * triangle.ab)
-            return (dist²::Tg, FEATURE_EDGE_AB)
+            return dist²::Tg
         end
 
         d5 = d1 - d12
         d6 = d2 - d22
         if (d6 >= 0) && (d5 <= d6)
             dist² = norm²(ap - triangle.ac)
-            return (dist²::Tg, FEATURE_VERTEX_C)
+            return dist²::Tg
         end
 
         vb = muladd(d22, d1, -d12 * d2)
@@ -994,7 +975,7 @@ end
             zer = zero(Tg)
             w = ifelse(d22 > floatmin(Tg), d2 / d22, zer)
             dist² = norm²(ap - w * triangle.ac)
-            return (dist²::Tg, FEATURE_EDGE_AC)
+            return dist²::Tg
         end
 
         uno = one(Tg)
@@ -1007,11 +988,38 @@ end
             w = clamp(ifelse(d33 > floatmin(Tg), d43 / d33, zer), zer, uno)
             bp = ap - triangle.ab
             dist² = norm²(bp - w * (triangle.ac - triangle.ab))
-            return (dist²::Tg, FEATURE_EDGE_BC)
+            return dist²::Tg
         else
             dist² = plane_dist²
-            return (dist²::Tg, FEATURE_FACE)
+            return dist²::Tg
         end
+    end
+end
+
+###############################   Fast Face-Interior Sign Shortcut   ###############################
+
+@inline function face_interior_sign_or_zero(
+    p::Point3{Tg}, tri::TriangleGeometry{Tg}, bary_tol::Tg=Tg(1e-4)
+) where {Tg<:AbstractFloat}
+    inv_denom = tri.inv_denom
+    iszero(inv_denom) && return zero(Tg)
+
+    @fastmath begin
+        ap = p - tri.a
+
+        d1 = tri.ab ⋅ ap
+        d2 = tri.ac ⋅ ap
+
+        v = muladd(tri.d22, d1, -tri.d12 * d2) * inv_denom
+        w = muladd(tri.d11, d2, -tri.d12 * d1) * inv_denom
+
+        if (v <= bary_tol) || (w <= bary_tol) || ((one(Tg) - v - w) <= bary_tol)
+            return zero(Tg)
+        end
+
+        # reuse precomputed face normal to avoid cross product
+        sgn = ifelse((tri.n ⋅ ap) >= zero(Tg), one(Tg), -one(Tg))
+        return sgn::Tg
     end
 end
 
@@ -1199,12 +1207,11 @@ function signed_distance_point(
 ) where {Tg<:AbstractFloat}
     dist²_best = floatmax(Tg)
     tri_best = Int32(0)
-    feature_best = FEATURE_DEGENERATE
 
     if (hint_face > 0) && (hint_face <= length(sdm.tri_geometries))
         tri_best = hint_face
         @inbounds triangle = sdm.tri_geometries[tri_best]
-        (dist²_best, feature_best) = closest_dist²_triangle_feature(point, triangle, dist²_best)
+        dist²_best = closest_dist²_triangle(point, triangle, dist²_best)
         (dist²_best <= zero(Tg)) && return zero(Tg)
     end
 
@@ -1212,19 +1219,18 @@ function signed_distance_point(
 
     if (grid_hint > 0) && (grid_hint != tri_best)
         @inbounds triangle = sdm.tri_geometries[grid_hint]
-        (d², feat) = closest_dist²_triangle_feature(point, triangle, dist²_best)
+        d² = closest_dist²_triangle(point, triangle, dist²_best)
         if d² <= zero(Tg)
             return zero(Tg)
         end
         if d² < dist²_best
             dist²_best = d²
             tri_best = grid_hint
-            feature_best = feat
         end
     end
 
     signed_distance = signed_distance_point_kernel(
-        sdm, point, dist²_best, tri_best, feature_best, sd_center, dist_to_c², stacks
+        sdm, point, dist²_best, tri_best, sd_center, dist_to_c², stacks
     )
     return signed_distance::Tg
 end
@@ -1236,17 +1242,16 @@ function signed_distance_point(
 
     dist²_best = floatmax(Tg)
     tri_best = Int32(0)
-    feature_best = FEATURE_DEGENERATE
 
     if (grid_hint > 0) && (grid_hint <= length(sdm.tri_geometries))
         tri_best = grid_hint
         @inbounds triangle = sdm.tri_geometries[tri_best]
-        (dist²_best, feature_best) = closest_dist²_triangle_feature(point, triangle, dist²_best)
+        dist²_best = closest_dist²_triangle(point, triangle, dist²_best)
         (dist²_best <= zero(Tg)) && return zero(Tg)
     end
 
     signed_distance = signed_distance_point_kernel(
-        sdm, point, dist²_best, tri_best, feature_best, sd_center, dist_to_c², stacks
+        sdm, point, dist²_best, tri_best, sd_center, dist_to_c², stacks
     )
     return signed_distance::Tg
 end
@@ -1257,16 +1262,15 @@ function signed_distance_point_kernel(
     point::Point3{Tg},
     dist²_best_in::Tg,
     tri_best_in::Int32,
-    feature_best_in::UInt8,
     sd_center::Tg,
     dist_to_c²::Tg,
     stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat}
 
     # Condenses duplicate 50-line stack blocks effortlessly onto generic boundaries
-    tri_best, dist²_best, feature_best = closest_triangle_kernel(
+    tri_best, dist²_best = closest_triangle_kernel(
         point, sdm.bvh, sdm.tri_geometries, stacks.dist,
-        tri_best_in, dist²_best_in, feature_best_in
+        tri_best_in, dist²_best_in
     )
 
     zer = zero(Tg)
@@ -1277,10 +1281,10 @@ function signed_distance_point_kernel(
 
     @inbounds tri = sdm.tri_geometries[tri_best]
 
-    if feature_best == FEATURE_FACE
-        ap = point - tri.a
-        # drops nested conditional multiplication utilizing pure intrinsic assignments
-        return copysign(dist, tri.n ⋅ ap)::Tg
+    # Fast face interior sign bypass strictly enforcing barycentric tolerances
+    sgn_fast = face_interior_sign_or_zero(point, tri)
+    if !iszero(sgn_fast)
+        return (sgn_fast * dist)::Tg
     end
 
     # STRONGER EIKONAL EARLY-OUT
