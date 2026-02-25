@@ -130,7 +130,7 @@ end
 
 ###################################   SAH (Surface Area Heuristic)   #################################
 
-const SAH_NUM_BINS = 16
+const NUM_SAH_BINS = 16
 
 mutable struct SAHScratch{T<:AbstractFloat}
     count::Vector{Int32}
@@ -150,7 +150,7 @@ mutable struct SAHScratch{T<:AbstractFloat}
 end
 
 function SAHScratch{T}() where {T<:AbstractFloat}
-    num_bins = SAH_NUM_BINS
+    num_bins = NUM_SAH_BINS
     count = Vector{Int32}(undef, num_bins)
     lb_x = Vector{T}(undef, num_bins)
     lb_y = Vector{T}(undef, num_bins)
@@ -176,7 +176,7 @@ function SAHScratch{T}() where {T<:AbstractFloat}
 end
 
 @inline function reset_sah_bins!(scratch::SAHScratch{T}) where {T<:AbstractFloat}
-    nb = SAH_BINS
+    nb = NUM_SAH_BINS
     fill!(scratch.count, Int32(0))
     inf_val = floatmax(T)
     ninf_val = -floatmax(T)
@@ -194,7 +194,7 @@ end
 @inline function centroid_bin_index(c::T, centroid_min::T, inv_extent::T) where {T<:AbstractFloat}
     x = (c - centroid_min) * inv_extent
     idx_bin_raw = Int(floor(x))
-    nbm1 = SAH_NUM_BINS - 1
+    nbm1 = NUM_SAH_BINS - 1
     idx_bin_raw = ifelse(idx_bin_raw < 0, 0, ifelse(idx_bin_raw > nbm1, nbm1, idx_bin_raw))
     idx_bin = idx_bin_raw + 1
     return idx_bin::Int
@@ -220,7 +220,7 @@ end
     extent = centroid_max - centroid_min
     (extent > zero(T)) || return (floatmax(T), 0, zero(T))
 
-    num_bins = SAH_NUM_BINS
+    num_bins = NUM_SAH_BINS
     inv_extent = T(num_bins) / extent
     reset_sah_bins!(scratch)
 
