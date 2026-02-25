@@ -18,7 +18,7 @@ function visualize(mesh::Mesh{3,Float32})
     return figure
 end
 
-###########################################   Utilities   ##########################################
+##################################   Feature Codes & Utilities   ##################################
 
 @inline function norm²(point::Point3{T}) where {T<:AbstractFloat}
     n² = point ⋅ point
@@ -30,26 +30,28 @@ end
 # packed triangle geometry aligned to 64 bytes (16 floats) for L1 cache-line
 struct TriangleGeometry{T<:AbstractFloat}
     a::Point3{T}
-    ab::Point3{T}
-    ac::Point3{T}
-    n::Point3{T}     # unnormalized face normal: ab × ac
-    d11::T           # norm²(ab)
-    d12::T           # ab ⋅ ac
-    d22::T           # norm²(ac)
-    inv_denom::T     # 1.0 / norm²(n)
+    ab::Point3{T}         # edge vector: b - a
+    ac::Point3{T}         # edge vector: c - a
+    n::Point3{T}          # unnormalized face normal: ab × ac
+    d11::T                # norm²(ab)
+    d12::T                # ab ⋅ ac
+    d22::T                # norm²(ac)
+    inv_denom::T          # 1 / norm²(n), zero for degenerate triangles
 end
 
 # 0th-order dipole expansion for fast winding numbers.
-# Topology packed natively to avoid redundant BVH fetches.
+# topology packed into UInt32 to avoid redundant BVH fetches:
+#   leaf:     high-bit set, bits 25–30 = count, bits 0–24 = leaf_start
+#   internal: bits 0–24 = left child (right child = left + 1)
 struct FWNNode{T<:AbstractFloat}
     cm_x::T
     cm_y::T
     cm_z::T
-    n_x::T
+    n_x::T               # area-weighted normal ÷ (4π)
     n_y::T
     n_z::T
-    r²β²::T
-    topology::UInt32 # High-bit: leaf flag. Bits 25-30: count. Bits 0-24: child_l / leaf_start
+    r²β²::T              # bounding-sphere radius² × β²
+    topology::UInt32
 end
 
 struct FastWindingData{T<:AbstractFloat}
@@ -57,6 +59,10 @@ struct FastWindingData{T<:AbstractFloat}
 end
 
 # AoS BVH node with overlapped integer fields for cache efficiency.
+# for T=Float32 this is 6×4 + 2×4 = 32 bytes — exactly two nodes per 64-byte cache line.
+# internal and leaf nodes overlap integer fields via sign-bit discriminant:
+#   internal: index = left child,  child_or_size = right child  (both > 0)
+#   leaf:     index = leaf_start,  child_or_size = -leaf_end    (< 0)
 struct BVHNode{T<:AbstractFloat}
     lb_x::T
     lb_y::T
@@ -75,19 +81,20 @@ struct BoundingVolumeHierarchy{T<:AbstractFloat}
     num_nodes::Int32
 end
 
-# Isotropic spatial voxel grid tailored to [-1, 1]^3.
-# Features exact cell-center evaluations for Eikonal Early-Out bypass.
-# Unified cells into an 8-byte Tuple block for single-instruction L1 Cache fetching.
+# isotropic spatial voxel grid over [-1, 1]³ with padding.
+# each cell stores the nearest packed triangle index and the signed distance at cell center.
+# cell_size and offset are precomputed so center = i * cell_size + offset (pure FMA).
 struct HintGrid{T<:AbstractFloat}
     lb::T
     inv_cell::T
-    cell_size::T     # absorbs spatial divisions strictly enabling continuous FMAs
-    offset::T        # absorbs floating offset subtraction natively
+    cell_size::T
+    offset::T
     res::Int
-    cells::Array{Tuple{Int32,T},3}
+    cells::Array{Tuple{Int32,T},3}  # (nearest_tri, signed_distance_at_center)
 end
 
-# Stack element carrying node topology.
+# stack element carrying node topology for inline AABB traversal.
+# stores child_or_size alongside dist² to avoid re-fetching the node on pop.
 struct NodeDist{T<:AbstractFloat}
     dist²::T
     index::Int32
@@ -100,8 +107,9 @@ struct QueryStacks{T<:AbstractFloat}
 end
 
 struct SignedDistanceMesh{Tg<:AbstractFloat}
-    tri_geometries::Vector{TriangleGeometry{Tg}}
+    tri_geometries::Vector{TriangleGeometry{Tg}}   # packed by BVH leaf order
     bvh::BoundingVolumeHierarchy{Tg}
+    # face_to_packed[f] = packed triangle index for original face id f
     face_to_packed::Vector{Int32}
     fwn::FastWindingData{Tg}
     hint_grid::HintGrid{Tg}
@@ -109,6 +117,7 @@ end
 
 #######################################   BVH Construction   #######################################
 
+# partial sort of indices by centroid along axis (build-time only)
 function median_split_sort!(
     indices::Vector{Int32}, lo::Int, mid::Int, hi::Int, centroids::NTuple{3,Vector{Tg}}, axis::Int
 ) where {Tg<:AbstractFloat}
@@ -118,6 +127,8 @@ function median_split_sort!(
     partialsort!(sub_indices, mid_relative; by=tri_idx -> centroids_axis[tri_idx])
     return nothing
 end
+
+###################################   SAH (Surface Area Heuristic)   #################################
 
 mutable struct SAHScratch{T<:AbstractFloat}
     count::Vector{Int32}
@@ -195,6 +206,7 @@ end
     return muladd(dx, dy, muladd(dx, dz, dy * dz))::T
 end
 
+# evaluate SAH cost for all bin splits along one axis; returns (best_cost, best_split, inv_extent)
 @inline function sah_best_split_axis!(
     scratch::SAHScratch{T},
     tri_indices::Vector{Int32}, lo::Int, hi::Int,
@@ -209,6 +221,7 @@ end
     inv_extent = T(nb) / extent
     reset_sah_bins!(scratch)
 
+    # bin triangles by centroid position
     @inbounds for i in lo:hi
         tri = tri_indices[i]
         b = centroid_bin_index(centroids_axis[tri], cmin, inv_extent)
@@ -222,6 +235,7 @@ end
         scratch.ub_z[b] = max(scratch.ub_z[b], ub_z_t[tri])
     end
 
+    # suffix scan for right-side bounds
     inf_val = floatmax(T)
     ninf_val = -floatmax(T)
     scratch.suffix_count[nb+1] = Int32(0)
@@ -242,6 +256,7 @@ end
         scratch.suffix_ub_z[b] = max(scratch.ub_z[b], scratch.suffix_ub_z[b+1])
     end
 
+    # prefix scan for left-side bounds, evaluate SAH cost at each split
     left_count = Int32(0)
     left_lb_x = inf_val
     left_lb_y = inf_val
@@ -283,6 +298,8 @@ end
     return (best_cost::T, best_split::Int, inv_extent::T)
 end
 
+########################################   BVH Builder   #########################################
+
 mutable struct BVHBuilder{T}
     const nodes::Vector{BVHNode{T}}
     const leaf_capacity::Int32
@@ -303,6 +320,7 @@ function build_node!(
 
     count = hi - lo + 1
     if count <= builder.leaf_capacity
+        # compute leaf bounds
         min_x = floatmax(T)
         min_y = floatmax(T)
         min_z = floatmax(T)
@@ -325,6 +343,7 @@ function build_node!(
         return node_id::Int32
     end
 
+    # split axis = longest centroid extent
     centroid_min_x = floatmax(T)
     centroid_min_y = floatmax(T)
     centroid_min_z = floatmax(T)
@@ -341,6 +360,7 @@ function build_node!(
         centroid_max_z = max(centroid_max_z, centroids[3][t])
     end
 
+    # try SAH split on all three axes, pick best
     scratch = builder.sah_scratch
     best_cost = floatmax(T)
     best_axis = 0
@@ -384,6 +404,7 @@ function build_node!(
         best_cmin = centroid_min_z
     end
 
+    # partition triangles by SAH bin boundary
     mid = 0
     if best_axis != 0
         axis = best_axis
@@ -402,6 +423,7 @@ function build_node!(
         mid = j
     end
 
+    # fallback to median split if SAH produced a degenerate partition
     if (best_axis == 0) || (mid < lo) || (mid >= hi)
         spread_x = centroid_max_x - centroid_min_x
         spread_y = centroid_max_y - centroid_min_y
@@ -418,6 +440,7 @@ function build_node!(
     build_node!(builder, child_l, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, depth + 1)
     build_node!(builder, child_r, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t, depth + 1)
 
+    # parent bounds = union of child bounds
     @inbounds begin
         node_l = builder.nodes[child_l]
         node_r = builder.nodes[child_r]
@@ -438,7 +461,7 @@ function build_bvh(
     leaf_capacity::Int=8
 ) where {Tg<:AbstractFloat}
 
-    # topology limit cap for robust 25-bit shift limits
+    # cap leaf capacity to 63 for 6-bit packing in FWN topology field
     leaf_capacity = min(leaf_capacity, 63)
     num_faces = length(first(centroids))
     @assert num_faces <= 33554431 "Mesh exceeds 33.5M faces."
@@ -450,6 +473,7 @@ function build_bvh(
     sah_scratch = SAHScratch{Tg}()
     builder = BVHBuilder{Tg}(nodes, Int32(leaf_capacity), sah_scratch, Int32(3), Int32(1))
 
+    # sentinel node at index 2 (builder.next_node starts at 3)
     if max_nodes >= 2
         zer = zero(Tg)
         builder.nodes[2] = BVHNode{Tg}(zer, zer, zer, zer, zer, zer, Int32(0), Int32(0))
@@ -463,12 +487,13 @@ function build_bvh(
     num_nodes = builder.next_node - 1
     resize!(builder.nodes, num_nodes)
     bvh = BoundingVolumeHierarchy{Tg}(builder.nodes, builder.max_depth, builder.leaf_capacity, Int32(num_nodes))
-    return (bvh, tri_indices)
+    return (bvh, tri_indices)  # return triangle order for packing
 end
 
 ######################################   Mesh Preprocessing   ######################################
 
-# extends evaluation logic allowing `signed_distance_point_kernel` to securely bypass redundant tree setups
+# BVH closest-triangle search with optional pre-seeded hint.
+# returns (packed_triangle_index, squared_distance).
 function closest_triangle_kernel(
     point::Point3{Tg},
     bvh::BoundingVolumeHierarchy{Tg},
@@ -479,7 +504,7 @@ function closest_triangle_kernel(
 ) where {Tg<:AbstractFloat}
     zer = zero(Tg)
 
-    # Honor pre-evaluated localized bounds dynamically bypassing initial distance limits
+    # tighten initial bound if a hint triangle was provided but not yet evaluated
     if dist²_best == floatmax(Tg) && tri_best > 0
         @inbounds triangle = tri_geometries[tri_best]
         dist²_best = closest_dist²_triangle(point, triangle, dist²_best)
@@ -502,13 +527,14 @@ function closest_triangle_kernel(
             (node_dist.dist² >= dist²_best) && break
             child_or_size = node_dist.child_or_size
 
-            if child_or_size > 0
+            if child_or_size > 0  # internal node
                 child_l_id = node_dist.index
                 child_r_id = child_or_size
 
                 node_l = bvh.nodes[child_l_id]
                 node_r = bvh.nodes[child_r_id]
 
+                # inline AABB dist² for both children
                 @fastmath begin
                     Δx_l = max(node_l.lb_x - p_x, p_x - node_l.ub_x, zer)
                     Δy_l = max(node_l.lb_y - p_y, p_y - node_l.ub_y, zer)
@@ -526,6 +552,7 @@ function closest_triangle_kernel(
                 idx_r = node_r.index
                 cos_r = node_r.child_or_size
 
+                # sort so near child is traversed next (far child pushed to stack)
                 swap = dist²_l > dist²_r
                 near_dist² = ifelse(swap, dist²_r, dist²_l)
                 far_dist² = ifelse(swap, dist²_l, dist²_r)
@@ -543,7 +570,7 @@ function closest_triangle_kernel(
                     continue
                 end
                 break
-            else
+            else  # leaf: test triangles
                 leaf_start = node_dist.index
                 leaf_end = -child_or_size
                 @inbounds for idx in leaf_start:leaf_end
@@ -560,6 +587,8 @@ function closest_triangle_kernel(
     return (tri_best::Int32, dist²_best::Tg)
 end
 
+# compute hint grid: for each voxel center, store nearest triangle and signed distance.
+# uses winding numbers for sign determination.
 function compute_hint_grid(
     bvh::BoundingVolumeHierarchy{Tg},
     tri_geometries::Vector{TriangleGeometry{Tg}},
@@ -567,21 +596,15 @@ function compute_hint_grid(
     grid_res::Int
 ) where {Tg<:AbstractFloat}
 
-    # -----------------------------------------------------------------------------------
-    # Because queries are mathematically guaranteed to be sampled strictly from within
-    # the unit cube [-1, 1]^3, we decouple the Hint Grid from the dynamic mesh AABB
-    # and lock it to perfectly partition this exact query domain.
-    # -----------------------------------------------------------------------------------
+    # queries are sampled from [-1, 1]³; pad slightly to cover boundary
     pad = Tg(0.05)
     lb = Tg(-1.0) - pad
     extent = Tg(2.0) + Tg(2.0) * pad
 
-    # eliminating floating point divisions entirely into pure unboxed 4-cycle FMAs
     inv_cell = Tg(grid_res) / extent
     cell_size = one(Tg) / inv_cell
     offset = lb - Tg(0.5) * cell_size
 
-    # Unboxed Tuple Array structures directly fetch identically contiguous 8-byte boundaries
     cells = Array{Tuple{Int32,Tg},3}(undef, grid_res, grid_res, grid_res)
     stack_capacity = bvh.max_depth + 4
 
@@ -589,25 +612,23 @@ function compute_hint_grid(
         stack = Vector{NodeDist{Tg}}(undef, stack_capacity)
         wind_stack = Vector{Int32}(undef, stack_capacity)
         for j in 1:grid_res
-            hint_tri = Int32(0) # seed horizontal propagation
+            hint_tri = Int32(0)  # seed horizontal propagation
             for i in 1:grid_res
-                # FMA resolution clears the costly division pipeline overhead instantly
+                # cell-center coordinates via FMA
                 cx = muladd(Tg(i), cell_size, offset)
                 cy = muladd(Tg(j), cell_size, offset)
                 cz = muladd(Tg(k), cell_size, offset)
                 p = Point3{Tg}(cx, cy, cz)
 
-                # Forward hint propagation shrinks initial BVH search spheres instantly
+                # propagate previous triangle as hint to tighten initial BVH bound
                 tri_best, dist²_best = closest_triangle_kernel(p, bvh, tri_geometries, stack, hint_tri)
                 hint_tri = tri_best
 
-                # Eikonal Early-Out Precomputation
                 dist = √(max(dist²_best, zero(Tg)))
 
                 @inbounds tri = tri_geometries[tri_best]
                 sgn_fast = face_interior_sign_or_zero(p, tri)
 
-                # Eliminating ifelse assignments directly yielding CPU bit-shifting intrinsics
                 if !iszero(sgn_fast)
                     sgn_dist = sgn_fast * dist
                 else
@@ -622,6 +643,16 @@ function compute_hint_grid(
     return HintGrid{Tg}(lb, inv_cell, cell_size, offset, grid_res, cells)
 end
 
+"""
+    preprocess_mesh(mesh; leaf_capacity=8, β_wind=2.0, grid_res=64)
+
+Build the acceleration structure for signed-distance queries on a
+watertight, consistently-oriented triangle mesh.
+
+- `mesh`:  `Mesh{3,Tg,GLTriangleFace}` — closed, watertight, consistently-oriented triangle mesh.
+
+Returns a `SignedDistanceMesh{Tg}` ready for `compute_signed_distance!` calls.
+"""
 function preprocess_mesh(
     mesh::Mesh{3,Tg,GLTriangleFace}; leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=64
 ) where {Tg<:AbstractFloat}
@@ -639,6 +670,7 @@ function preprocess_mesh(
     num_faces = length(faces)
     (num_faces > 0) || error("Mesh must contain at least one face.")
 
+    # per-triangle bounding boxes and centroids
     lb_x_t = Vector{Tg}(undef, num_faces)
     lb_y_t = Vector{Tg}(undef, num_faces)
     lb_z_t = Vector{Tg}(undef, num_faces)
@@ -677,11 +709,13 @@ function preprocess_mesh(
         centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t; leaf_capacity
     )
 
+    # pack triangle geometry contiguously by BVH leaf order
     tri_geometries = Vector{TriangleGeometry{Tg}}(undef, num_faces)
+    # map original face index → packed index (for triangle-hint acceleration)
     face_to_packed = Vector{Int32}(undef, num_faces)
 
     @inbounds for j in eachindex(faces)
-        idx_face = tri_order[j]
+        idx_face = tri_order[j]   # original face index
         face_to_packed[idx_face] = Int32(j)
 
         face = faces[idx_face]
@@ -702,7 +736,7 @@ function preprocess_mesh(
         denom_sum = c_x * c_x + c_y * c_y + c_z * c_z
         zer = zero(Tg)
 
-        # Guard prevents division by subnormal cascades throwing downstream NaNs
+        # guard for degenerate triangles to avoid NaN
         inv_denom = ifelse(denom_sum > floatmin(Tg), inv(denom_sum), zer)
 
         tri_geometries[j] = TriangleGeometry{Tg}(
@@ -740,8 +774,9 @@ function precompute_fast_winding_data(
     n_sum_y = Vector{Float64}(undef, num_nodes)
     n_sum_z = Vector{Float64}(undef, num_nodes)
 
-    # Clean bottom-up reverse iteration inherently evaluates structurally deepest nodes exactly
+    # bottom-up pass: deepest nodes first due to reverse iteration
     @inbounds for node_id in num_nodes:-1:1
+        # sentinel node (index 2) — skip
         if node_id == 2
             fwn_nodes[2] = FWNNode{Tg}(
                 zero(Tg), zero(Tg), zero(Tg),
@@ -755,7 +790,7 @@ function precompute_fast_winding_data(
         node = bvh.nodes[node_id]
         child_or_size = node.child_or_size
 
-        if child_or_size < 0
+        if child_or_size < 0  # leaf: accumulate from triangles
             leaf_start = Int(node.index)
             leaf_end = Int(-child_or_size)
             a_sum = 0.0
@@ -798,7 +833,7 @@ function precompute_fast_winding_data(
             n_sum_x[node_id] = nn_x_sum
             n_sum_y[node_id] = nn_y_sum
             n_sum_z[node_id] = nn_z_sum
-        else
+        else  # internal: merge children
             child_l = Int(node.index)
             child_r = Int(child_or_size)
             a_sum = area_sum[child_l] + area_sum[child_r]
@@ -811,6 +846,7 @@ function precompute_fast_winding_data(
             n_sum_z[node_id] = n_sum_z[child_l] + n_sum_z[child_r]
         end
 
+        # area-weighted centroid (fallback to AABB center for zero-area nodes)
         a_sum = area_sum[node_id]
         if a_sum > 0.0
             c_x = cent_sum_x[node_id] / a_sum
@@ -824,7 +860,7 @@ function precompute_fast_winding_data(
 
         local topology::UInt32
 
-        if child_or_size < 0
+        if child_or_size < 0  # leaf: bounding sphere from vertex distances
             leaf_start = Int(node.index)
             leaf_end = Int(-child_or_size)
             max_r² = 0.0
@@ -839,7 +875,7 @@ function precompute_fast_winding_data(
 
             count = UInt32(leaf_end - leaf_start + 1)
             topology = 0x80000000 | (count << 25) | UInt32(leaf_start)
-        else
+        else  # internal: hierarchical bounding sphere
             child_l = Int(node.index)
             child_r = Int(child_or_size)
 
@@ -849,6 +885,7 @@ function precompute_fast_winding_data(
             r_r = exact_r[child_r] + √((Float64(fR.cm_x) - c_x)^2 + (Float64(fR.cm_y) - c_y)^2 + (Float64(fR.cm_z) - c_z)^2)
             hierarchical_r = max(r_l, r_r)
 
+            # tighten with AABB-derived radius
             dx = max(abs(Float64(node.lb_x) - c_x), abs(Float64(node.ub_x) - c_x))
             dy = max(abs(Float64(node.lb_y) - c_y), abs(Float64(node.ub_y) - c_y))
             dz = max(abs(Float64(node.lb_z) - c_z), abs(Float64(node.ub_z) - c_z))
@@ -875,18 +912,23 @@ function precompute_fast_winding_data(
     return fwd::FastWindingData{Tg}
 end
 
+# allocate one traversal stack pair per chunk.
+# each stack is tiny, so per-call allocation is negligible.
 function allocate_stacks(sdm::SignedDistanceMesh{Tg}, num_points::Int) where {Tg}
     stack_capacity = Int(sdm.bvh.max_depth) + 4
 
     n_threads = Threads.nthreads()
+    # enforce a minimum chunk size to prevent false sharing and guarantee cache locality
     min_chunk_size = 512
     num_chunks_max = max(1, num_points ÷ min_chunk_size)
 
     if num_chunks_max < n_threads
+        # array is too small to use all threads optimally, limit the chunks
         num_chunks = num_chunks_max
-    else
+    else  # array is large enough to target ideal 8× oversubscription
         factor_max = 8
         factor = min(factor_max, num_chunks_max ÷ n_threads)
+        # set num_chunks to an exact multiple of n_threads for even load distribution
         num_chunks = n_threads * factor
     end
 
@@ -899,11 +941,12 @@ end
 
 ##############################   High-Performance Hot Loop Routines   ##############################
 
+# closest squared distance from point to a line segment defined by ap = p - a, ab = b - a
 @inline function closest_dist²_segment(
     ap::Point3{Tg}, ab::Point3{Tg}, ab2::Tg
 ) where {Tg<:AbstractFloat}
     zer = zero(Tg)
-    # floatmin natively replaces pure zero limits entirely avoiding subnormal division panics
+    # guard for degenerate (zero-length) edge
     (ab2 <= floatmin(Tg)) && return norm²(ap)::Tg
     @fastmath begin
         tc = clamp((ap ⋅ ab) / ab2, zer, one(Tg))
@@ -912,6 +955,8 @@ end
     end
 end
 
+# closest squared distance from point to triangle with early-exit plane test.
+# returns dist² ≥ dist²_best unchanged if the plane distance alone exceeds the current best.
 @inline function closest_dist²_triangle(
     p::Point3{Tg}, triangle::TriangleGeometry{Tg}, dist²_best::Tg
 ) where {Tg<:AbstractFloat}
@@ -919,6 +964,7 @@ end
         inv_denom = triangle.inv_denom
         ap = p - triangle.a
 
+        # degenerate triangle: test all three edges
         if iszero(inv_denom)
             d2_ab = closest_dist²_segment(ap, triangle.ab, triangle.d11)
             d2_ac = closest_dist²_segment(ap, triangle.ac, triangle.d22)
@@ -931,6 +977,7 @@ end
             return dist²::Tg
         end
 
+        # early-exit: plane distance alone exceeds current best
         dot_n = triangle.n ⋅ ap
         plane_dist² = (dot_n * dot_n) * inv_denom
         (plane_dist² >= dist²_best) && return plane_dist²::Tg
@@ -938,6 +985,7 @@ end
         d1 = triangle.ab ⋅ ap
         d2 = triangle.ac ⋅ ap
 
+        # vertex a region
         if (d1 <= 0) && (d2 <= 0)
             dist² = norm²(ap)
             return dist²::Tg
@@ -947,6 +995,7 @@ end
         d12 = triangle.d12
         d22 = triangle.d22
 
+        # vertex b region
         d3 = d1 - d11
         d4 = d2 - d12
         if (d3 >= 0) && (d4 <= d3)
@@ -954,8 +1003,8 @@ end
             return dist²::Tg
         end
 
+        # edge ab region
         vc = muladd(d11, d2, -d12 * d1)
-        # floatmin totally replaces invisible edge constraints
         if (vc <= 0) && (d1 >= 0) && (d3 <= 0)
             zer = zero(Tg)
             v = ifelse(d11 > floatmin(Tg), d1 / d11, zer)
@@ -963,6 +1012,7 @@ end
             return dist²::Tg
         end
 
+        # vertex c region
         d5 = d1 - d12
         d6 = d2 - d22
         if (d6 >= 0) && (d5 <= d6)
@@ -970,6 +1020,7 @@ end
             return dist²::Tg
         end
 
+        # edge ac region
         vb = muladd(d22, d1, -d12 * d2)
         if (vb <= 0) && (d2 >= 0) && (d6 <= 0)
             zer = zero(Tg)
@@ -978,6 +1029,7 @@ end
             return dist²::Tg
         end
 
+        # edge bc region or face interior
         uno = one(Tg)
         v_bary = (vb + vc) * inv_denom
         if v_bary >= uno
@@ -990,6 +1042,7 @@ end
             dist² = norm²(bp - w * (triangle.ac - triangle.ab))
             return dist²::Tg
         else
+            # face interior: plane distance is exact
             dist² = plane_dist²
             return dist²::Tg
         end
@@ -998,6 +1051,8 @@ end
 
 ###############################   Fast Face-Interior Sign Shortcut   ###############################
 
+# returns +1 / -1 if the closest point is strictly inside the face interior,
+# zero otherwise (edge/vertex proximity — requires full winding number).
 @inline function face_interior_sign_or_zero(
     p::Point3{Tg}, tri::TriangleGeometry{Tg}, bary_tol::Tg=Tg(1e-4)
 ) where {Tg<:AbstractFloat}
@@ -1017,7 +1072,7 @@ end
             return zero(Tg)
         end
 
-        # reuse precomputed face normal to avoid cross product
+        # reuse precomputed face normal to determine sign
         sgn = ifelse((tri.n ⋅ ap) >= zero(Tg), one(Tg), -one(Tg))
         return sgn::Tg
     end
@@ -1025,6 +1080,8 @@ end
 
 ###################################   Fast Winding Number Query   ##################################
 
+# solid angle subtended by a triangle, scaled by 1/(2π), computed in Float64.
+# uses the atan2-based formula for numerical stability.
 @inline function solid_angle_scaled(q_f64::NTuple{3,Float64}, tri::TriangleGeometry{Tg}) where {Tg<:AbstractFloat}
     @fastmath begin
         (qx, qy, qz) = q_f64
@@ -1045,8 +1102,8 @@ end
         lb = √(bx * bx + by * by + bz * bz)
         lc = √(cx * cx + cy * cy + cz * cz)
 
-        eps_val = 1.0e-30
-        (la < eps_val || lb < eps_val || lc < eps_val) && return 0.0
+        ε = 1.0e-30
+        (la < ε || lb < ε || lc < ε) && return 0.0
 
         ab = ax * bx + ay * by + az * bz
         ac = ax * cx + ay * cy + az * cz
@@ -1058,7 +1115,8 @@ end
     end
 end
 
-# zero-push forward mac evaluation achieving 100% shared l1 cache hits instantly
+# fast winding number via multipole acceptance criterion (MAC).
+# returns the winding number in Float64 (inside ≈ 1, outside ≈ 0).
 @inline function winding_number_point_kernel(
     fwn_nodes::Vector{FWNNode{Tg}},
     tri_geometries::Vector{TriangleGeometry{Tg}},
@@ -1072,7 +1130,7 @@ end
     q_f64 = (qx, qy, qz)
     wn = 0.0
 
-    # Execute and clear the root cleanly outside the loop to bypass initiating arbitrarily deep stack pushes
+    # evaluate root node MAC before entering the loop
     @inbounds root_node = fwn_nodes[1]
     @fastmath begin
         rx_root = Float64(root_node.cm_x) - qx
@@ -1098,7 +1156,7 @@ end
             fnode = fwn_nodes[node_id]
             topology = fnode.topology
 
-            if (topology & 0x80000000) != 0
+            if (topology & 0x80000000) != 0  # leaf: exact solid angles
                 count = (topology >> 25) & 0x3F
                 leaf_start = topology & 0x01FFFFFF
                 leaf_end = leaf_start + count - 1
@@ -1106,11 +1164,10 @@ end
                     wn += solid_angle_scaled(q_f64, tri_geometries[tri_id])
                 end
                 break
-            else
+            else  # internal: MAC test on both children
                 child_l_id = Int(topology)
                 child_r_id = child_l_id + 1
 
-                # Load both siblings simultaneously resolving the native allocation completely within shared bounds
                 node_l = fwn_nodes[child_l_id]
                 node_r = fwn_nodes[child_r_id]
 
@@ -1118,7 +1175,7 @@ end
                 pass_r = false
 
                 @fastmath begin
-                    # MAC Left Child Evaluation
+                    # MAC left child
                     rx_l = Float64(node_l.cm_x) - qx
                     ry_l = Float64(node_l.cm_y) - qy
                     rz_l = Float64(node_l.cm_z) - qz
@@ -1131,7 +1188,7 @@ end
                         wn += dot_val_l * (inv_dist_l * inv_dist_l * inv_dist_l)
                     end
 
-                    # MAC Right Child Evaluation
+                    # MAC right child
                     rx_r = Float64(node_r.cm_x) - qx
                     ry_r = Float64(node_r.cm_y) - qy
                     rz_r = Float64(node_r.cm_z) - qz
@@ -1145,7 +1202,7 @@ end
                     end
                 end
 
-                # Traversing sequentially downward strictly intercepts inherently failed limits naturally
+                # descend into children that failed MAC
                 if (!pass_l) && (!pass_r)
                     stack_top += 1
                     stack[stack_top] = Int32(child_r_id)
@@ -1157,8 +1214,8 @@ end
                 elseif !pass_r
                     node_id = child_r_id
                     continue
-                else
-                    break # Both uniquely passed MAC properties! Instantly prune bounding depth natively!
+                else  # both passed MAC — no further traversal needed
+                    break
                 end
             end
         end
@@ -1188,7 +1245,7 @@ end
         iz = Base.unsafe_trunc(Int, z_c) + 1
     end
 
-    # 4-cycle fused multiply add strictly erasing array boundary divisions entirely
+    # cell-center coordinates via FMA
     cx = muladd(Tg(ix), grid.cell_size, grid.offset)
     cy = muladd(Tg(iy), grid.cell_size, grid.offset)
     cz = muladd(Tg(iz), grid.cell_size, grid.offset)
@@ -1208,6 +1265,7 @@ function signed_distance_point(
     dist²_best = floatmax(Tg)
     tri_best = Int32(0)
 
+    # tighten initial bound using the provided triangle hint
     if (hint_face > 0) && (hint_face <= length(sdm.tri_geometries))
         tri_best = hint_face
         @inbounds triangle = sdm.tri_geometries[tri_best]
@@ -1217,6 +1275,7 @@ function signed_distance_point(
 
     (grid_hint, sd_center, dist_to_c²) = get_grid_hint(sdm.hint_grid, point)
 
+    # further tighten with grid hint if it differs from the face hint
     if (grid_hint > 0) && (grid_hint != tri_best)
         @inbounds triangle = sdm.tri_geometries[grid_hint]
         d² = closest_dist²_triangle(point, triangle, dist²_best)
@@ -1256,7 +1315,7 @@ function signed_distance_point(
     return signed_distance::Tg
 end
 
-# canonical code deduplication routing local hints dynamically out of isolated parallel evaluation blocks
+# core kernel: BVH traversal → sign determination (face-interior shortcut → Eikonal → winding number)
 function signed_distance_point_kernel(
     sdm::SignedDistanceMesh{Tg},
     point::Point3{Tg},
@@ -1267,7 +1326,6 @@ function signed_distance_point_kernel(
     stacks::QueryStacks{Tg}
 ) where {Tg<:AbstractFloat}
 
-    # Condenses duplicate 50-line stack blocks effortlessly onto generic boundaries
     tri_best, dist²_best = closest_triangle_kernel(
         point, sdm.bvh, sdm.tri_geometries, stacks.dist,
         tri_best_in, dist²_best_in
@@ -1281,29 +1339,42 @@ function signed_distance_point_kernel(
 
     @inbounds tri = sdm.tri_geometries[tri_best]
 
-    # Fast face interior sign bypass strictly enforcing barycentric tolerances
+    # fast face-interior sign bypass (avoids winding number when clearly inside a face)
     sgn_fast = face_interior_sign_or_zero(point, tri)
     if !iszero(sgn_fast)
         return (sgn_fast * dist)::Tg
     end
 
-    # STRONGER EIKONAL EARLY-OUT
+    # Eikonal early-out: if the triangle inequality with the grid center holds,
+    # the sign must match the cached grid center sign
     abs_sd = abs(sd_center)
     sum_dist = dist + abs_sd
 
     if (sum_dist * sum_dist) > dist_to_c² * Tg(1.00001)
-        # Eliminating ifelse branching logic cleanly replacing the exit pipeline
         return copysign(dist, sd_center)::Tg
     end
 
+    # fallback: full winding number for sign determination
     wn = winding_number_point_kernel(sdm.fwn.nodes, sdm.tri_geometries, point, stacks.wind)
 
-    # Drops nested conditional multiplication mapping completely via hardware copysign extraction
     return copysign(dist, Tg(0.5) - Tg(wn))::Tg
 end
 
 ##########################################   Public API   ##########################################
 
+"""
+    compute_signed_distance!(out, sdm, points, hint_faces)
+
+In-place batch signed distance query with triangle hints. Writes results into `out`.
+- `out`:            length-n vector to store the output signed distances.
+- `sdm`:            a [`SignedDistanceMesh`] built once via `preprocess_mesh`.
+- `points`:         `3 × n` matrix of query points.
+- `hint_faces`:     length-n vector of *original* face indices (1-based, matching the input `faces`)
+                    for each point. A single exact triangle check tightens the upper
+                    bound before BVH traversal, which can substantially speed up near-surface queries.
+
+Positive = outside, negative = inside.
+"""
 function compute_signed_distance!(
     out::AbstractVector{Tg},
     sdm::SignedDistanceMesh{Tg},
@@ -1316,6 +1387,9 @@ function compute_signed_distance!(
 
     face_to_packed = sdm.face_to_packed
     stacks = allocate_stacks(sdm, num_points)
+    # equipartition the work into chunks, so each chunk gets its own stack.
+    # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
+    # concurrent callers on the same sdm never share mutable scratch space.
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
 
@@ -1333,6 +1407,16 @@ function compute_signed_distance!(
     return out
 end
 
+"""
+    compute_signed_distance!(out, sdm, points)
+
+In-place batch signed distance query without triangle hints. Writes results into `out`.
+- `out`:        length-n vector to store the output signed distances.
+- `sdm`:        a [`SignedDistanceMesh`] built once via `preprocess_mesh`.
+- `points`:     `3 × n` matrix of query points.
+
+Positive = outside, negative = inside.
+"""
 function compute_signed_distance!(
     out::AbstractVector{Tg}, sdm::SignedDistanceMesh{Tg}, points::StridedMatrix{Tg}
 ) where {Tg<:AbstractFloat}
@@ -1341,6 +1425,9 @@ function compute_signed_distance!(
     @assert size(points, 1) == 3 "points matrix must be 3×n"
 
     stacks = allocate_stacks(sdm, num_points)
+    # equipartition the work into chunks, so each chunk gets its own stack.
+    # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
+    # concurrent callers on the same sdm never share mutable scratch space.
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
 
@@ -1358,6 +1445,12 @@ end
 
 ###################################   Optional Reusable Scratch   ##################################
 
+"""
+    compute_signed_distance!(out, sdm, points, hint_faces, stacks)
+
+In-place batch signed distance query with pre-allocated stacks.
+Identical to the two-argument variant but reuses `stacks` across calls to avoid allocation.
+"""
 function compute_signed_distance!(
     out::AbstractVector{Tg},
     sdm::SignedDistanceMesh{Tg},
@@ -1388,6 +1481,11 @@ function compute_signed_distance!(
     return out
 end
 
+"""
+    compute_signed_distance!(out, sdm, points, stacks)
+
+In-place batch signed distance query with pre-allocated stacks and no triangle hints.
+"""
 function compute_signed_distance!(
     out::AbstractVector{Tg},
     sdm::SignedDistanceMesh{Tg},
