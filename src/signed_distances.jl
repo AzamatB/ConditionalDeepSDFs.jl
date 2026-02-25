@@ -1122,7 +1122,7 @@ end
                     rx_l = Float64(node_l.cm_x) - qx
                     ry_l = Float64(node_l.cm_y) - qy
                     rz_l = Float64(node_l.cm_z) - qz
-                    dist2_l = rx_l * rx_l + ry_l * ry_l + rz_l * rz_l
+                    dist2_l = muladd(rx_l, rx_l, muladd(ry_l, ry_l, rz_l * rz_l))
                     pass_l = dist2_l > Float64(node_l.r²β²)
 
                     if pass_l
@@ -1135,7 +1135,7 @@ end
                     rx_r = Float64(node_r.cm_x) - qx
                     ry_r = Float64(node_r.cm_y) - qy
                     rz_r = Float64(node_r.cm_z) - qz
-                    dist2_r = rx_r * rx_r + ry_r * ry_r + rz_r * rz_r
+                    dist2_r = muladd(rx_r, rx_r, muladd(ry_r, ry_r, rz_r * rz_r))
                     pass_r = dist2_r > Float64(node_r.r²β²)
 
                     if pass_r
