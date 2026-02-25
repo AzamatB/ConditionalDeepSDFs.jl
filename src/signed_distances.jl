@@ -655,7 +655,7 @@ function compute_hint_grid(
 end
 
 """
-    preprocess_mesh(mesh; leaf_capacity=8, β_wind=2.0, grid_res=64)
+    preprocess_mesh(mesh; leaf_capacity=8, β_wind=2.0, grid_res=128)
 
 Build the acceleration structure for signed-distance queries on a
 watertight, consistently-oriented triangle mesh.
@@ -665,7 +665,7 @@ watertight, consistently-oriented triangle mesh.
 Returns a `SignedDistanceMesh{Tg}` ready for `compute_signed_distance!` calls.
 """
 function preprocess_mesh(
-    mesh::Mesh{3,Tg,GLTriangleFace}; leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=64
+    mesh::Mesh{3,Tg,GLTriangleFace}; leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=128
 ) where {Tg<:AbstractFloat}
     vertices = GeometryBasics.coordinates(mesh)
     tri_faces = GeometryBasics.faces(mesh)
@@ -677,7 +677,7 @@ end
 function preprocess_mesh(
     vertices::Vector{Point3{Tg}},
     faces::Vector{NTuple{3,Int32}};
-    leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=64
+    leaf_capacity::Int=8, β_wind::Real=2.0, grid_res::Int=128
 ) where {Tg<:AbstractFloat}
     num_faces = length(faces)
     (num_faces > 0) || error("Mesh must contain at least one face.")
