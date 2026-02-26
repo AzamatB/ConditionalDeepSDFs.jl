@@ -13,6 +13,7 @@ LuxCore = "bb33d45b-7691-41d6-9220-0943567d0623"
 Meshing = "e6723b4c-ebff-59f1-b4b7-d97aa5274f73"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [compat]
@@ -25,4 +26,5 @@ LuxCore = "1.5.3"
 Meshing = "0.7.0"
 NNlib = "0.9.33"
 Random = "1.11.0"
+Reactant = "0.2.228"
 Statistics = "1.11.1"

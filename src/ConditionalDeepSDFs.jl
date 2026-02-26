@@ -25,4 +25,8 @@ include("model.jl")
 
 include("lazy_grids.jl")
 
+using Reactant
+
+include("odc.jl")
+
 end
