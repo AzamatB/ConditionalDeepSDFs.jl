@@ -12,6 +12,7 @@
                    qef_lambda::Float32 = 0.05f0,
                    fd_step::Union{Nothing,Float32} = nothing,
                    det_eps::Float32 = 1f-12,
+                   manifoldize::Bool = true,
                    backend::String = "gpu")
 
 SDF-only occupancy-based / manifold dual contouring style meshing (multi-vertex per cell).
@@ -24,12 +25,13 @@ Inputs
 - `bounding_box = (pmin, pmax)`.
 
 Output
-- NamedTuple `(vertices::Vector{Point3f}, faces::Vector{TriangleFace{Int32}})`.
+- `GeometryBasics.Mesh` with `Point3f` vertices and `TriangleFace{Int32}` faces.
 
 Notes
 - Multi-vertex-per-cell via *true primal-face partitioning*: face marching-squares segments → cycles → one QEF vertex per cycle.
 - Hermite normals from SDF gradients via finite differences (GPU-batched).
 - Intersection-Free Contouring quad splitting uses ODC appendix case1/case2/case3 with Wang (2009) concavity test.
+- Optional manifold post-pass (`manifoldize=true`) splits non-manifold edges/vertices to guarantee 2-manifold output.
 """
 function construct_mesh(signed_distance::Function,
     bounding_box::NTuple{2,Point3f};
@@ -40,6 +42,7 @@ function construct_mesh(signed_distance::Function,
     qef_lambda::Float32=0.05f0,
     fd_step::Union{Nothing,Float32}=nothing,
     det_eps::Float32=1f-12,
+    manifoldize::Bool=true,
     backend::String="gpu")
 
     # --------------------
@@ -93,7 +96,7 @@ function construct_mesh(signed_distance::Function,
 
     n_patches = patch_data.n_patches
     if n_patches == 0
-        return (vertices=Point3f[], faces=TriangleFace{Int32}[])
+        return Mesh(Point3f[], TriangleFace{Int32}[])
     end
 
     # --------------------
@@ -121,6 +124,10 @@ function construct_mesh(signed_distance::Function,
 
     _emit_faces_z!(faces, vertices, cell_edge_patch, sdf, ez_p, ez_active,
         xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+
+    if manifoldize
+        _manifoldize!(vertices, faces)
+    end
 
     return Mesh(vertices, faces)
 end
@@ -386,8 +393,8 @@ function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, batc
     sdf_flat = Vector{Float32}(undef, N)
 
     pts_host = zeros(Float32, 3, batch)
-    # compile-time input buffer already inside eval_sd; we just re-upload each chunk
-    # simplest: to_rarray per chunk
+    pts_device = Reactant.to_rarray(pts_host)  # pre-allocate device buffer once
+
     for base in 0:batch:(N-1)
         m = min(batch, N - base)
         @inbounds for t in 1:m
@@ -403,9 +410,9 @@ function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, batc
             @inbounds pts_host[:, m+1:batch] .= 0f0
         end
 
-        pts_r = Reactant.to_rarray(pts_host)
-        out_r = eval_sd(pts_r)
-        out = Array(out_r)  # host
+        copyto!(pts_device, pts_host)
+        out_r = eval_sd(pts_device)
+        out = Array(out_r)
         @inbounds sdf_flat[base+1:base+m] .= out[1:m]
     end
 
@@ -469,9 +476,11 @@ function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin,
         end
     end
 
-    # chunked GPU root+normal
+    # chunked GPU root+normal — pre-allocate host AND device buffers once
     p0 = zeros(Float32, 3, batch)
     p1 = zeros(Float32, 3, batch)
+    p0_device = Reactant.to_rarray(p0)
+    p1_device = Reactant.to_rarray(p1)
 
     for base in 0:batch:(length(active)-1)
         m = min(batch, length(active) - base)
@@ -510,13 +519,14 @@ function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin,
             end
         end
 
-        p0r = Reactant.to_rarray(p0)
-        p1r = Reactant.to_rarray(p1)
-        root_r = kernels.edge_bisect(p0r, p1r)
+        copyto!(p0_device, p0)
+        copyto!(p1_device, p1)
+        root_r = kernels.edge_bisect(p0_device, p1_device)
         root = Array(root_r)
 
-        pr = Reactant.to_rarray(root)
-        nor_r = kernels.normals_fd(pr)
+        # reuse p0_device for normals input (same shape)
+        copyto!(p0_device, root)
+        nor_r = kernels.normals_fd(p0_device)
         nor = Array(nor_r)
 
         @inbounds for t in 1:m
@@ -545,6 +555,8 @@ function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin,
 
     p0 = zeros(Float32, 3, batch)
     p1 = zeros(Float32, 3, batch)
+    p0_device = Reactant.to_rarray(p0)
+    p1_device = Reactant.to_rarray(p1)
 
     for base in 0:batch:(length(active)-1)
         m = min(batch, length(active) - base)
@@ -580,13 +592,13 @@ function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin,
             end
         end
 
-        p0r = Reactant.to_rarray(p0)
-        p1r = Reactant.to_rarray(p1)
-        root_r = kernels.edge_bisect(p0r, p1r)
+        copyto!(p0_device, p0)
+        copyto!(p1_device, p1)
+        root_r = kernels.edge_bisect(p0_device, p1_device)
         root = Array(root_r)
 
-        pr = Reactant.to_rarray(root)
-        nor_r = kernels.normals_fd(pr)
+        copyto!(p0_device, root)
+        nor_r = kernels.normals_fd(p0_device)
         nor = Array(nor_r)
 
         @inbounds for t in 1:m
@@ -615,6 +627,8 @@ function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin,
 
     p0 = zeros(Float32, 3, batch)
     p1 = zeros(Float32, 3, batch)
+    p0_device = Reactant.to_rarray(p0)
+    p1_device = Reactant.to_rarray(p1)
 
     for base in 0:batch:(length(active)-1)
         m = min(batch, length(active) - base)
@@ -650,13 +664,13 @@ function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin,
             end
         end
 
-        p0r = Reactant.to_rarray(p0)
-        p1r = Reactant.to_rarray(p1)
-        root_r = kernels.edge_bisect(p0r, p1r)
+        copyto!(p0_device, p0)
+        copyto!(p1_device, p1)
+        root_r = kernels.edge_bisect(p0_device, p1_device)
         root = Array(root_r)
 
-        pr = Reactant.to_rarray(root)
-        nor_r = kernels.normals_fd(pr)
+        copyto!(p0_device, root)
+        nor_r = kernels.normals_fd(p0_device)
         nor = Array(nor_r)
 
         @inbounds for t in 1:m
@@ -1018,101 +1032,68 @@ function _build_patches_primal_partition!(sdf,
     return cell_edge_patch, pdata
 end
 
+# Lookup table: local edge → (axis_char, di, dj, dk) where axis_char selects
+# which edge array (x/y/z) and (di,dj,dk) is the offset from cell corner (ci,cj,ck).
+# x-edges: 0,2,4,6   y-edges: 1,3,5,7   z-edges: 8,9,10,11
+const _EDGE_LUT = (
+    # e0:  x-edge at (ci, cj,   ck  )
+    (0x01, 0, 0, 0),
+    # e1:  y-edge at (ci+1, cj, ck  )
+    (0x02, 1, 0, 0),
+    # e2:  x-edge at (ci, cj+1, ck  )
+    (0x01, 0, 1, 0),
+    # e3:  y-edge at (ci, cj,   ck  )
+    (0x02, 0, 0, 0),
+    # e4:  x-edge at (ci, cj,   ck+1)
+    (0x01, 0, 0, 1),
+    # e5:  y-edge at (ci+1, cj, ck+1)
+    (0x02, 1, 0, 1),
+    # e6:  x-edge at (ci, cj+1, ck+1)
+    (0x01, 0, 1, 1),
+    # e7:  y-edge at (ci, cj,   ck+1)
+    (0x02, 0, 0, 1),
+    # e8:  z-edge at (ci, cj,   ck  )
+    (0x03, 0, 0, 0),
+    # e9:  z-edge at (ci+1, cj, ck  )
+    (0x03, 1, 0, 0),
+    # e10: z-edge at (ci+1, cj+1,ck )
+    (0x03, 1, 1, 0),
+    # e11: z-edge at (ci, cj+1, ck  )
+    (0x03, 0, 1, 0),
+)
+
 @inline function _fill_edge_constraint!(Px, Py, Pz, Nx, Ny, Nz, W,
     pid::Int32, slot::Int,
     e::Int8, ci::Int, cj::Int, ck::Int,
     ex_p, ex_n, ey_p, ey_n, ez_p, ez_n)
-    # Map local edge -> global edge array index
-    # local edges:
-    # 0,2,4,6 are x-edges: ex at (ci, cj+dy, ck+dz)
-    # 1,3,5,7 are y-edges: ey at (ci+dx, cj, ck+dz)
-    # 8,9,10,11 are z-edges: ez at (ci+dx, cj+dy, ck)
+
+    axis, di, dj, dk = _EDGE_LUT[Int(e)+1]
     @inbounds begin
         W[slot, pid] = 1f0
-        if e == 0
-            Px[slot, pid] = ex_p[1, ci, cj, ck]
-            Py[slot, pid] = ex_p[2, ci, cj, ck]
-            Pz[slot, pid] = ex_p[3, ci, cj, ck]
-            Nx[slot, pid] = ex_n[1, ci, cj, ck]
-            Ny[slot, pid] = ex_n[2, ci, cj, ck]
-            Nz[slot, pid] = ex_n[3, ci, cj, ck]
-        elseif e == 2
-            Px[slot, pid] = ex_p[1, ci, cj+1, ck]
-            Py[slot, pid] = ex_p[2, ci, cj+1, ck]
-            Pz[slot, pid] = ex_p[3, ci, cj+1, ck]
-            Nx[slot, pid] = ex_n[1, ci, cj+1, ck]
-            Ny[slot, pid] = ex_n[2, ci, cj+1, ck]
-            Nz[slot, pid] = ex_n[3, ci, cj+1, ck]
-        elseif e == 4
-            Px[slot, pid] = ex_p[1, ci, cj, ck+1]
-            Py[slot, pid] = ex_p[2, ci, cj, ck+1]
-            Pz[slot, pid] = ex_p[3, ci, cj, ck+1]
-            Nx[slot, pid] = ex_n[1, ci, cj, ck+1]
-            Ny[slot, pid] = ex_n[2, ci, cj, ck+1]
-            Nz[slot, pid] = ex_n[3, ci, cj, ck+1]
-        elseif e == 6
-            Px[slot, pid] = ex_p[1, ci, cj+1, ck+1]
-            Py[slot, pid] = ex_p[2, ci, cj+1, ck+1]
-            Pz[slot, pid] = ex_p[3, ci, cj+1, ck+1]
-            Nx[slot, pid] = ex_n[1, ci, cj+1, ck+1]
-            Ny[slot, pid] = ex_n[2, ci, cj+1, ck+1]
-            Nz[slot, pid] = ex_n[3, ci, cj+1, ck+1]
-        elseif e == 1
-            Px[slot, pid] = ey_p[1, ci+1, cj, ck]
-            Py[slot, pid] = ey_p[2, ci+1, cj, ck]
-            Pz[slot, pid] = ey_p[3, ci+1, cj, ck]
-            Nx[slot, pid] = ey_n[1, ci+1, cj, ck]
-            Ny[slot, pid] = ey_n[2, ci+1, cj, ck]
-            Nz[slot, pid] = ey_n[3, ci+1, cj, ck]
-        elseif e == 3
-            Px[slot, pid] = ey_p[1, ci, cj, ck]
-            Py[slot, pid] = ey_p[2, ci, cj, ck]
-            Pz[slot, pid] = ey_p[3, ci, cj, ck]
-            Nx[slot, pid] = ey_n[1, ci, cj, ck]
-            Ny[slot, pid] = ey_n[2, ci, cj, ck]
-            Nz[slot, pid] = ey_n[3, ci, cj, ck]
-        elseif e == 5
-            Px[slot, pid] = ey_p[1, ci+1, cj, ck+1]
-            Py[slot, pid] = ey_p[2, ci+1, cj, ck+1]
-            Pz[slot, pid] = ey_p[3, ci+1, cj, ck+1]
-            Nx[slot, pid] = ey_n[1, ci+1, cj, ck+1]
-            Ny[slot, pid] = ey_n[2, ci+1, cj, ck+1]
-            Nz[slot, pid] = ey_n[3, ci+1, cj, ck+1]
-        elseif e == 7
-            Px[slot, pid] = ey_p[1, ci, cj, ck+1]
-            Py[slot, pid] = ey_p[2, ci, cj, ck+1]
-            Pz[slot, pid] = ey_p[3, ci, cj, ck+1]
-            Nx[slot, pid] = ey_n[1, ci, cj, ck+1]
-            Ny[slot, pid] = ey_n[2, ci, cj, ck+1]
-            Nz[slot, pid] = ey_n[3, ci, cj, ck+1]
-        elseif e == 8
-            Px[slot, pid] = ez_p[1, ci, cj, ck]
-            Py[slot, pid] = ez_p[2, ci, cj, ck]
-            Pz[slot, pid] = ez_p[3, ci, cj, ck]
-            Nx[slot, pid] = ez_n[1, ci, cj, ck]
-            Ny[slot, pid] = ez_n[2, ci, cj, ck]
-            Nz[slot, pid] = ez_n[3, ci, cj, ck]
-        elseif e == 9
-            Px[slot, pid] = ez_p[1, ci+1, cj, ck]
-            Py[slot, pid] = ez_p[2, ci+1, cj, ck]
-            Pz[slot, pid] = ez_p[3, ci+1, cj, ck]
-            Nx[slot, pid] = ez_n[1, ci+1, cj, ck]
-            Ny[slot, pid] = ez_n[2, ci+1, cj, ck]
-            Nz[slot, pid] = ez_n[3, ci+1, cj, ck]
-        elseif e == 10
-            Px[slot, pid] = ez_p[1, ci+1, cj+1, ck]
-            Py[slot, pid] = ez_p[2, ci+1, cj+1, ck]
-            Pz[slot, pid] = ez_p[3, ci+1, cj+1, ck]
-            Nx[slot, pid] = ez_n[1, ci+1, cj+1, ck]
-            Ny[slot, pid] = ez_n[2, ci+1, cj+1, ck]
-            Nz[slot, pid] = ez_n[3, ci+1, cj+1, ck]
-        else # e == 11
-            Px[slot, pid] = ez_p[1, ci, cj+1, ck]
-            Py[slot, pid] = ez_p[2, ci, cj+1, ck]
-            Pz[slot, pid] = ez_p[3, ci, cj+1, ck]
-            Nx[slot, pid] = ez_n[1, ci, cj+1, ck]
-            Ny[slot, pid] = ez_n[2, ci, cj+1, ck]
-            Nz[slot, pid] = ez_n[3, ci, cj+1, ck]
+        if axis == 0x01  # x-edge
+            gi, gj, gk = ci + di, cj + dj, ck + dk
+            Px[slot, pid] = ex_p[1, gi, gj, gk]
+            Py[slot, pid] = ex_p[2, gi, gj, gk]
+            Pz[slot, pid] = ex_p[3, gi, gj, gk]
+            Nx[slot, pid] = ex_n[1, gi, gj, gk]
+            Ny[slot, pid] = ex_n[2, gi, gj, gk]
+            Nz[slot, pid] = ex_n[3, gi, gj, gk]
+        elseif axis == 0x02  # y-edge
+            gi, gj, gk = ci + di, cj + dj, ck + dk
+            Px[slot, pid] = ey_p[1, gi, gj, gk]
+            Py[slot, pid] = ey_p[2, gi, gj, gk]
+            Pz[slot, pid] = ey_p[3, gi, gj, gk]
+            Nx[slot, pid] = ey_n[1, gi, gj, gk]
+            Ny[slot, pid] = ey_n[2, gi, gj, gk]
+            Nz[slot, pid] = ey_n[3, gi, gj, gk]
+        else  # z-edge
+            gi, gj, gk = ci + di, cj + dj, ck + dk
+            Px[slot, pid] = ez_p[1, gi, gj, gk]
+            Py[slot, pid] = ez_p[2, gi, gj, gk]
+            Pz[slot, pid] = ez_p[3, gi, gj, gk]
+            Nx[slot, pid] = ez_n[1, gi, gj, gk]
+            Ny[slot, pid] = ez_n[2, gi, gj, gk]
+            Nz[slot, pid] = ez_n[3, gi, gj, gk]
         end
     end
     return nothing
@@ -1155,6 +1136,24 @@ function _solve_qef_patches!(kernels::_Kernels, pdata::_PatchData, qef_batch::In
     maxx = zeros(Float32, B)
     maxy = zeros(Float32, B)
     maxz = zeros(Float32, B)
+
+    # Pre-allocate device buffers once (16 arrays)
+    Px_r = Reactant.to_rarray(Px)
+    Py_r = Reactant.to_rarray(Py)
+    Pz_r = Reactant.to_rarray(Pz)
+    Nx_r = Reactant.to_rarray(Nx)
+    Ny_r = Reactant.to_rarray(Ny)
+    Nz_r = Reactant.to_rarray(Nz)
+    W_r = Reactant.to_rarray(W)
+    Cx_r = Reactant.to_rarray(Cx)
+    Cy_r = Reactant.to_rarray(Cy)
+    Cz_r = Reactant.to_rarray(Cz)
+    minx_r = Reactant.to_rarray(minx)
+    miny_r = Reactant.to_rarray(miny)
+    minz_r = Reactant.to_rarray(minz)
+    maxx_r = Reactant.to_rarray(maxx)
+    maxy_r = Reactant.to_rarray(maxy)
+    maxz_r = Reactant.to_rarray(maxz)
 
     for base in 0:B:(n-1)
         m = min(B, n - base)
@@ -1200,23 +1199,23 @@ function _solve_qef_patches!(kernels::_Kernels, pdata::_PatchData, qef_batch::In
             end
         end
 
-        # GPU
-        Px_r = Reactant.to_rarray(Px)
-        Py_r = Reactant.to_rarray(Py)
-        Pz_r = Reactant.to_rarray(Pz)
-        Nx_r = Reactant.to_rarray(Nx)
-        Ny_r = Reactant.to_rarray(Ny)
-        Nz_r = Reactant.to_rarray(Nz)
-        W_r = Reactant.to_rarray(W)
-        Cx_r = Reactant.to_rarray(Cx)
-        Cy_r = Reactant.to_rarray(Cy)
-        Cz_r = Reactant.to_rarray(Cz)
-        minx_r = Reactant.to_rarray(minx)
-        miny_r = Reactant.to_rarray(miny)
-        minz_r = Reactant.to_rarray(minz)
-        maxx_r = Reactant.to_rarray(maxx)
-        maxy_r = Reactant.to_rarray(maxy)
-        maxz_r = Reactant.to_rarray(maxz)
+        # Copy host → pre-allocated device buffers (no allocation)
+        copyto!(Px_r, Px)
+        copyto!(Py_r, Py)
+        copyto!(Pz_r, Pz)
+        copyto!(Nx_r, Nx)
+        copyto!(Ny_r, Ny)
+        copyto!(Nz_r, Nz)
+        copyto!(W_r, W)
+        copyto!(Cx_r, Cx)
+        copyto!(Cy_r, Cy)
+        copyto!(Cz_r, Cz)
+        copyto!(minx_r, minx)
+        copyto!(miny_r, miny)
+        copyto!(minz_r, minz)
+        copyto!(maxx_r, maxx)
+        copyto!(maxy_r, maxy)
+        copyto!(maxz_r, maxz)
 
         out_r = kernels.qef_solve(Px_r, Py_r, Pz_r, Nx_r, Ny_r, Nz_r, W_r, Cx_r, Cy_r, Cz_r,
             minx_r, miny_r, minz_r, maxx_r, maxy_r, maxz_r)
@@ -1482,4 +1481,178 @@ function _emit_faces_z!(faces, vertices, cell_edge_patch, sdf, ez_p, active_edge
 
         _triangulate_quad_ic!(faces, vertices, i1, i2, i3, i4, p_in, p_out, p_edge)
     end
+end
+
+
+# --------------------------------------------
+# Manifold post-pass (ported from SDFODC)
+# Splits non-manifold edges and vertices to guarantee 2-manifold output.
+# --------------------------------------------
+
+@inline function _edgekey(u::Int32, v::Int32)::UInt64
+    a = UInt64(min(u, v))
+    b = UInt64(max(u, v))
+    return (a << 32) | b
+end
+
+@inline function _unpack_edgekey(key::UInt64)::Tuple{Int32,Int32}
+    u = Int32(key >> 32)
+    v = Int32(key & 0xffffffff)
+    return u, v
+end
+
+@inline function _third_vertex(f::TriangleFace{Int32}, u::Int32, v::Int32)::Int32
+    a, b, c = f[1], f[2], f[3]
+    if a != u && a != v
+        return a
+    elseif b != u && b != v
+        return b
+    else
+        return c
+    end
+end
+
+function _manifoldize!(verts::Vector{Point3f}, faces::Vector{TriangleFace{Int32}})
+    # ---- Pass 1: Split non-manifold edges (>2 incident faces) ----
+    edge_faces = Dict{UInt64,Vector{Int32}}()
+    for (fi, f) in enumerate(faces)
+        a, b, c = f[1], f[2], f[3]
+        for (u, v) in ((a, b), (b, c), (c, a))
+            key = _edgekey(u, v)
+            push!(get!(edge_faces, key, Int32[]), Int32(fi))
+        end
+    end
+
+    for (key, flist) in edge_faces
+        if length(flist) <= 2
+            continue
+        end
+
+        u, v = _unpack_edgekey(key)
+        pu = verts[Int(u)]
+        pv = verts[Int(v)]
+        d = _sub(pv, pu)
+        inv_len = 1f0 / (sqrt(_dot(d, d)) + 1f-12)
+        dn = Point3f(d[1] * inv_len, d[2] * inv_len, d[3] * inv_len)
+
+        # Build a stable perpendicular basis (b1, b2) around edge axis dn
+        ax = abs(dn[1]) < 0.9f0 ? Point3f(1, 0, 0) : Point3f(0, 1, 0)
+        b1 = _cross(dn, ax)
+        inv_b1 = 1f0 / (sqrt(_dot(b1, b1)) + 1f-12)
+        b1 = Point3f(b1[1] * inv_b1, b1[2] * inv_b1, b1[3] * inv_b1)
+        b2 = _cross(dn, b1)
+
+        mid = Point3f(0.5f0 * (pu[1] + pv[1]), 0.5f0 * (pu[2] + pv[2]), 0.5f0 * (pu[3] + pv[3]))
+
+        angles = Vector{Float32}(undef, length(flist))
+        for (ii, fid) in enumerate(flist)
+            f = faces[Int(fid)]
+            w = _third_vertex(f, u, v)
+            pw = verts[Int(w)]
+            vec = _sub(pw, mid)
+            x = _dot(vec, b1)
+            y = _dot(vec, b2)
+            angles[ii] = atan(y, x)
+        end
+
+        perm = sortperm(angles)
+        sorted_f = flist[perm]
+
+        # Keep first two faces on original (u,v); for the rest, duplicate u in pairs
+        for start in 3:2:length(sorted_f)
+            newu = Int32(length(verts) + 1)
+            push!(verts, verts[Int(u)]) # duplicate position
+
+            for fid in sorted_f[start:min(start + 1, length(sorted_f))]
+                f = faces[Int(fid)]
+                a, b, c = f[1], f[2], f[3]
+                a = (a == u) ? newu : a
+                b = (b == u) ? newu : b
+                c = (c == u) ? newu : c
+                faces[Int(fid)] = TriangleFace{Int32}(a, b, c)
+            end
+        end
+    end
+
+    # ---- Pass 2: Split non-manifold vertices by connected components ----
+    faces_of_v = [Int32[] for _ in 1:length(verts)]
+    for (fi, f) in enumerate(faces)
+        a, b, c = f[1], f[2], f[3]
+        push!(faces_of_v[Int(a)], Int32(fi))
+        push!(faces_of_v[Int(b)], Int32(fi))
+        push!(faces_of_v[Int(c)], Int32(fi))
+    end
+
+    for v in Int32(1):Int32(length(verts))
+        fl = faces_of_v[Int(v)]
+        if length(fl) <= 1
+            continue
+        end
+
+        # Local union-find over incident faces
+        m = length(fl)
+        parent = collect(1:m)
+
+        find(i) = (parent[i] == i ? i : (parent[i] = find(parent[i])))
+        function unite(i, j)
+            ri, rj = find(i), find(j)
+            if ri != rj
+                parent[rj] = ri
+            end
+        end
+
+        neighbor_face = Dict{Int32,Int}()  # neighbor vertex -> local face idx
+        for (li, fid) in enumerate(fl)
+            f = faces[Int(fid)]
+            a, b, c = f[1], f[2], f[3]
+            n1::Int32 = 0
+            n2::Int32 = 0
+            if a == v
+                n1, n2 = b, c
+            elseif b == v
+                n1, n2 = a, c
+            else
+                n1, n2 = a, b
+            end
+
+            for n in (n1, n2)
+                if haskey(neighbor_face, n)
+                    unite(li, neighbor_face[n])
+                else
+                    neighbor_face[n] = li
+                end
+            end
+        end
+
+        # Group by root
+        groups = Dict{Int,Vector{Int32}}()
+        for (li, fid) in enumerate(fl)
+            r = find(li)
+            push!(get!(groups, r, Int32[]), fid)
+        end
+
+        if length(groups) <= 1
+            continue
+        end
+
+        first_root = first(keys(groups))
+        for (r, gfaces) in groups
+            if r == first_root
+                continue
+            end
+            newv = Int32(length(verts) + 1)
+            push!(verts, verts[Int(v)])
+
+            for fid in gfaces
+                f = faces[Int(fid)]
+                a, b, c = f[1], f[2], f[3]
+                a = (a == v) ? newv : a
+                b = (b == v) ? newv : b
+                c = (c == v) ? newv : c
+                faces[Int(fid)] = TriangleFace{Int32}(a, b, c)
+            end
+        end
+    end
+
+    return nothing
 end
