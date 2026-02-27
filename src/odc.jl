@@ -6,7 +6,6 @@ struct ODCKernels{D,C,Ksd,Keb,Knf,Kqs}
     edge_batch::Int
     qef_batch::Int
     bs_iters::Int
-    fd::Float32
     λ::Float32
     det_eps::Float32
     eval_sd::Ksd
@@ -36,34 +35,32 @@ function ODCKernels(
 )
     Reactant.set_default_backend(backend)
 
-    λ = qef_lambda
     device = reactant_device(; force=true)
     host = cpu_device()
 
     # --- eval_sd kernel (3,B) -> (B)
-    let B = edge_batch
-        pts_ex = device(zeros(Float32, 3, B))
-        eval_sd = @compile signed_distance(pts_ex)
+    let signed_dist = signed_distance, Be = edge_batch, Bq = qef_batch, iters = bs_iters, λ = qef_lambda, ε = det_eps
+        pts_ex = device(zeros(Float32, 3, Be))
+        eval_sd = @compile signed_dist(pts_ex)
 
         # --- edge bisect kernel (3,B),(3,B) -> (3,B)
-        p0_ex = device(zeros(Float32, 3, B))
-        p1_ex = device(zeros(Float32, 3, B))
+        p0_ex = device(zeros(Float32, 3, Be))
+        p1_ex = device(zeros(Float32, 3, Be))
         function edge_bisect_kernel(p0, p1)
-            return _edge_bisect(p0, p1, signed_distance, Val(bs_iters))
+            return _edge_bisect(p0, p1, signed_dist, Val(iters))
         end
         edge_bisect = @compile edge_bisect_kernel(p0_ex, p1_ex)
 
         # --- normals kernel (3,B),(1,) -> (3,B)   fd is a runtime scalar
-        p_ex = device(zeros(Float32, 3, B))
+        p_ex = device(zeros(Float32, 3, Be))
         fd_ex = device(zeros(Float32, 1))
         function normals_kernel(p, fd_buf)
-            return _normals_fd(p, signed_distance, fd_buf[1])
+            return _normals_fd(p, signed_dist, fd_buf)
         end
         normals_fd = @compile normals_kernel(p_ex, fd_ex)
 
         # --- QEF kernel (E,Bqef) -> (3,Bqef)
         E = 12
-        Bq = qef_batch
         zerosEB() = device(zeros(Float32, E, Bq))
         zerosB() = device(zeros(Float32, Bq))
 
@@ -85,13 +82,12 @@ function ODCKernels(
         maxz_ex = zerosB()
 
         function qef_kernel(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz, minx, miny, minz, maxx, maxy, maxz)
-            return _qef_solve_batch(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz, minx, miny, minz, maxx, maxy, maxz, λ, det_eps)
+            return _qef_solve_batch(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz, minx, miny, minz, maxx, maxy, maxz, λ, ε)
         end
         qef_solve = @compile qef_kernel(Px_ex, Py_ex, Pz_ex, Nx_ex, Ny_ex, Nz_ex, W_ex,
             Cx_ex, Cy_ex, Cz_ex, minx_ex, miny_ex, minz_ex, maxx_ex, maxy_ex, maxz_ex)
 
-        return ODCKernels(edge_batch, qef_batch, bs_iters, 0f0, λ, det_eps,
-            eval_sd, edge_bisect, normals_fd, qef_solve, device, host)
+        return ODCKernels(Be, Bq, iters, λ, ε, eval_sd, edge_bisect, normals_fd, qef_solve, device, host)
     end
 end
 
@@ -269,7 +265,7 @@ function _edge_bisect(p0, p1, signed_distance, ::Val{ITERS}) where {ITERS}
     for _ in 1:ITERS
         mid = 0.5f0 .* (lo .+ hi)
         fmid = signed_distance(mid)
-        inside = fmid .< 0f0
+        inside = (fmid .< 0f0)'
         # if inside: lo = mid else hi = mid
         lo = ifelse.(inside, mid, lo)
         hi = ifelse.(inside, hi, mid)
