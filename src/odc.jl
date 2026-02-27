@@ -862,18 +862,20 @@ function _build_patches_primal_partition!(sdf,
     # ---- pass 1: count cycles per cell
     cycles_per_cell = zeros(UInt8, nx, ny, nz)
 
-    # thread-local buffers
-    Tn = nthreads()
-    nbr1s = [fill(Int8(-1), 12) for _ in 1:Tn]
-    nbr2s = [fill(Int8(-1), 12) for _ in 1:Tn]
-    visiteds = [fill(false, 12) for _ in 1:Tn]
+    # thread-local buffers — one per chunk (not per threadid, which can exceed nthreads)
+    num_chunks = nthreads()
+    nbr1s = [fill(Int8(-1), 12) for _ in 1:num_chunks]
+    nbr2s = [fill(Int8(-1), 12) for _ in 1:num_chunks]
+    visiteds = [fill(false, 12) for _ in 1:num_chunks]
+    chunk_size = cld(nz, num_chunks)
 
-    @threads for ck in 1:nz
-        tid = threadid()
-        nbr1 = nbr1s[tid]
-        nbr2 = nbr2s[tid]
-        visited = visiteds[tid]
-        for cj in 1:ny, ci in 1:nx
+    @threads :dynamic for idx_chunk in 1:num_chunks
+        nbr1 = nbr1s[idx_chunk]
+        nbr2 = nbr2s[idx_chunk]
+        visited = visiteds[idx_chunk]
+        ck_start = (idx_chunk - 1) * chunk_size + 1
+        ck_end = min(idx_chunk * chunk_size, nz)
+        for ck in ck_start:ck_end, cj in 1:ny, ci in 1:nx
             # gather 8 corner values
             f0 = sdf[ci, cj, ck]
             f1 = sdf[ci+1, cj, ck]
@@ -952,12 +954,13 @@ function _build_patches_primal_partition!(sdf,
     maxz = zeros(Float32, n_patches)
 
     # ---- pass 2: fill cycles + constraints + cell_edge_patch
-    @threads for ck in 1:nz
-        tid = threadid()
-        nbr1 = nbr1s[tid]
-        nbr2 = nbr2s[tid]
-        visited = visiteds[tid]
-        for cj in 1:ny, ci in 1:nx
+    @threads :dynamic for idx_chunk in 1:num_chunks
+        nbr1 = nbr1s[idx_chunk]
+        nbr2 = nbr2s[idx_chunk]
+        visited = visiteds[idx_chunk]
+        ck_start = (idx_chunk - 1) * chunk_size + 1
+        ck_end = min(idx_chunk * chunk_size, nz)
+        for ck in ck_start:ck_end, cj in 1:ny, ci in 1:nx
             ccyc = cycles_per_cell[ci, cj, ck]
             if ccyc == 0
                 continue
