@@ -267,8 +267,8 @@ function ConditionalSDF(
 end
 
 function (model::ConditionalSDF)(
-    input::Tuple{AbstractArray{T},AbstractArray{T}}, params::NamedTuple, states::NamedTuple
-) where {T<:Number}
+    input::Tuple{AbstractArray,AbstractArray}, params::NamedTuple, states::NamedTuple
+)
     activation = model.activation
     scale_film = model.scale_film
     (x, p_raw) = input   # x: 3×N, p: 4

@@ -25,8 +25,8 @@ vector of signed distances (negative inside, positive outside).
 """
 function ODCKernels(
     signed_distance::Function;
-    edge_batch::Int=262_144,
-    qef_batch::Int=262_144,
+    edge_batch::Int=131_072,
+    qef_batch::Int=131_072,
     bs_iters::Int=15,
     qef_lambda::Float32=0.05f0,
     det_eps::Float32=1f-12,
@@ -39,10 +39,7 @@ function ODCKernels(
     # --- eval_sd kernel (3,B) -> (B)
     let B = edge_batch
         pts_ex = Reactant.to_rarray(zeros(Float32, 3, B))
-        function eval_sd_kernel(pts)
-            return signed_distance(pts)
-        end
-        eval_sd = @compile eval_sd_kernel(pts_ex)
+        eval_sd = @compile signed_distance(pts_ex)
 
         # --- edge bisect kernel (3,B),(3,B) -> (3,B)
         p0_ex = Reactant.to_rarray(zeros(Float32, 3, B))
