@@ -28,11 +28,16 @@ mesh_samplers = load_object(dataset_path)
 mesh_sampler = first(mesh_samplers)
 mesh_params = device(mesh_sampler.parameters)
 
-function signed_distance(points)
-    return first(model((points, mesh_params), params, states))
+function make_signed_distance(model, mesh_params, params, states)
+    function signed_distance(points)
+        input = (points, mesh_params)
+        return first(model(input, params, states))
+    end
+    return signed_distance
 end
 
-odc_kernels = ODCKernels(signed_distance)
+signed_dist = make_signed_distance(model, mesh_params, params, states)
+odc_kernels = ODCKernels(signed_dist)
 bounding_box = (mesh_sampler.bbox_min, mesh_sampler.bbox_max)
 mesh = construct_mesh(odc_kernels, bounding_box)
 # visualize the mesh
