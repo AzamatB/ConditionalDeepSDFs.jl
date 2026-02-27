@@ -33,7 +33,15 @@ mesh_sampler = first(mesh_samplers)
 grid_slabs = GridSlabs(resolution, slab_size)
 points = device(slab_points(grid_slabs, 1))
 mesh_params = device(mesh_sampler.parameters)
-model_compiled = @compile model((points, mesh_params), params, states)
+function make_signed_distance(model, mesh_params, params, states)
+    function signed_distance(points)
+        input = (points, mesh_params)
+        return first(model(input, params, states))
+    end
+    return signed_distance
+end
+signed_distance = make_signed_distance(model, mesh_params, params, states)
+signed_dist = @compile signed_distance(points)
 
 # run full inference on a single mesh
 mesh_params = device(mesh_sampler.parameters)
@@ -41,7 +49,7 @@ sdf_flat = Array{Float32}(undef, resolution^3)
 for idx in eachindex(grid_slabs)
     local points = device(slab_points(grid_slabs, idx))
     indices = point_indices(grid_slabs, idx)
-    (signed_dists, _) = model_compiled((points, mesh_params), params, states)
+    signed_dists = signed_dist(points)
     copyto!(view(sdf_flat, indices), cpu(signed_dists))
 end
 # reshape into a signed distance field over the grid
