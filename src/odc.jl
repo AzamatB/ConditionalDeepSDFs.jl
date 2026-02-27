@@ -5,7 +5,7 @@
 """
     construct_mesh(signed_distance::Function,
                    bounding_box::NTuple{2,Point3f};
-                   resolution::NTuple{3,Int} = (128,128,128),
+                   resolution_max::Int = 128,
                    edge_batch::Int = 1_000_000,
                    qef_batch::Int  = 200_000,
                    binary_iters::Int = 15,
@@ -23,6 +23,9 @@ Inputs
     * returns a length-n vector of signed distances
     * **assumed negative inside, positive outside**
 - `bounding_box = (pmin, pmax)`.
+- `resolution_max`: number of cells along the longest bounding-box axis.
+  Shorter axes get proportionally fewer cells, and the bounding box is
+  symmetrically padded on each axis so that all voxels are exactly cubic.
 
 Output
 - `GeometryBasics.Mesh` with `Point3f` vertices and `TriangleFace{Int32}` faces.
@@ -33,9 +36,10 @@ Notes
 - Intersection-Free Contouring quad splitting uses ODC appendix case1/case2/case3 with Wang (2009) concavity test.
 - Optional manifold post-pass (`manifoldize=true`) splits non-manifold edges/vertices to guarantee 2-manifold output.
 """
-function construct_mesh(signed_distance::Function,
+function construct_mesh(
+    signed_distance::Function,
     bounding_box::NTuple{2,Point3f};
-    resolution::NTuple{3,Int}=(128, 128, 128),
+    resolution_max::Int=256,
     edge_batch::Int=1_000_000,
     qef_batch::Int=200_000,
     binary_iters::Int=15,
@@ -43,27 +47,14 @@ function construct_mesh(signed_distance::Function,
     fd_step::Union{Nothing,Float32}=nothing,
     det_eps::Float32=1f-12,
     manifoldize::Bool=true,
-    backend::String="gpu")
-
+    backend::String="gpu"
+)
     # --------------------
-    # Grid setup
+    # Grid setup: cubic voxels with symmetric bbox padding
     # --------------------
-    pmin, pmax = bounding_box
-    nx, ny, nz = resolution
+    (δ, nx, ny, nz, xmin, ymin, zmin, xmax, ymax, zmax) = setup_grid(bounding_box, resolution_max)
 
-    xmin = Float32(pmin.x)
-    ymin = Float32(pmin.y)
-    zmin = Float32(pmin.z)
-    xmax = Float32(pmax.x)
-    ymax = Float32(pmax.y)
-    zmax = Float32(pmax.z)
-
-    dx = (xmax - xmin) / Float32(nx)
-    dy = (ymax - ymin) / Float32(ny)
-    dz = (zmax - zmin) / Float32(nz)
-
-    hmin = min(dx, dy, dz)
-    fd = fd_step === nothing ? (0.5f0 * hmin) : Float32(fd_step)
+    fd = fd_step === nothing ? (0.5f0 * δ) : Float32(fd_step)
 
     # --------------------
     # Reactant backend
@@ -74,14 +65,14 @@ function construct_mesh(signed_distance::Function,
     # --------------------
     # 1) Evaluate SDF on grid vertices (GPU-batched)
     # --------------------
-    sdf = _eval_grid_sdf!(kernels.eval_sd, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, edge_batch)
+    sdf = _eval_grid_sdf!(kernels.eval_sd, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
 
     # --------------------
     # 2) Extract sign-change edges (CPU) + 3) 1D root search (GPU) + normals (GPU)
     # --------------------
-    ex_p, ex_n, ex_active = _compute_edge_hermite_data_x!(kernels, sdf, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, edge_batch)
-    ey_p, ey_n, ey_active = _compute_edge_hermite_data_y!(kernels, sdf, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, edge_batch)
-    ez_p, ez_n, ez_active = _compute_edge_hermite_data_z!(kernels, sdf, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, edge_batch)
+    ex_p, ex_n, ex_active = _compute_edge_hermite_data_x!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
+    ey_p, ey_n, ey_active = _compute_edge_hermite_data_y!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
+    ez_p, ez_n, ez_active = _compute_edge_hermite_data_z!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
 
     # --------------------
     # 4) True primal-face partitioning per cell → cycles → patches
@@ -91,7 +82,7 @@ function construct_mesh(signed_distance::Function,
     # --------------------
     cell_edge_patch, patch_data = _build_patches_primal_partition!(
         sdf, ex_p, ex_n, ey_p, ey_n, ez_p, ez_n,
-        xmin, ymin, zmin, dx, dy, dz, nx, ny, nz
+        xmin, ymin, zmin, δ, nx, ny, nz
     )
 
     n_patches = patch_data.n_patches
@@ -117,13 +108,13 @@ function construct_mesh(signed_distance::Function,
     sizehint!(faces, 2 * (length(ex_active) + length(ey_active) + length(ez_active)))
 
     _emit_faces_x!(faces, vertices, cell_edge_patch, sdf, ex_p, ex_active,
-        xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+        xmin, ymin, zmin, δ, nx, ny, nz)
 
     _emit_faces_y!(faces, vertices, cell_edge_patch, sdf, ey_p, ey_active,
-        xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+        xmin, ymin, zmin, δ, nx, ny, nz)
 
     _emit_faces_z!(faces, vertices, cell_edge_patch, sdf, ez_p, ez_active,
-        xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+        xmin, ymin, zmin, δ, nx, ny, nz)
 
     if manifoldize
         _manifoldize!(vertices, faces)
@@ -132,6 +123,68 @@ function construct_mesh(signed_distance::Function,
     return Mesh(vertices, faces)
 end
 
+
+# --------------------------------------------
+# Cubic-voxel grid from bounding box
+# --------------------------------------------
+
+"""
+    setup_grid(bounding_box, resolution_max) -> NamedTuple
+
+Compute a uniform grid with exactly cubic voxels.
+
+`resolution_max` cells are placed along the longest bounding-box axis, fixing
+the voxel size `δ`.  Shorter axes get `ceil(extent / δ)` cells.  Each axis is
+then symmetrically padded so that `ni * δ` equals the padded extent exactly.
+
+All arithmetic is performed in Float64 to avoid intermediate rounding; the
+returned values are converted to Float32 at the very end.
+
+Returns `(; nx, ny, nz, xmin, ymin, zmin, xmax, ymax, zmax, δ)` with Float32 coordinates.
+"""
+function setup_grid(bounding_box::NTuple{2,Point3f}, resolution_max::Int)
+    (pmin, pmax) = bounding_box
+    xmin = Float64(pmin[1])
+    ymin = Float64(pmin[2])
+    zmin = Float64(pmin[3])
+    xmax = Float64(pmax[1])
+    ymax = Float64(pmax[2])
+    zmax = Float64(pmax[3])
+
+    ex = xmax - xmin
+    ey = ymax - ymin
+    ez = zmax - zmin
+
+    # Voxel size determined by the longest axis
+    δ = max(ex, ey, ez) / resolution_max
+
+    # Cell count per axis (at least 1)
+    nx = max(ceil(Int, ex / δ), 1)
+    ny = max(ceil(Int, ey / δ), 1)
+    nz = max(ceil(Int, ez / δ), 1)
+
+    # Symmetric padding: pad_i = (ni * δ - ei) / 2
+    # Use muladd(ni, δ, -ei) for ni*δ - ei to avoid intermediate rounding
+    pad_x = 0.5 * muladd(nx, δ, -ex)
+    pad_y = 0.5 * muladd(ny, δ, -ey)
+    pad_z = 0.5 * muladd(nz, δ, -ez)
+
+    # xmin = pmin - pad, xmax = xmin + ni*δ
+    # Use muladd for xmax = muladd(ni, δ, xmin) to fuse the multiply-add
+    xmin -= pad_x
+    ymin -= pad_y
+    zmin -= pad_z
+    xmax = muladd(nx, δ, xmin)
+    ymax = muladd(ny, δ, ymin)
+    zmax = muladd(nz, δ, zmin)
+
+    return (
+        Float32(δ),
+        nx, ny, nz,
+        Float32(xmin), Float32(ymin), Float32(zmin),
+        Float32(xmax), Float32(ymax), Float32(zmax),
+    )
+end
 
 # --------------------------------------------
 # Reactant kernel compilation & caching
@@ -384,7 +437,7 @@ end
 # Grid SDF evaluation (chunked)
 # --------------------------------------------
 
-function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, batch::Int)
+function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
     sx = nx + 1
     sy = ny + 1
     sz = nz + 1
@@ -402,9 +455,9 @@ function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, batc
             i = idx % sx
             j = (idx ÷ sx) % sy
             k = idx ÷ (sx * sy)
-            pts_host[1, t] = xmin + dx * Float32(i)
-            pts_host[2, t] = ymin + dy * Float32(j)
-            pts_host[3, t] = zmin + dz * Float32(k)
+            pts_host[1, t] = xmin + δ * Float32(i)
+            pts_host[2, t] = ymin + δ * Float32(j)
+            pts_host[3, t] = zmin + δ * Float32(k)
         end
         if m < batch
             @inbounds pts_host[:, m+1:batch] .= 0f0
@@ -462,7 +515,7 @@ end
     return i, j, k
 end
 
-function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, batch::Int)
+function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
     ex_p = zeros(Float32, 3, nx, ny + 1, nz + 1)
     ex_n = zeros(Float32, 3, nx, ny + 1, nz + 1)
     active = Int[]
@@ -488,9 +541,9 @@ function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin,
         @inbounds for t in 1:m
             l = active[base+t]
             i, j, k = _decode_ex(l, nx, ny)
-            x0 = xmin + dx * Float32(i - 1)
-            y0 = ymin + dy * Float32(j - 1)
-            z0 = zmin + dz * Float32(k - 1)
+            x0 = xmin + δ * Float32(i - 1)
+            y0 = ymin + δ * Float32(j - 1)
+            z0 = zmin + δ * Float32(k - 1)
 
             f0 = sdf[i, j, k]
             # endpoint at (i,j,k) and (i+1,j,k)
@@ -499,12 +552,12 @@ function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin,
                 p0[1, t] = x0
                 p0[2, t] = y0
                 p0[3, t] = z0
-                p1[1, t] = x0 + dx
+                p1[1, t] = x0 + δ
                 p1[2, t] = y0
                 p1[3, t] = z0
             else
                 # inside at end
-                p0[1, t] = x0 + dx
+                p0[1, t] = x0 + δ
                 p0[2, t] = y0
                 p0[3, t] = z0
                 p1[1, t] = x0
@@ -540,7 +593,7 @@ function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin,
     return ex_p, ex_n, active
 end
 
-function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, batch::Int)
+function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
     ey_p = zeros(Float32, 3, nx + 1, ny, nz + 1)
     ey_n = zeros(Float32, 3, nx + 1, ny, nz + 1)
     active = Int[]
@@ -564,9 +617,9 @@ function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin,
         @inbounds for t in 1:m
             l = active[base+t]
             i, j, k = _decode_ey(l, nx, ny)
-            x0 = xmin + dx * Float32(i - 1)
-            y0 = ymin + dy * Float32(j - 1)
-            z0 = zmin + dz * Float32(k - 1)
+            x0 = xmin + δ * Float32(i - 1)
+            y0 = ymin + δ * Float32(j - 1)
+            z0 = zmin + δ * Float32(k - 1)
 
             f0 = sdf[i, j, k]
             if f0 < 0f0
@@ -574,11 +627,11 @@ function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin,
                 p0[2, t] = y0
                 p0[3, t] = z0
                 p1[1, t] = x0
-                p1[2, t] = y0 + dy
+                p1[2, t] = y0 + δ
                 p1[3, t] = z0
             else
                 p0[1, t] = x0
-                p0[2, t] = y0 + dy
+                p0[2, t] = y0 + δ
                 p0[3, t] = z0
                 p1[1, t] = x0
                 p1[2, t] = y0
@@ -612,7 +665,7 @@ function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin,
     return ey_p, ey_n, active
 end
 
-function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz, batch::Int)
+function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
     ez_p = zeros(Float32, 3, nx + 1, ny + 1, nz)
     ez_n = zeros(Float32, 3, nx + 1, ny + 1, nz)
     active = Int[]
@@ -636,9 +689,9 @@ function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin,
         @inbounds for t in 1:m
             l = active[base+t]
             i, j, k = _decode_ez(l, nx, ny)
-            x0 = xmin + dx * Float32(i - 1)
-            y0 = ymin + dy * Float32(j - 1)
-            z0 = zmin + dz * Float32(k - 1)
+            x0 = xmin + δ * Float32(i - 1)
+            y0 = ymin + δ * Float32(j - 1)
+            z0 = zmin + δ * Float32(k - 1)
 
             f0 = sdf[i, j, k]
             if f0 < 0f0
@@ -647,11 +700,11 @@ function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin,
                 p0[3, t] = z0
                 p1[1, t] = x0
                 p1[2, t] = y0
-                p1[3, t] = z0 + dz
+                p1[3, t] = z0 + δ
             else
                 p0[1, t] = x0
                 p0[2, t] = y0
-                p0[3, t] = z0 + dz
+                p0[3, t] = z0 + δ
                 p1[1, t] = x0
                 p1[2, t] = y0
                 p1[3, t] = z0
@@ -822,7 +875,7 @@ end
 
 function _build_patches_primal_partition!(sdf,
     ex_p, ex_n, ey_p, ey_n, ez_p, ez_n,
-    xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    xmin, ymin, zmin, δ, nx, ny, nz)
 
     # cell_edge_patch: (12, nx, ny, nz) gives patch_id (== vertex index) for each local edge in each cell
     cell_edge_patch = zeros(Int32, 12, nx, ny, nz)
@@ -954,12 +1007,12 @@ function _build_patches_primal_partition!(sdf,
             fill!(visited, false)
 
             # cell bounds and center (same for all patches in this cell)
-            cminx = xmin + dx * Float32(ci - 1)
-            cminy = ymin + dy * Float32(cj - 1)
-            cminz = zmin + dz * Float32(ck - 1)
-            cmaxx = cminx + dx
-            cmaxy = cminy + dy
-            cmaxz = cminz + dz
+            cminx = xmin + δ * Float32(ci - 1)
+            cminy = ymin + δ * Float32(cj - 1)
+            cminz = zmin + δ * Float32(ck - 1)
+            cmaxx = cminx + δ
+            cmaxy = cminy + δ
+            cmaxz = cminz + δ
             ccx = 0.5f0 * (cminx + cmaxx)
             ccy = 0.5f0 * (cminy + cmaxy)
             ccz = 0.5f0 * (cminz + cmaxz)
@@ -1316,7 +1369,7 @@ end
 #  - apply IC quad split.
 
 function _emit_faces_x!(faces, vertices, cell_edge_patch, sdf, ex_p, active_edges,
-    xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    xmin, ymin, zmin, δ, nx, ny, nz)
 
     # local edge indices for the x-edge in the 4 surrounding cells (base order for +x)
     # cells: A(i, j-1,k-1), B(i, j,k-1), C(i, j,k), D(i, j-1,k)
@@ -1360,12 +1413,12 @@ function _emit_faces_x!(faces, vertices, cell_edge_patch, sdf, ex_p, active_edge
         i4 = Int32(v[4])
 
         # p_in/p_out
-        x0 = xmin + dx * Float32(i - 1)
-        y0 = ymin + dy * Float32(j - 1)
-        z0 = zmin + dz * Float32(k - 1)
+        x0 = xmin + δ * Float32(i - 1)
+        y0 = ymin + δ * Float32(j - 1)
+        z0 = zmin + δ * Float32(k - 1)
 
         p_lo = Point3f(x0, y0, z0)
-        p_hi = Point3f(x0 + dx, y0, z0)
+        p_hi = Point3f(x0 + δ, y0, z0)
         p_in = dirpos ? p_lo : p_hi
         p_out = dirpos ? p_hi : p_lo
 
@@ -1376,7 +1429,7 @@ function _emit_faces_x!(faces, vertices, cell_edge_patch, sdf, ex_p, active_edge
 end
 
 function _emit_faces_y!(faces, vertices, cell_edge_patch, sdf, ey_p, active_edges,
-    xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    xmin, ymin, zmin, δ, nx, ny, nz)
 
     # y-edge around order for +y:
     # cells: A(i-1,j,k-1), B(i-1,j,k), C(i,j,k), D(i,j,k-1)
@@ -1414,12 +1467,12 @@ function _emit_faces_y!(faces, vertices, cell_edge_patch, sdf, ey_p, active_edge
         i3 = Int32(v[3])
         i4 = Int32(v[4])
 
-        x0 = xmin + dx * Float32(i - 1)
-        y0 = ymin + dy * Float32(j - 1)
-        z0 = zmin + dz * Float32(k - 1)
+        x0 = xmin + δ * Float32(i - 1)
+        y0 = ymin + δ * Float32(j - 1)
+        z0 = zmin + δ * Float32(k - 1)
 
         p_lo = Point3f(x0, y0, z0)
-        p_hi = Point3f(x0, y0 + dy, z0)
+        p_hi = Point3f(x0, y0 + δ, z0)
         p_in = dirpos ? p_lo : p_hi
         p_out = dirpos ? p_hi : p_lo
 
@@ -1430,7 +1483,7 @@ function _emit_faces_y!(faces, vertices, cell_edge_patch, sdf, ey_p, active_edge
 end
 
 function _emit_faces_z!(faces, vertices, cell_edge_patch, sdf, ez_p, active_edges,
-    xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    xmin, ymin, zmin, δ, nx, ny, nz)
 
     # z-edge around order for +z:
     # cells: A(i-1,j-1,k), B(i,j-1,k), C(i,j,k), D(i-1,j,k)
@@ -1468,12 +1521,12 @@ function _emit_faces_z!(faces, vertices, cell_edge_patch, sdf, ez_p, active_edge
         i3 = Int32(v[3])
         i4 = Int32(v[4])
 
-        x0 = xmin + dx * Float32(i - 1)
-        y0 = ymin + dy * Float32(j - 1)
-        z0 = zmin + dz * Float32(k - 1)
+        x0 = xmin + δ * Float32(i - 1)
+        y0 = ymin + δ * Float32(j - 1)
+        z0 = zmin + δ * Float32(k - 1)
 
         p_lo = Point3f(x0, y0, z0)
-        p_hi = Point3f(x0, y0, z0 + dz)
+        p_hi = Point3f(x0, y0, z0 + δ)
         p_in = dirpos ? p_lo : p_hi
         p_out = dirpos ? p_hi : p_lo
 
