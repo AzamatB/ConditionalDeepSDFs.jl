@@ -2,26 +2,106 @@
 # Public API
 # --------------------------------------------
 
+struct ODCKernels{Ksd,Keb,Knf,Kqs}
+    edge_batch::Int
+    qef_batch::Int
+    bs_iters::Int
+    fd::Float32
+    λ::Float32
+    det_eps::Float32
+    eval_sd::Ksd
+    edge_bisect::Keb
+    normals_fd::Knf
+    qef_solve::Kqs
+end
+
 """
-    construct_mesh(signed_distance::Function,
-                   bounding_box::NTuple{2,Point3f};
-                   resolution_max::Int = 128,
-                   edge_batch::Int = 1_000_000,
-                   qef_batch::Int  = 200_000,
-                   binary_iters::Int = 15,
-                   qef_lambda::Float32 = 0.05f0,
-                   fd_step::Union{Nothing,Float32} = nothing,
-                   det_eps::Float32 = 1f-12,
-                   manifoldize::Bool = true,
-                   backend::String = "gpu")
+    ODCKernels(signed_distance; edge_batch, qef_batch, bs_iters, qef_lambda, det_eps, backend)
+
+Pre-compile all Reactant/XLA kernels needed by [`construct_mesh`](@ref).
+
+`signed_distance(pts)` must accept a `(3, n)` matrix and return a length-`n`
+vector of signed distances (negative inside, positive outside).
+"""
+function ODCKernels(
+    signed_distance::Function;
+    edge_batch::Int=262_144,
+    qef_batch::Int=262_144,
+    bs_iters::Int=15,
+    qef_lambda::Float32=0.05f0,
+    det_eps::Float32=1f-12,
+    backend::String="gpu"
+)
+    Reactant.set_default_backend(backend)
+
+    λ = qef_lambda
+
+    # --- eval_sd kernel (3,B) -> (B)
+    let B = edge_batch
+        pts_ex = Reactant.to_rarray(zeros(Float32, 3, B))
+        function eval_sd_kernel(pts)
+            return signed_distance(pts)
+        end
+        eval_sd = @compile eval_sd_kernel(pts_ex)
+
+        # --- edge bisect kernel (3,B),(3,B) -> (3,B)
+        p0_ex = Reactant.to_rarray(zeros(Float32, 3, B))
+        p1_ex = Reactant.to_rarray(zeros(Float32, 3, B))
+        function edge_bisect_kernel(p0, p1)
+            return _edge_bisect(p0, p1, signed_distance, Val(bs_iters))
+        end
+        edge_bisect = @compile edge_bisect_kernel(p0_ex, p1_ex)
+
+        # --- normals kernel (3,B),(1,) -> (3,B)   fd is a runtime scalar
+        p_ex = Reactant.to_rarray(zeros(Float32, 3, B))
+        fd_ex = Reactant.to_rarray(zeros(Float32, 1))
+        function normals_kernel(p, fd_buf)
+            return _normals_fd(p, signed_distance, fd_buf[1])
+        end
+        normals_fd = @compile normals_kernel(p_ex, fd_ex)
+
+        # --- QEF kernel (E,Bqef) -> (3,Bqef)
+        E = 12
+        Bq = qef_batch
+        zerosEB() = Reactant.to_rarray(zeros(Float32, E, Bq))
+        zerosB() = Reactant.to_rarray(zeros(Float32, Bq))
+
+        Px_ex = zerosEB()
+        Py_ex = zerosEB()
+        Pz_ex = zerosEB()
+        Nx_ex = zerosEB()
+        Ny_ex = zerosEB()
+        Nz_ex = zerosEB()
+        W_ex = zerosEB()
+        Cx_ex = zerosB()
+        Cy_ex = zerosB()
+        Cz_ex = zerosB()
+        minx_ex = zerosB()
+        miny_ex = zerosB()
+        minz_ex = zerosB()
+        maxx_ex = zerosB()
+        maxy_ex = zerosB()
+        maxz_ex = zerosB()
+
+        function qef_kernel(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz, minx, miny, minz, maxx, maxy, maxz)
+            return _qef_solve_batch(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz, minx, miny, minz, maxx, maxy, maxz, λ, det_eps)
+        end
+        qef_solve = @compile qef_kernel(Px_ex, Py_ex, Pz_ex, Nx_ex, Ny_ex, Nz_ex, W_ex,
+            Cx_ex, Cy_ex, Cz_ex, minx_ex, miny_ex, minz_ex, maxx_ex, maxy_ex, maxz_ex)
+
+        return ODCKernels(edge_batch, qef_batch, bs_iters, 0f0, λ, det_eps,
+            eval_sd, edge_bisect, normals_fd, qef_solve)
+    end
+end
+
+
+"""
+    construct_mesh(kernels::ODCKernels, bounding_box::NTuple{2,Point3f}; resolution_max::Int=256)
 
 SDF-only occupancy-based / manifold dual contouring style meshing (multi-vertex per cell).
 
 Inputs
-- `signed_distance(pts)`:
-    * `pts` is a (3, n) matrix whose columns are xyz points
-    * returns a length-n vector of signed distances
-    * **assumed negative inside, positive outside**
+- `kernels`: pre-compiled [`ODCKernels`](@ref) (carries the SDF and all GPU kernels).
 - `bounding_box = (pmin, pmax)`.
 - `resolution_max`: number of cells along the longest bounding-box axis.
   Shorter axes get proportionally fewer cells, and the bounding box is
@@ -34,19 +114,14 @@ Notes
 - Multi-vertex-per-cell via *true primal-face partitioning*: face marching-squares segments → cycles → one QEF vertex per cycle.
 - Hermite normals from SDF gradients via finite differences (GPU-batched).
 - Intersection-Free Contouring quad splitting uses ODC appendix case1/case2/case3 with Wang (2009) concavity test.
-- Optional manifold post-pass (`manifoldize=true`) splits non-manifold edges/vertices to guarantee 2-manifold output.
+- Manifold post-pass splits non-manifold edges/vertices to guarantee 2-manifold output.
 """
 function construct_mesh(
-    signed_distance::Function,
-    bounding_box::NTuple{2,Point3f};
-    resolution_max::Int=256,
-    edge_batch::Int=262_144,
-    qef_batch::Int=262_144,
-    binary_iters::Int=15,
-    qef_lambda::Float32=0.05f0,
-    det_eps::Float32=1f-12,
-    backend::String="gpu"
+    kernels::ODCKernels, bounding_box::NTuple{2,Point3f}; resolution_max::Int=256
 )
+    edge_batch = kernels.edge_batch
+    qef_batch = kernels.qef_batch
+
     # --------------------
     # Grid setup: cubic voxels with symmetric bbox padding
     # --------------------
@@ -55,10 +130,9 @@ function construct_mesh(
     fd = 0.5f0 * δ
 
     # --------------------
-    # Reactant backend
+    # Runtime fd device buffer (not baked into the compiled graph)
     # --------------------
-    Reactant.set_default_backend(backend)  # typically "gpu" for CUDA/XLA
-    kernels = _get_kernels(signed_distance, edge_batch, qef_batch, binary_iters, fd, qef_lambda, det_eps)
+    fd_device = Reactant.to_rarray(Float32[fd])
 
     # --------------------
     # 1) Evaluate SDF on grid vertices (GPU-batched)
@@ -68,9 +142,9 @@ function construct_mesh(
     # --------------------
     # 2) Extract sign-change edges (CPU) + 3) 1D root search (GPU) + normals (GPU)
     # --------------------
-    ex_p, ex_n, ex_active = _compute_edge_hermite_data_x!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
-    ey_p, ey_n, ey_active = _compute_edge_hermite_data_y!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
-    ez_p, ez_n, ez_active = _compute_edge_hermite_data_z!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
+    ex_p, ex_n, ex_active = _compute_edge_hermite_data_x!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch, fd_device)
+    ey_p, ey_n, ey_active = _compute_edge_hermite_data_y!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch, fd_device)
+    ez_p, ez_n, ez_active = _compute_edge_hermite_data_z!(kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch, fd_device)
 
     # --------------------
     # 4) True primal-face partitioning per cell → cycles → patches
@@ -182,95 +256,7 @@ function setup_grid(bounding_box::NTuple{2,Point3f}, resolution_max::Int)
     )
 end
 
-# --------------------------------------------
-# Reactant kernel compilation & caching
-# --------------------------------------------
 
-const _KERNEL_CACHE = IdDict{Tuple{UInt,Int,Int,Int,Float32,Float32,Float32,String},Any}()
-
-struct _Kernels
-    eval_sd
-    edge_bisect
-    normals_fd
-    qef_solve
-    edge_batch::Int
-    qef_batch::Int
-    iters::Int
-    fd::Float32
-    λ::Float32
-    det_eps::Float32
-end
-
-function _get_kernels(signed_distance::Function,
-    edge_batch::Int,
-    qef_batch::Int,
-    iters::Int,
-    fd::Float32,
-    λ::Float32,
-    det_eps::Float32)
-
-    key = (Base.objectid(signed_distance), edge_batch, qef_batch, iters, fd, λ, det_eps, String(Reactant.default_backend()))
-    if haskey(_KERNEL_CACHE, key)
-        return _KERNEL_CACHE[key]::_Kernels
-    end
-
-    # --- eval_sd kernel (3,B) -> (B)
-    let B = edge_batch
-        pts_ex = Reactant.to_rarray(zeros(Float32, 3, B))
-        function eval_sd_kernel(pts)
-            return signed_distance(pts)
-        end
-        eval_sd = @compile eval_sd_kernel(pts_ex)
-
-        # --- edge bisect kernel (3,B),(3,B) -> (3,B)
-        p0_ex = Reactant.to_rarray(zeros(Float32, 3, B))
-        p1_ex = Reactant.to_rarray(zeros(Float32, 3, B))
-        function edge_bisect_kernel(p0, p1)
-            return _edge_bisect(p0, p1, signed_distance, Val(iters))
-        end
-        edge_bisect = @compile edge_bisect_kernel(p0_ex, p1_ex)
-
-        # --- normals kernel (3,B) -> (3,B)
-        p_ex = Reactant.to_rarray(zeros(Float32, 3, B))
-        function normals_kernel(p)
-            return _normals_fd(p, signed_distance, fd)
-        end
-        normals_fd = @compile normals_kernel(p_ex)
-
-        # --- QEF kernel (E,Bqef) -> (3,Bqef)
-        E = 12
-        Bq = qef_batch
-        zerosEB() = Reactant.to_rarray(zeros(Float32, E, Bq))
-        zerosB() = Reactant.to_rarray(zeros(Float32, Bq))
-
-        Px_ex = zerosEB()
-        Py_ex = zerosEB()
-        Pz_ex = zerosEB()
-        Nx_ex = zerosEB()
-        Ny_ex = zerosEB()
-        Nz_ex = zerosEB()
-        W_ex = zerosEB()
-        Cx_ex = zerosB()
-        Cy_ex = zerosB()
-        Cz_ex = zerosB()
-        minx_ex = zerosB()
-        miny_ex = zerosB()
-        minz_ex = zerosB()
-        maxx_ex = zerosB()
-        maxy_ex = zerosB()
-        maxz_ex = zerosB()
-
-        function qef_kernel(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz, minx, miny, minz, maxx, maxy, maxz)
-            return _qef_solve_batch(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz, minx, miny, minz, maxx, maxy, maxz, λ, det_eps)
-        end
-        qef_solve = @compile qef_kernel(Px_ex, Py_ex, Pz_ex, Nx_ex, Ny_ex, Nz_ex, W_ex,
-            Cx_ex, Cy_ex, Cz_ex, minx_ex, miny_ex, minz_ex, maxx_ex, maxy_ex, maxz_ex)
-
-        k = _Kernels(eval_sd, edge_bisect, normals_fd, qef_solve, edge_batch, qef_batch, iters, fd, λ, det_eps)
-        _KERNEL_CACHE[key] = k
-        return k
-    end
-end
 
 # --------------------------------------------
 # Reactant kernels (pure array ops)
@@ -290,7 +276,7 @@ function _edge_bisect(p0, p1, signed_distance, ::Val{ITERS}) where {ITERS}
     return 0.5f0 .* (lo .+ hi)
 end
 
-function _normals_fd(p, signed_distance, fd::Float32)
+function _normals_fd(p, signed_distance, fd)
     # p: (3,B)
     B = size(p, 2)
     # build 6B points: (+x,-x,+y,-y,+z,-z)
@@ -511,7 +497,7 @@ end
     return i, j, k
 end
 
-function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
+function _compute_edge_hermite_data_x!(kernels::ODCKernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int, fd_device)
     ex_p = zeros(Float32, 3, nx, ny + 1, nz + 1)
     ex_n = zeros(Float32, 3, nx, ny + 1, nz + 1)
     active = Int[]
@@ -575,7 +561,7 @@ function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin,
 
         # reuse p0_device for normals input (same shape)
         copyto!(p0_device, root)
-        nor_r = kernels.normals_fd(p0_device)
+        nor_r = kernels.normals_fd(p0_device, fd_device)
         nor = Array(nor_r)
 
         @inbounds for t in 1:m
@@ -589,7 +575,7 @@ function _compute_edge_hermite_data_x!(kernels::_Kernels, sdf, xmin, ymin, zmin,
     return ex_p, ex_n, active
 end
 
-function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
+function _compute_edge_hermite_data_y!(kernels::ODCKernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int, fd_device)
     ey_p = zeros(Float32, 3, nx + 1, ny, nz + 1)
     ey_n = zeros(Float32, 3, nx + 1, ny, nz + 1)
     active = Int[]
@@ -647,7 +633,7 @@ function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin,
         root = Array(root_r)
 
         copyto!(p0_device, root)
-        nor_r = kernels.normals_fd(p0_device)
+        nor_r = kernels.normals_fd(p0_device, fd_device)
         nor = Array(nor_r)
 
         @inbounds for t in 1:m
@@ -661,7 +647,7 @@ function _compute_edge_hermite_data_y!(kernels::_Kernels, sdf, xmin, ymin, zmin,
     return ey_p, ey_n, active
 end
 
-function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
+function _compute_edge_hermite_data_z!(kernels::ODCKernels, sdf, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int, fd_device)
     ez_p = zeros(Float32, 3, nx + 1, ny + 1, nz)
     ez_n = zeros(Float32, 3, nx + 1, ny + 1, nz)
     active = Int[]
@@ -719,7 +705,7 @@ function _compute_edge_hermite_data_z!(kernels::_Kernels, sdf, xmin, ymin, zmin,
         root = Array(root_r)
 
         copyto!(p0_device, root)
-        nor_r = kernels.normals_fd(p0_device)
+        nor_r = kernels.normals_fd(p0_device, fd_device)
         nor = Array(nor_r)
 
         @inbounds for t in 1:m
@@ -1159,7 +1145,7 @@ struct _PatchPositions
     pz::Vector{Float32}
 end
 
-function _solve_qef_patches!(kernels::_Kernels, pdata::_PatchData, qef_batch::Int)
+function _solve_qef_patches!(kernels::ODCKernels, pdata::_PatchData, qef_batch::Int)
     n = pdata.n_patches
     px = Vector{Float32}(undef, n)
     py = Vector{Float32}(undef, n)
