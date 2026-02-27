@@ -51,11 +51,11 @@ function ODCKernels(
         end
         edge_bisect = @compile edge_bisect_kernel(p0_ex, p1_ex)
 
-        # --- normals kernel (3,B),(1,) -> (3,B)   fd is a runtime scalar
+        # --- normals kernel (3,B),scalar -> (3,B)   fd is a runtime scalar
         p_ex = device(zeros(Float32, 3, Be))
-        fd_ex = device(zeros(Float32, 1))
-        function normals_kernel(p, fd_buf)
-            return _normals_fd(p, signed_dist, fd_buf)
+        fd_ex = Reactant.ConcreteRNumber(0f0)
+        function normals_kernel(p, fd)
+            return _normals_fd(p, signed_dist, fd)
         end
         normals_fd = @compile normals_kernel(p_ex, fd_ex)
 
@@ -127,9 +127,9 @@ function construct_mesh(
     fd = 0.5f0 * δ
 
     # --------------------
-    # Runtime fd device buffer (not baked into the compiled graph)
+    # Runtime fd scalar (not baked into the compiled graph)
     # --------------------
-    fd_device = kernels.device(Float32[fd])
+    fd_device = Reactant.ConcreteRNumber(Float32(fd))
 
     # --------------------
     # 1) Evaluate SDF on grid vertices (GPU-batched)
