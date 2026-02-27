@@ -407,7 +407,7 @@ function _qef_solve_batch(Px, Py, Pz, Nx, Ny, Nz, W, Cx, Cy, Cz,
     y = min.(max.(y, miny), maxy)
     z = min.(max.(z, minz), maxz)
 
-    out = Reactant.Ops.stack((x, y, z); axis=1)  # (3,B)
+    out = Reactant.Ops.stack((x', y', z'); dims=1)  # (3,B)
     return out
 end
 
