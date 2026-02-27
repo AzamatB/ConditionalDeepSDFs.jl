@@ -40,13 +40,11 @@ function construct_mesh(
     signed_distance::Function,
     bounding_box::NTuple{2,Point3f};
     resolution_max::Int=256,
-    edge_batch::Int=1_000_000,
-    qef_batch::Int=200_000,
+    edge_batch::Int=262_144,
+    qef_batch::Int=262_144,
     binary_iters::Int=15,
     qef_lambda::Float32=0.05f0,
-    fd_step::Union{Nothing,Float32}=nothing,
     det_eps::Float32=1f-12,
-    manifoldize::Bool=true,
     backend::String="gpu"
 )
     # --------------------
@@ -54,7 +52,7 @@ function construct_mesh(
     # --------------------
     (δ, nx, ny, nz, xmin, ymin, zmin, xmax, ymax, zmax) = setup_grid(bounding_box, resolution_max)
 
-    fd = fd_step === nothing ? (0.5f0 * δ) : Float32(fd_step)
+    fd = 0.5f0 * δ
 
     # --------------------
     # Reactant backend
@@ -116,9 +114,7 @@ function construct_mesh(
     _emit_faces_z!(faces, vertices, cell_edge_patch, sdf, ez_p, ez_active,
         xmin, ymin, zmin, δ, nx, ny, nz)
 
-    if manifoldize
-        _manifoldize!(vertices, faces)
-    end
+    _manifoldize!(vertices, faces)
 
     return Mesh(vertices, faces)
 end
