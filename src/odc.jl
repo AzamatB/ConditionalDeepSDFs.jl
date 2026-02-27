@@ -1271,12 +1271,15 @@ end
 # IC quad split (ODC appendix + Wang concavity)
 # --------------------------------------------
 
-@inline _sub(a::Point3f, b::Point3f) = Point3f(a.x - b.x, a.y - b.y, a.z - b.z)
-@inline _dot(a::Point3f, b::Point3f) = a.x * b.x + a.y * b.y + a.z * b.z
+@inline function _dot(a::Point3f, b::Point3f)
+    return muladd(a[1], b[1], muladd(a[2], b[2], a[3] * b[3]))
+end
+
 @inline function _cross(a::Point3f, b::Point3f)
-    return Point3f(a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x)
+    x = muladd(a[2], b[3], -(a[3] * b[2]))
+    y = muladd(a[3], b[1], -(a[1] * b[3]))
+    z = muladd(a[1], b[2], -(a[2] * b[1]))
+    return Point3f(x, y, z)
 end
 
 """
@@ -1288,8 +1291,8 @@ For a candidate envelope vertex q relative to diagonal endpoints (a,b) and edge 
     (q - p_in ) ⋅ ((a - p_in ) × (b - p_in )) > 0
 """
 @inline function _is_concave(q::Point3f, a::Point3f, b::Point3f, p_in::Point3f, p_out::Point3f)
-    t1 = _dot(_sub(q, p_out), _cross(_sub(a, p_out), _sub(b, p_out))) < 0f0
-    t2 = _dot(_sub(q, p_in), _cross(_sub(a, p_in), _sub(b, p_in))) > 0f0
+    t1 = _dot(q - p_out, _cross(a - p_out, b - p_out)) < 0f0
+    t2 = _dot(q - p_in, _cross(a - p_in, b - p_in)) > 0f0
     return t1 || t2
 end
 
@@ -1567,7 +1570,7 @@ function _manifoldize!(verts::Vector{Point3f}, faces::Vector{TriangleFace{Int32}
         u, v = _unpack_edgekey(key)
         pu = verts[Int(u)]
         pv = verts[Int(v)]
-        d = _sub(pv, pu)
+        d = pv - pu
         inv_len = 1f0 / (sqrt(_dot(d, d)) + 1f-12)
         dn = Point3f(d[1] * inv_len, d[2] * inv_len, d[3] * inv_len)
 
@@ -1585,7 +1588,7 @@ function _manifoldize!(verts::Vector{Point3f}, faces::Vector{TriangleFace{Int32}
             f = faces[Int(fid)]
             w = _third_vertex(f, u, v)
             pw = verts[Int(w)]
-            vec = _sub(pw, mid)
+            vec = pw - mid
             x = _dot(vec, b1)
             y = _dot(vec, b2)
             angles[ii] = atan(y, x)
