@@ -2,7 +2,7 @@
 # Public API
 # --------------------------------------------
 
-struct ODCKernels{Ksd,Keb,Knf,Kqs}
+struct ODCKernels{D,C,Ksd,Keb,Knf,Kqs}
     edge_batch::Int
     qef_batch::Int
     bs_iters::Int
@@ -13,6 +13,8 @@ struct ODCKernels{Ksd,Keb,Knf,Kqs}
     edge_bisect::Keb
     normals_fd::Knf
     qef_solve::Kqs
+    device::D
+    cpu::C
 end
 
 """
@@ -35,23 +37,25 @@ function ODCKernels(
     Reactant.set_default_backend(backend)
 
     λ = qef_lambda
+    device = reactant_device(; force=true)
+    host = cpu_device()
 
     # --- eval_sd kernel (3,B) -> (B)
     let B = edge_batch
-        pts_ex = Reactant.to_rarray(zeros(Float32, 3, B))
+        pts_ex = device(zeros(Float32, 3, B))
         eval_sd = @compile signed_distance(pts_ex)
 
         # --- edge bisect kernel (3,B),(3,B) -> (3,B)
-        p0_ex = Reactant.to_rarray(zeros(Float32, 3, B))
-        p1_ex = Reactant.to_rarray(zeros(Float32, 3, B))
+        p0_ex = device(zeros(Float32, 3, B))
+        p1_ex = device(zeros(Float32, 3, B))
         function edge_bisect_kernel(p0, p1)
             return _edge_bisect(p0, p1, signed_distance, Val(bs_iters))
         end
         edge_bisect = @compile edge_bisect_kernel(p0_ex, p1_ex)
 
         # --- normals kernel (3,B),(1,) -> (3,B)   fd is a runtime scalar
-        p_ex = Reactant.to_rarray(zeros(Float32, 3, B))
-        fd_ex = Reactant.to_rarray(zeros(Float32, 1))
+        p_ex = device(zeros(Float32, 3, B))
+        fd_ex = device(zeros(Float32, 1))
         function normals_kernel(p, fd_buf)
             return _normals_fd(p, signed_distance, fd_buf[1])
         end
@@ -60,8 +64,8 @@ function ODCKernels(
         # --- QEF kernel (E,Bqef) -> (3,Bqef)
         E = 12
         Bq = qef_batch
-        zerosEB() = Reactant.to_rarray(zeros(Float32, E, Bq))
-        zerosB() = Reactant.to_rarray(zeros(Float32, Bq))
+        zerosEB() = device(zeros(Float32, E, Bq))
+        zerosB() = device(zeros(Float32, Bq))
 
         Px_ex = zerosEB()
         Py_ex = zerosEB()
@@ -87,7 +91,7 @@ function ODCKernels(
             Cx_ex, Cy_ex, Cz_ex, minx_ex, miny_ex, minz_ex, maxx_ex, maxy_ex, maxz_ex)
 
         return ODCKernels(edge_batch, qef_batch, bs_iters, 0f0, λ, det_eps,
-            eval_sd, edge_bisect, normals_fd, qef_solve)
+            eval_sd, edge_bisect, normals_fd, qef_solve, device, host)
     end
 end
 
@@ -129,12 +133,12 @@ function construct_mesh(
     # --------------------
     # Runtime fd device buffer (not baked into the compiled graph)
     # --------------------
-    fd_device = Reactant.to_rarray(Float32[fd])
+    fd_device = kernels.device(Float32[fd])
 
     # --------------------
     # 1) Evaluate SDF on grid vertices (GPU-batched)
     # --------------------
-    sdf = _eval_grid_sdf!(kernels.eval_sd, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
+    sdf = _eval_grid_sdf!(kernels, xmin, ymin, zmin, δ, nx, ny, nz, edge_batch)
 
     # --------------------
     # 2) Extract sign-change edges (CPU) + 3) 1D root search (GPU) + normals (GPU)
@@ -416,7 +420,7 @@ end
 # Grid SDF evaluation (chunked)
 # --------------------------------------------
 
-function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
+function _eval_grid_sdf!(kernels::ODCKernels, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
     sx = nx + 1
     sy = ny + 1
     sz = nz + 1
@@ -425,7 +429,7 @@ function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
     sdf_flat = Vector{Float32}(undef, N)
 
     pts_host = zeros(Float32, 3, batch)
-    pts_device = Reactant.to_rarray(pts_host)  # pre-allocate device buffer once
+    pts_device = kernels.device(pts_host)  # pre-allocate device buffer once
 
     for base in 0:batch:(N-1)
         m = min(batch, N - base)
@@ -443,8 +447,8 @@ function _eval_grid_sdf!(eval_sd, xmin, ymin, zmin, δ, nx, ny, nz, batch::Int)
         end
 
         copyto!(pts_device, pts_host)
-        out_r = eval_sd(pts_device)
-        out = Array(out_r)
+        out_r = kernels.eval_sd(pts_device)
+        out = kernels.cpu(out_r)
         @inbounds sdf_flat[base+1:base+m] .= out[1:m]
     end
 
@@ -511,8 +515,8 @@ function _compute_edge_hermite_data_x!(kernels::ODCKernels, sdf, xmin, ymin, zmi
     # chunked GPU root+normal — pre-allocate host AND device buffers once
     p0 = zeros(Float32, 3, batch)
     p1 = zeros(Float32, 3, batch)
-    p0_device = Reactant.to_rarray(p0)
-    p1_device = Reactant.to_rarray(p1)
+    p0_device = kernels.device(p0)
+    p1_device = kernels.device(p1)
 
     for base in 0:batch:(length(active)-1)
         m = min(batch, length(active) - base)
@@ -554,12 +558,12 @@ function _compute_edge_hermite_data_x!(kernels::ODCKernels, sdf, xmin, ymin, zmi
         copyto!(p0_device, p0)
         copyto!(p1_device, p1)
         root_r = kernels.edge_bisect(p0_device, p1_device)
-        root = Array(root_r)
+        root = kernels.cpu(root_r)
 
         # reuse p0_device for normals input (same shape)
         copyto!(p0_device, root)
         nor_r = kernels.normals_fd(p0_device, fd_device)
-        nor = Array(nor_r)
+        nor = kernels.cpu(nor_r)
 
         @inbounds for t in 1:m
             l = active[base+t]
@@ -587,8 +591,8 @@ function _compute_edge_hermite_data_y!(kernels::ODCKernels, sdf, xmin, ymin, zmi
 
     p0 = zeros(Float32, 3, batch)
     p1 = zeros(Float32, 3, batch)
-    p0_device = Reactant.to_rarray(p0)
-    p1_device = Reactant.to_rarray(p1)
+    p0_device = kernels.device(p0)
+    p1_device = kernels.device(p1)
 
     for base in 0:batch:(length(active)-1)
         m = min(batch, length(active) - base)
@@ -627,11 +631,11 @@ function _compute_edge_hermite_data_y!(kernels::ODCKernels, sdf, xmin, ymin, zmi
         copyto!(p0_device, p0)
         copyto!(p1_device, p1)
         root_r = kernels.edge_bisect(p0_device, p1_device)
-        root = Array(root_r)
+        root = kernels.cpu(root_r)
 
         copyto!(p0_device, root)
         nor_r = kernels.normals_fd(p0_device, fd_device)
-        nor = Array(nor_r)
+        nor = kernels.cpu(nor_r)
 
         @inbounds for t in 1:m
             l = active[base+t]
@@ -659,8 +663,8 @@ function _compute_edge_hermite_data_z!(kernels::ODCKernels, sdf, xmin, ymin, zmi
 
     p0 = zeros(Float32, 3, batch)
     p1 = zeros(Float32, 3, batch)
-    p0_device = Reactant.to_rarray(p0)
-    p1_device = Reactant.to_rarray(p1)
+    p0_device = kernels.device(p0)
+    p1_device = kernels.device(p1)
 
     for base in 0:batch:(length(active)-1)
         m = min(batch, length(active) - base)
@@ -699,11 +703,11 @@ function _compute_edge_hermite_data_z!(kernels::ODCKernels, sdf, xmin, ymin, zmi
         copyto!(p0_device, p0)
         copyto!(p1_device, p1)
         root_r = kernels.edge_bisect(p0_device, p1_device)
-        root = Array(root_r)
+        root = kernels.cpu(root_r)
 
         copyto!(p0_device, root)
         nor_r = kernels.normals_fd(p0_device, fd_device)
-        nor = Array(nor_r)
+        nor = kernels.cpu(nor_r)
 
         @inbounds for t in 1:m
             l = active[base+t]
@@ -1170,22 +1174,23 @@ function _solve_qef_patches!(kernels::ODCKernels, pdata::_PatchData, qef_batch::
     maxz = zeros(Float32, B)
 
     # Pre-allocate device buffers once (16 arrays)
-    Px_r = Reactant.to_rarray(Px)
-    Py_r = Reactant.to_rarray(Py)
-    Pz_r = Reactant.to_rarray(Pz)
-    Nx_r = Reactant.to_rarray(Nx)
-    Ny_r = Reactant.to_rarray(Ny)
-    Nz_r = Reactant.to_rarray(Nz)
-    W_r = Reactant.to_rarray(W)
-    Cx_r = Reactant.to_rarray(Cx)
-    Cy_r = Reactant.to_rarray(Cy)
-    Cz_r = Reactant.to_rarray(Cz)
-    minx_r = Reactant.to_rarray(minx)
-    miny_r = Reactant.to_rarray(miny)
-    minz_r = Reactant.to_rarray(minz)
-    maxx_r = Reactant.to_rarray(maxx)
-    maxy_r = Reactant.to_rarray(maxy)
-    maxz_r = Reactant.to_rarray(maxz)
+    device = kernels.device
+    Px_r = device(Px)
+    Py_r = device(Py)
+    Pz_r = device(Pz)
+    Nx_r = device(Nx)
+    Ny_r = device(Ny)
+    Nz_r = device(Nz)
+    W_r = device(W)
+    Cx_r = device(Cx)
+    Cy_r = device(Cy)
+    Cz_r = device(Cz)
+    minx_r = device(minx)
+    miny_r = device(miny)
+    minz_r = device(minz)
+    maxx_r = device(maxx)
+    maxy_r = device(maxy)
+    maxz_r = device(maxz)
 
     for base in 0:B:(n-1)
         m = min(B, n - base)
@@ -1251,7 +1256,7 @@ function _solve_qef_patches!(kernels::ODCKernels, pdata::_PatchData, qef_batch::
 
         out_r = kernels.qef_solve(Px_r, Py_r, Pz_r, Nx_r, Ny_r, Nz_r, W_r, Cx_r, Cy_r, Cz_r,
             minx_r, miny_r, minz_r, maxx_r, maxy_r, maxz_r)
-        out = Array(out_r) # (3,B)
+        out = kernels.cpu(out_r) # (3,B)
         @inbounds begin
             px[rng] .= out[1, 1:m]
             py[rng] .= out[2, 1:m]
