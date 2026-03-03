@@ -211,7 +211,7 @@ function ConditionalSDF(
     activation=swish,
     num_fourier::Int=256,
     fourier_scale::Float32=24.0f0,
-    scale_film::Float32=0.2f0,
+    scale_film::Float32=0.1f0,
     dim_hidden::Int=512,
     dim_film::Int=256
 )
